@@ -45,9 +45,9 @@ By proposing designs up front, we aim to reduce risk and ensure the project evol
 
 To bring attention to your proposal, share it in the Cozystack community:
 
--   Telegram: [English](https://t.me/cozystack)
--   CNCF Slack channel `#cozystack`
--   Kubernetes Slack channel `#cozystack`
+-   [Community chat in Telegram](https://t.me/cozystack)
+-   [CNCF Slack – #cozystack](https://cloud-native.slack.com/archives/C08BQJD95J7)
+-   [Kubernetes Slack – #cozystack](https://kubernetes.slack.com/archives/C06L3CPRVN1)
 -   Bi-weekly Cozystack community calls
 
 ## Approval Process
