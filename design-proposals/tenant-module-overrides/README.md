@@ -93,7 +93,7 @@ Key points:
 
 New annotation in [cozyvalues-gen](https://github.com/cozystack/cozyvalues-gen):
 
-```
+```text
 @embed <package-path> as <TypedefName>
 ```
 
@@ -112,7 +112,7 @@ Semantics:
 
 Generator output side effects:
 
-- Tenant chart's `values.schema.json` gains the full etcd sub-schema under `properties.etcd.properties.values`.
+- Tenant chart's `values.schema.json` gains the full etcd sub-schema under `properties.etcd.properties.valuesOverride`.
 - Tenant chart's generated README lists the embedded schema inline, with a reference note pointing at the source package.
 - Generator adds the target package's `values.yaml` path to a sidecar manifest so that `make generate` knows the tenant chart must be regenerated whenever `packages/extra/etcd/values.yaml` changes. (Concretely: a one-line `# cozyvalues-gen:embed packages/extra/etcd` header in the generated artifacts so a pre-commit check flags stale generation.)
 
@@ -128,7 +128,7 @@ Each module template normalizes bool-form to object-form and, when `enabled`, re
 {{- $etcd := .Values.etcd }}
 {{- if kindIs "bool" $etcd }}
   {{- /* Bool-form compatibility shim. Normalized to object-form. */ -}}
-  {{- $etcd = dict "enabled" $etcd "valuesOverride" dict }}
+  {{- $etcd = dict "enabled" $etcd "valuesOverride" (dict) }}
 {{- end }}
 {{- if $etcd.enabled }}
 ---
@@ -171,7 +171,7 @@ metadata:
 type: Opaque
 stringData:
   values.yaml: |
-{{ toYaml (default dict $etcd.valuesOverride) | indent 4 }}
+{{ toYaml (default (dict) $etcd.valuesOverride) | indent 4 }}
 {{- end }}
 ```
 
