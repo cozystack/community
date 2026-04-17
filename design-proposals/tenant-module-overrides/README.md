@@ -1,7 +1,7 @@
 # Tenant module overrides
 
 - **Title:** Per-tenant overrides for bundled tenant modules (etcd, seaweedfs, monitoring, ingress)
-- **Author(s):** _TBD by submitter_
+- **Author(s):** [@myasnikovdaniil](https://github.com/myasnikovdaniil), Claude (Anthropic)
 - **Date:** 2026-04-17
 - **Status:** Draft
 
