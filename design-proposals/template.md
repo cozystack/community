@@ -1,12 +1,13 @@
+<!-- Rename this file to README.md and place it in a sub-directory under design-proposals/ -->
 # Your proposal title
 
 - **Title:** `Your full title`
 - **Author(s):** `@your-github-handle, @coauthor`
 - **Date:** `YYYY-MM-DD`
-- **Status:** Draft | Review | Accepted | Superseded
+- **Status:** Draft | Review | Accepted | Rejected | Superseded
 
-<!-- Status transitions: Draft → Review (PR opened) → Accepted (merged)
-     or Superseded (replaced by a later proposal; link it). -->
+<!-- Status transitions: Draft → Review (PR opened) → Accepted (merged),
+     Rejected, or Superseded (replaced by a later proposal; link it). -->
 
 ## Overview
 
