@@ -16,7 +16,7 @@ Hybrid clusters — workers that live outside the Cozystack management cluster (
 
 ## Scope and related proposals
 
-- **Phase 3 (hybrid clusters)** lives in a separate draft proposal — link to be added once that PR is open. None of the design here forecloses Phase 3; the package split is exactly what makes Phase 3 expressible cleanly.
+- **Phase 3 (hybrid clusters)** lives in a separate draft proposal: [`kubernetes-nodes-hybrid-clusters`](../kubernetes-nodes-hybrid-clusters/) ([PR #9](https://github.com/cozystack/community/pull/9)). None of the design here forecloses Phase 3; the package split is exactly what makes Phase 3 expressible cleanly.
 - **Companion: [`cross-cluster-tenant-mesh`](../cross-cluster-tenant-mesh/)** (PR #7). Independent of this proposal; relevant once tenants need to reach services across cluster boundaries.
 
 ## Context
