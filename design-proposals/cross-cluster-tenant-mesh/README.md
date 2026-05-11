@@ -1,18 +1,26 @@
-# Cross-cluster mesh for tenant access to host-cluster services
+# ClusterMesh: a generic cluster-to-cluster mesh controller for Kilo
 
-- **Title:** `Cross-cluster mesh for tenant access to host-cluster services`
+- **Title:** `ClusterMesh: a generic cluster-to-cluster mesh controller for Kilo`
 - **Author(s):** `@kvaps`
 - **Date:** `2026-05-04`
 - **Status:** Draft
 - **Upstream:** Implementation will live as an independent project under the [kilo-io](https://github.com/kilo-io) GitHub organization. Kilo maintainer [@squat](https://github.com/squat) has confirmed interest in upstreaming this functionality, on the condition that the controller and its CRD are framed as a generic *cluster-to-cluster mesh* primitive ("ClusterMesh") rather than as a Cozystack/tenant-specific construct. This proposal has been adjusted accordingly.
 
+## Scope
+
+**This proposal is scoped to the design of the upstream controller** (`kilo-clustermesh` in the `kilo-io` organization). It specifies the controller's CRD, reconciliation logic, validation model, and security boundary.
+
+**Specifically out of scope of this proposal**: the question of how Cozystack will integrate the controller — which workloads consume it, with what address-plane shape (routed pod-CIDR vs NAT egress vs Service-mirror), whether it covers tenant↔host services (Ceph-style use cases) or tenant↔tenant-namespace applications (managed databases and other apps) or both, and what defaults and policies Cozystack applies on top. These decisions remain open and will be made in separate Cozystack-side design work once the upstream controller is shaped. The [Cozystack integration considerations](#cozystack-integration-considerations-deferred) section below sketches potential patterns for discussion only; it is **not** a committed integration plan.
+
 ## Overview
 
 This proposal describes a generic controller-driven approach for connecting two or more Kubernetes clusters into a flat node-to-node WireGuard mesh, using Kilo's `mesh-granularity=cross` topology. The controller — provisionally named **`kilo-clustermesh`** — is intended to live as an independent project in the `kilo-io` organization and to be reusable outside Cozystack.
 
-The motivating use case for this design is exposing a Rook-managed Ceph cluster running in a Cozystack host cluster so that pods inside Cozystack-managed tenant clusters can consume RBD, CephFS, and Ceph Object Gateway storage as if it were local. However, the controller itself does not know about Cozystack tenants. From its point of view, a `ClusterMesh` resource declares a set of peer clusters (referenced via Secrets holding kubeconfigs) that should be linked together; tenancy semantics are entirely a concern of whatever system creates those resources.
+A motivating use case explored during design is exposing a Rook-managed Ceph cluster in one Kubernetes cluster so that pods in another cluster can consume RBD, CephFS, and Ceph Object Gateway storage as if it were local. Ceph illustrates the throughput and topology constraints that shaped the design (direct pod-IP connectivity to many backend pods, throughput incompatible with a single gateway pair), but the controller itself is agnostic to the workload that runs over the mesh.
 
-The design favours a fully-meshed node-to-node topology over the conventional single-gateway model, because Ceph clients require direct L3 connectivity to many backend pods (monitors, OSDs, MDS) and the throughput profile is incompatible with funneling all traffic through one pair of gateways. The controller is responsible for keeping the mesh consistent: creating and removing `Peer` CRDs in every participating cluster as nodes come and go, validating address space, and enforcing trust boundaries through the choice of which kubeconfigs are held where.
+The controller does not know about Cozystack tenants, hubs, spokes, or trust direction. From its point of view, a `ClusterMesh` resource declares a set of peer clusters (referenced via Secrets holding kubeconfigs) that should be linked together; tenancy semantics, who is allowed to create a `ClusterMesh`, and which use cases are served are entirely concerns of whatever system creates those resources.
+
+The design favours a fully-meshed node-to-node topology over the conventional single-gateway model, because workloads of the Ceph kind require direct L3 connectivity to many backend pods and the throughput profile is incompatible with funneling all traffic through one pair of gateways. The controller is responsible for keeping the mesh consistent: creating and removing `Peer` CRDs in every participating cluster as nodes come and go, validating address space, and enforcing trust boundaries through the choice of which kubeconfigs are held where.
 
 ## Context
 
@@ -45,7 +53,7 @@ Following discussion with Kilo maintainer [@squat](https://github.com/squat), th
 
 ## Goals
 
-- Pods in any peer cluster can reach selected services in another peer cluster as if they were on the local network. (Cozystack use case: tenant pods reach host Ceph monitors, OSDs and MDS daemons.)
+- Pods in any peer cluster can reach selected services in another peer cluster as if they were on the local network. (Representative workload: a Ceph cluster whose monitors, OSDs and MDS daemons must be reachable directly at pod-IP level from another cluster.)
 - Nodes added to or removed from any participating cluster are wired into / detached from the mesh automatically, without per-node manual configuration.
 - A compromise of a peer cluster (up to and including full root on a peer node) cannot affect routing in another peer cluster beyond the network surface that was explicitly granted, and cannot affect unrelated peers.
 - Failure of a single node does not break connectivity to services running on other nodes — recovery is automatic and does not require operator action or controller intervention on the data path.
@@ -54,10 +62,10 @@ Following discussion with Kilo maintainer [@squat](https://github.com/squat), th
 
 ### Non-goals
 
-- Cross-cluster service discovery (DNS, mirrored Services). This is a separate concern; for the Ceph use case it is unnecessary because Ceph clients receive endpoint lists from the monitors directly.
+- **Specifying the Cozystack integration shape.** Which Cozystack workloads consume this controller, with what address-plane (routed / NAT-egress / Service-mirror), and with what defaults — out of scope here. See [Cozystack integration considerations (deferred)](#cozystack-integration-considerations-deferred).
+- Cross-cluster service discovery (DNS, mirrored Services). This is a separate concern; for Ceph-style workloads it is unnecessary because clients receive endpoint lists from the cluster map directly.
 - Replacing the CNI in any participating cluster. Each cluster continues to run its preferred CNI; Kilo only adds the cross-cluster encryption fabric.
-- Supporting peers whose pod-CIDR overlaps with another peer's pod-CIDR. Disjoint pod-CIDRs are a precondition.
-- Cozystack-specific tenant policy. Whether and how a particular tenant gets a `ClusterMesh` object is decided by Cozystack control-plane logic outside the controller.
+- Supporting peers whose pod-CIDR overlaps with another peer's pod-CIDR within the same routed `ClusterMesh`. Disjoint pod-CIDRs are a precondition for the controller as designed. A NAT-egress extension that lifts this restriction is one of the open Cozystack-integration patterns and is not part of this proposal.
 
 ## Design
 
@@ -209,31 +217,36 @@ Rationale:
 
 In the Cozystack deployment shape, `--allowed-cidr` is exactly: host pod-CIDR + host WG-CIDR + (optionally host service-CIDR) + tenant pod-CIDR pool + tenant WG-CIDR pool. The pod and WG pools for tenants are kept as disjoint sub-ranges so that allocations from each end up in the right "slot" of every tenant's `allowedNetworks`.
 
-## Cozystack integration
+## Cozystack integration considerations (deferred)
 
-This proposal describes the upstream controller that will live in `kilo-io`. Its consumption inside Cozystack is a separate concern.
+> **This section is exploratory, not a committed integration plan.** The upstream controller described above is the deliverable of this proposal. How Cozystack adopts it — which workloads it serves, what address-plane shape it takes, which defaults and policies apply, how it interacts with the [`kubernetes-nodes-split`](https://github.com/cozystack/community/pull/8) proposal — remains an open design question and will be addressed separately. The patterns sketched here are inputs to that future discussion.
 
-This integration also has to fit alongside the [`kubernetes-nodes-split`](https://github.com/cozystack/community/pull/8) proposal, which reshapes a tenant cluster from a single `kubernetes` HelmRelease into `1 × kubernetes` (Kamaji control-plane only) + `N × kubernetes-nodes` HelmReleases (one per pool, possibly across different locations and backends — `kubevirt-kubeadm`, `kubevirt-talos`, `cloud-talos-hetzner`, `cloud-talos-azure`). The mesh must work uniformly across this layout.
+Several distinct Cozystack integration patterns have been raised during design discussion. Each has different tradeoffs and none is committed; the right answer may even be a hybrid.
 
-The integration shape is:
+### Pattern A: routed pod-level mesh for tenant ↔ host services
 
-- The host-cluster admin deploys `kilo-clustermesh` with `--allowed-cidr` populated from disjoint sub-pools: host pod-CIDR, host WG-CIDR, optionally host service-CIDR, the global tenant pod-CIDR pool, and the global tenant WG-CIDR pool. This single allowlist is the chokepoint that bounds every Peer the controller will ever write, and it is owned by the host admin, not by tenant-provisioning code.
-- RBAC in the host cluster grants `kilo.squat.ai/Peer` access **only** to the controller's ServiceAccount. Tenant-provisioning, the dashboard, and cluster admins can create and read `ClusterMesh` objects (high-level intent) but cannot write `Peer` directly.
-- A tenant cluster is identified at the `kubernetes` HelmRelease level. The kubeconfig issued by the Kamaji control-plane is the single source of truth for that tenant, regardless of how many `kubernetes-nodes` HelmReleases are attached or which backends they use.
-- The existing tenant provisioning pipeline (a) allocates a tenant pod-CIDR from the tenant pod-pool, (b) allocates a tenant WG-CIDR from the tenant WG-pool and injects it into the tenant's `kg-agent --wireguard-cidr`, (c) fetches the Kamaji-issued kubeconfig scoped to a minimal Role (read `Node`, full access on `Peer`), and stores it as a Secret in the host cluster.
-- For each tenant that should connect to host services, Cozystack creates **one** `ClusterMesh` object in the host cluster with two entries in `spec.clusters`: the host (with `local: true`, `allowedNetworks` = host pod-CIDR + host WG-CIDR + …) and the tenant (referencing the Secret, `allowedNetworks` = tenant pod-CIDR + tenant WG-CIDR). Both entries' values are guaranteed subsets of `--allowed-cidr` by construction.
-- One `ClusterMesh` per tenant is sufficient even when the tenant spans multiple locations and backends — the controller's per-cluster Node watch picks up every worker node regardless of which `kubernetes-nodes` pool created it (CAPI-managed KubeVirt VM, autoscaled Hetzner server, autoscaled Azure VMSS instance, etc.) as long as the worker is registered against the tenant kube-apiserver and runs `kg-agent`.
-- New tenant pools added later (additional `kubernetes-nodes` HelmReleases for new locations) require no `ClusterMesh` changes: their nodes are observed by the same watch and reconciled into Peers automatically.
-- A new managed-service entry exposes Ceph RBD/CephFS storage classes that work transparently inside connected tenant clusters.
-- The dashboard surfaces the `ClusterMesh` state (Ready / NetworksNotAllowed / NetworksOverlap / partial connectivity) on the tenant cluster page.
+For workloads in the host cluster that tenants need to consume directly at pod-IP level (Ceph monitors, OSDs, MDS), Cozystack provisions one `ClusterMesh` per tenant with `spec.clusters` containing the host and one tenant entry. `allowedNetworks` declares the actual pod-CIDR and WG-CIDR on each side. This is the most direct mapping of the controller's design but requires globally disjoint tenant pod-CIDRs, allocated from a Cozystack-managed pool at tenant-provisioning time. Tenants that bring their own clusters with pre-existing pod-CIDRs cannot participate unless their CIDR happens to fit the pool.
 
-No tenant-aware logic lives in the controller itself. All tenancy semantics — quotas, lifecycle, who is allowed to attach to which host — are enforced upstream of the `ClusterMesh` object by Cozystack.
+### Pattern B: NAT egress mode for tenants with arbitrary pod-CIDR
 
-### Implications for `kubernetes-nodes` backends
+To support tenants whose pod-CIDR is not coordinated with Cozystack (BYO clusters, external clouds), an extension would introduce per-tenant *egress slices*: a small CIDR allocated from a controlled pool (e.g. CGNAT range 100.64.0.0/10), with per-node /32 SNAT on the tenant side. Only the egress slice appears in `allowedNetworks`; the tenant's real pod-CIDR is hidden from the mesh. Inspired by Submariner Globalnet. Loses end-to-end pod-IP visibility on the wire but is fine for cephx-authenticated traffic. Would require an extension to either the controller (new mode) or to a Cozystack-side companion component that materialises the SNAT configuration.
 
-- **`kubevirt-kubeadm` / `kubevirt-talos`** — workers run as KubeVirt VMs on host nodes. Their pod-CIDRs are inside the tenant pod-CIDR; `kg-agent` runs as part of the tenant Kilo deployment; nothing backend-specific is needed.
-- **`cloud-talos-hetzner` / `cloud-talos-azure`** — workers run as cloud VMs outside the host cluster. They join the tenant kube-apiserver over the public internet and run `kg-agent` like any other tenant node. The mesh reaches them via their `force-endpoint` annotation (cloud public IP); no special-casing in the controller.
-- The Talos `machineconfig` template used by `cloud-talos-*` backends must include the bits needed for `kg-agent` (Kilo's kernel modules / WireGuard interface). This is a `kubernetes-nodes` concern, not a `ClusterMesh` concern, but it needs to be tracked alongside the mesh rollout.
+### Pattern C: Service-mirror via Outline for tenant ↔ tenant-namespace applications
+
+For the common Cozystack case of tenant pods accessing the tenant's own managed apps (Postgres, Mongo, Kafka, …) that run in the tenant-namespace of the management cluster, the `ClusterMesh` controller is **not necessarily the right tool**. An alternative builds on the Outline (Shadowsocks) infrastructure already present in Cozystack: a per-tenant Outline server in the tenant namespace, a Service-mirror controller that materialises shadow Services in the tenant cluster, and a userspace SOCKS5-proxy DaemonSet on tenant nodes. Both sides are fully unprivileged (no TUN, no `CAP_NET_ADMIN`), the Outline server is genuinely stateless and HA-scalable. Limitations: L4 only, no forward secrecy, one direction (tenant → mgmt). Would coexist with this `ClusterMesh` controller rather than replace it.
+
+### Open Cozystack questions
+
+These are not asks of the upstream controller; they are reminders of what still has to be decided in Cozystack:
+
+- Which of the patterns above (or which combination) Cozystack adopts. Patterns A and B are variants of consuming this controller; pattern C uses a different mechanism entirely.
+- How `ClusterMesh` provisioning interacts with the [`kubernetes-nodes-split`](https://github.com/cozystack/community/pull/8) proposal, which can place tenant workers in multiple locations and backends (`kubevirt-kubeadm`, `kubevirt-talos`, `cloud-talos-hetzner`, `cloud-talos-azure`). The mesh design must work uniformly across this layout, but the Cozystack-side provisioning glue is non-trivial.
+- For `cloud-talos-*` backends, whether the Talos `machineconfig` should ship Kilo's WireGuard / `kg-agent` bits as part of the platform-side template, and how that template is versioned and updated.
+- Default deny vs explicit advertise: should tenants by default opt in to host-side advertised CIDRs, or get them automatically once they have a `ClusterMesh`? This is a Cozystack policy decision, not a controller capability.
+- Whether to expose `ClusterMesh` to tenants as a user-facing resource or keep it admin-only (created by Cozystack on the tenant's behalf based on a higher-level Cozystack CR).
+- Dashboard surfacing of mesh state per tenant.
+
+None of these block the upstream controller from progressing.
 
 ## Upgrade and rollback compatibility
 
@@ -298,14 +311,14 @@ The tenant attacker **cannot**:
 - Per-Node validation tests: tampered `kilo.squat.ai/wireguard-ip` (out of `allowedNetworks`, wrong prefix length, duplicate within cluster), `Node.Spec.PodCIDRs` out of `allowedNetworks` — each must skip only the offending Node, leave the mesh Ready, and emit the corresponding event.
 - RBAC tests: the controller's ServiceAccount is the only principal able to mutate `kilo.squat.ai/Peer` in any participating cluster; verify that other host-cluster components (tenant-provisioning controller, dashboard, cluster admins) are denied.
 - Integration tests with `kind`: two clusters, install controller, validate end-to-end connectivity from a pod in one cluster to a pod in another.
-- E2E in CI: full Cozystack stack with a real tenant cluster and Rook-managed Ceph; verify a `ceph rbd map` succeeds inside a tenant pod, verify a `ceph osd down` on a host node does not interrupt I/O on the tenant side beyond the normal Ceph recovery window.
 
 ## Rollout
 
+This rollout covers the upstream controller only. Cozystack adoption is a separate effort that picks up after Phase 1 (see [Cozystack integration considerations (deferred)](#cozystack-integration-considerations-deferred)).
+
 - **Phase 1.** Implement the controller and `ClusterMesh` CRD in a `kilo-io` repository, alongside upstreaming `mesh-granularity=cross` in Kilo itself. Manual provisioning of `ClusterMesh` and kubeconfig Secrets; documentation.
-- **Phase 2.** Cozystack integration: tenant provisioning automatically creates the kubeconfig Secret and `ClusterMesh` for opt-in tenants.
-- **Phase 3.** Storage classes for Ceph RBD/CephFS that work transparently inside connected tenant clusters; samples and migration guide.
-- **Future.** Use `allowedNetworks` to expose non-pod CIDRs (host-network ranges, service CIDR) for use cases beyond Ceph; this is already supported by the schema, but is gated on Cozystack adding the corresponding entries to the controller allowlist.
+- **Phase 2.** Soak in non-Cozystack deployments (e.g. paired test clusters, community contributors with their own multi-cluster needs). Gather feedback on the CRD shape, validation semantics, and operational ergonomics. Address gaps before any Cozystack-side commitment.
+- **Phase 3 and beyond.** Cozystack adoption is shaped by the deferred design work referenced above. Possible follow-ups include automated `ClusterMesh` provisioning from a higher-level Cozystack CR, a NAT-egress extension to support BYO-CIDR tenants, and the orthogonal Service-mirror approach for tenant ↔ tenant-namespace traffic. None of these belong in this proposal.
 
 ## Open questions
 
