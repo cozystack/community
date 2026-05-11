@@ -48,7 +48,7 @@ Additionally, in deployments where one cluster is treated as the trusted side (e
 
 Following discussion with Kilo maintainer [@squat](https://github.com/squat), the controller will be developed in a dedicated repository under the [kilo-io](https://github.com/kilo-io) organization rather than as a Cozystack-internal component. The two key design consequences:
 
-1. The CRD does not contain references to tenants. Instead it accepts a map of peer clusters, each referenced by a Secret holding that cluster's kubeconfig. The Cozystack-specific notion of "tenant" lives entirely outside the controller.
+1. The CRD does not contain references to tenants. Instead it accepts a list of peer clusters, each referenced by a Secret holding that cluster's kubeconfig. The Cozystack-specific notion of "tenant" lives entirely outside the controller.
 2. The Cozystack control plane integrates by translating its own tenant model into `ClusterMesh` objects (one per tenant connection, in the simple deployment shape) plus the corresponding kubeconfig Secrets. See [Cozystack integration](#cozystack-integration).
 
 ## Goals
@@ -121,14 +121,14 @@ metadata:
   namespace: kilo
 spec:
   clusters:
-    cluster-a:
+    - name: cluster-a
       # The controller's own cluster — no kubeconfig needed.
       local: true
       allowedNetworks:
         - 10.4.0.0/16          # WG-CIDR
         - 10.244.0.0/16        # pod-CIDR
         - 10.96.0.0/12         # service-CIDR (optional, if the cluster wants to expose it)
-    cluster-b:
+    - name: cluster-b
       kubeconfigSecretRef:
         name: cluster-b-kubeconfig
         key: kubeconfig
@@ -137,24 +137,22 @@ spec:
         - 10.5.42.0/24         # WG-CIDR
 status:
   clusters:
-    cluster-a:
+    - name: cluster-a
       registeredPeers: 5
       skippedNodes: 0
-    cluster-b:
+    - name: cluster-b
       registeredPeers: 12
       skippedNodes: 0
   conditions:
     - type: Ready
       status: "True"
-    - type: NetworksNotAllowed
-      status: "False"
     - type: NetworksOverlap
       status: "False"
 ```
 
-`allowedNetworks` is the full list of CIDRs the cluster contributes to the mesh — pod-CIDR, WG-CIDR (the address space of `kilo0`), service-CIDR if exposed, and any other reachable subnet. There is no separate WG-CIDR field; the controller treats every entry uniformly for both validation and Peer construction.
+`allowedNetworks` is the full list of CIDRs the cluster contributes to the mesh — pod-CIDR, WG-CIDR (the address space of `kilo0`), service-CIDR if exposed, and any other reachable subnet. The list is intentionally flat: there is no separate `podCIDR` or `wireguardCIDR` field. The controller treats every entry uniformly for both validation and Peer construction. This shape also formally bounds the mesh — nothing outside the union of `allowedNetworks` across all clusters can ever appear in a generated `Peer.allowedIPs`, which keeps the impact of `ClusterMesh` reconciliation predictable for the underlying routing.
 
-The `spec.clusters` field is a map keyed by an arbitrary cluster identifier. Each entry references a Secret holding a kubeconfig (`kubeconfigSecretRef`) and declares `allowedNetworks` — the full set of CIDRs this cluster may bring into the mesh. The pod-CIDR, the service-CIDR, host-network ranges and any other reachable subnets all live in the same list; no separate `podCIDR` or `advertise` field is needed. Exactly one entry may have `local: true`, indicating the cluster the controller itself runs in (no kubeconfig required).
+The `spec.clusters` field is a list of named cluster entries, in line with Kubernetes convention for repeated structures (Pods/containers, Volumes, etc.). Each entry has a `name` (used as the cluster identifier in `status` and as a label value on generated Peer objects), an optional `kubeconfigSecretRef`, and an `allowedNetworks` list. Exactly one entry may have `local: true`, indicating the cluster the controller itself runs in (no kubeconfig required).
 
 The CRD has no notion of tenants, hubs, spokes, owners, or trust direction. Asymmetric deployment shapes (e.g. one trusted cluster reachable by many less-trusted clusters) are expressed by the consumer of the controller through the choice of clusters they include in each `ClusterMesh` and through external RBAC on the kubeconfig Secrets.
 
@@ -164,21 +162,21 @@ For each `ClusterMesh`, the controller performs validation in two layers — mes
 
 **Mesh-level (halts reconciliation on failure):**
 
-1. Every CIDR in every `spec.clusters[*].allowedNetworks` is a subset of the controller's `--allowed-cidr` allowlist; otherwise `NetworksNotAllowed=True`.
-2. The union of `allowedNetworks` across all `spec.clusters` is pairwise disjoint; otherwise `NetworksOverlap=True`.
+1. The union of `allowedNetworks` across all `spec.clusters` is pairwise disjoint; otherwise `NetworksOverlap=True`. The same check is also applied across different `ClusterMesh` objects managed by the same controller (an `allowedNetworks` entry of mesh X must not overlap with an `allowedNetworks` entry of mesh Y), to prevent two meshes from claiming routing for the same address range.
 
 **Per-Node (skips the Node, mesh stays Ready):**
 
-3. `Node.Spec.PodCIDRs[0]` is a subset of that cluster's `allowedNetworks`. (Defensive validation against a tampered Node object on the remote side.)
-4. `Node.kilo.squat.ai/wireguard-ip` is present, has prefix length `/32` (or `/128` for IPv6), and is a subset of that cluster's `allowedNetworks`.
-5. `Node.kilo.squat.ai/wireguard-ip` is unique among all Nodes of this cluster.
+2. `Node.Spec.PodCIDRs[0]` is a subset of that cluster's `allowedNetworks`. (Defensive validation against a tampered Node object on the remote side.)
+3. `Node.kilo.squat.ai/wireguard-ip` is present, has prefix length `/32` (or `/128` for IPv6), and is a subset of that cluster's `allowedNetworks`.
+4. `Node.kilo.squat.ai/wireguard-ip` is unique among all Nodes of this cluster.
 
-Failed per-Node checks emit a Kubernetes event on the `ClusterMesh` (`NodeOutOfRange`, `WGIPInvalid`, `WGIPDuplicate`) and increment `status.clusters[<id>].skippedNodes`. The Node simply does not appear as a `Peer` on remote sides. A tenant root that tampers with their own Node annotations can therefore only remove that one Node from the mesh — they cannot inject a Peer with arbitrary `allowedIPs` into another cluster, and they cannot affect other Nodes of the same tenant or any other `ClusterMesh`.
+Failed per-Node checks emit a Kubernetes event on the `ClusterMesh` (`NodeOutOfRange`, `WGIPInvalid`, `WGIPDuplicate`) and increment `status.clusters[<id>].skippedNodes`. The Node simply does not appear as a `Peer` on remote sides. A remote-side attacker who tampers with their own Node annotations can therefore only remove that one Node from the mesh — they cannot inject a Peer with arbitrary `allowedIPs` into another cluster, and they cannot affect other Nodes of the same cluster or any other `ClusterMesh`.
 
 **Peer construction:**
 
-6. For every ordered pair `(A, B)` of clusters in `spec.clusters`, ensure a `Peer` exists in B for each validated Node of A with: `publicKey` from `kilo.squat.ai/wireguard-public-key`, `endpoint` from `kilo.squat.ai/force-endpoint`, and `allowedIPs` = `Node.Spec.PodCIDRs[0]` ∪ `kilo.squat.ai/wireguard-ip` (the standard Kilo per-Node Peer shape). Cluster-wide CIDRs in `allowedNetworks` not covered by per-Node pod-CIDRs / WG-IPs (e.g. service-CIDR) are attached to a single anchor Peer per cluster.
-7. Remove orphaned Peer objects on every side using a label selector tied to the `ClusterMesh` name.
+5. For every ordered pair `(A, B)` of clusters in `spec.clusters`, ensure a `Peer` exists in B for each validated Node of A with: `publicKey` from `kilo.squat.ai/wireguard-public-key`, `endpoint` from `kilo.squat.ai/force-endpoint`, and `allowedIPs` = `Node.Spec.PodCIDRs[0]` ∪ `kilo.squat.ai/wireguard-ip` (the standard Kilo per-Node Peer shape). Cluster-wide CIDRs in `allowedNetworks` not covered by per-Node pod-CIDRs / WG-IPs (e.g. service-CIDR) are attached to a single anchor Peer per cluster.
+6. Every generated Peer carries the labels `kilo-clustermesh.io/mesh: <ClusterMesh name>` and `kilo-clustermesh.io/source-cluster: <source cluster name>`. These labels disambiguate ownership when, for example, two controllers running on different "hub" clusters write Peers into the same remote cluster: each controller only ever touches Peers whose `source-cluster` label matches one of the clusters listed in its own `ClusterMesh`, and never modifies or deletes Peers belonging to a different source cluster, even if the mesh name happens to collide.
+7. Remove orphaned Peer objects on every side using a label selector tied to both the mesh name and the source-cluster name.
 
 #### Watches
 
@@ -198,24 +196,12 @@ No mesh-specific IP space is allocated. `Peer.allowedIPs` entries are constructe
 
 Constraints (already listed in [Reconciliation](#reconciliation)):
 
-- Every CIDR in `spec.clusters[*].allowedNetworks` must be a subset of the controller's `--allowed-cidr` allowlist.
 - All `allowedNetworks` entries across `spec.clusters` of a `ClusterMesh` must be pairwise disjoint.
+- `allowedNetworks` entries must also be disjoint across different `ClusterMesh` objects managed by the same controller.
 - Every `Node.Spec.PodCIDRs[0]` in a cluster must be a subset of that cluster's `allowedNetworks`.
 - Every `Node.kilo.squat.ai/wireguard-ip` (every cluster, every Node) must be a `/32` subset of that cluster's `allowedNetworks` and unique within the cluster.
 
-How disjoint CIDRs are allocated in the first place is the responsibility of whoever creates the `ClusterMesh`. In the Cozystack case, the tenant provisioning pipeline allocates both a tenant pod-CIDR and a tenant WG-CIDR from disjoint pools that are wired into `--allowed-cidr`, and injects the tenant WG-CIDR into the tenant's `kg-agent --wireguard-cidr` at cluster-creation time.
-
-### Subnet allowlist
-
-The controller is configured at deploy time with a single CIDR allowlist `--allowed-cidr` (repeatable). Every CIDR appearing in `spec.clusters[*].allowedNetworks` of any reconciled `ClusterMesh` must be a subset of one of these.
-
-Rationale:
-
-- The allowlist lives in the controller's deployment configuration, not in the `ClusterMesh` spec, so a user who can create `ClusterMesh` objects cannot widen the address surface — only the operator who owns the controller can.
-- It is enforced by the controller itself, not by an admission webhook. This keeps the admission path simple and avoids webhook-availability as a dependency.
-- A single combined allowlist is sufficient: pod-CIDRs, WG-CIDRs and service-CIDRs all flow through the same disjoint check, and per-Node WG-IP validation goes against the *cluster's own* `allowedNetworks`. A tampered tenant annotation pointing at a CIDR the tenant did not declare in its own `allowedNetworks` (e.g., the host's pod-CIDR or WG-CIDR) is rejected by per-Node containment, and cannot widen its surface to anything the tenant didn't already legitimately own.
-
-In the Cozystack deployment shape, `--allowed-cidr` is exactly: host pod-CIDR + host WG-CIDR + (optionally host service-CIDR) + tenant pod-CIDR pool + tenant WG-CIDR pool. The pod and WG pools for tenants are kept as disjoint sub-ranges so that allocations from each end up in the right "slot" of every tenant's `allowedNetworks`.
+How disjoint CIDRs are allocated in the first place is the responsibility of whoever creates the `ClusterMesh`. The controller relies on the fact that whatever principal authors `ClusterMesh` objects is trusted to set sensible `allowedNetworks` values; cluster-scoped guardrails against a rogue `ClusterMesh` author writing arbitrary CIDRs are out of scope here and discussed under [Alternatives considered](#alternatives-considered) as orthogonal future Kilo work.
 
 ## Cozystack integration considerations (deferred)
 
@@ -267,16 +253,16 @@ The host's exposure to any tenant peer is bounded **exclusively** by the `allowe
 - **On receive**: a packet decrypted with a peer's key is dropped before it reaches the network stack if its source IP is not in that peer's `allowedIPs`.
 - **On send**: a packet leaves through the WG tunnel of the peer whose `allowedIPs` covers its destination, or via normal routing if no peer matches; the host never speaks WG with a destination outside the union of `allowedIPs` of its peers.
 
-Anything a tenant root does to its own `kilo0` interface, local routing tables, kg-agent configuration, or post-reconcile annotations cannot widen this bound, because the host enforces it independently of any sender-side state. The entire job of the controller and its allowlists is therefore reduced to one question: *what `allowedIPs` does the host's `Peer` object end up with?*
+Anything a remote root does to its own `kilo0` interface, local routing tables, kg-agent configuration, or post-reconcile annotations cannot widen this bound, because each side enforces `allowedIPs` independently of any sender-side state. The entire job of the controller and its validation is therefore reduced to one question: *what `allowedIPs` does each cluster's `Peer` object end up with?*
 
 ### Supporting controls
 
 - **Controller monopoly on `Peer`.** RBAC in every participating cluster grants `create/update/patch/delete` on `kilo.squat.ai/Peer` **only** to the controller's ServiceAccount (in the local cluster) or to the user the controller authenticates as via the cluster's kubeconfig (in remote clusters). No other principal — tenant-provisioning, dashboard, cluster admins, any other host-cluster component — has rights on `Peer`. A compromise of an unrelated host component therefore cannot directly write into the mesh routing surface.
-- **In tenant clusters**, the kubeconfig stored in the host-cluster Secret is bound to a minimal Role: read on `Node`, full access on `kilo.squat.ai/Peer`, nothing else. A leaked tenant kubeconfig of this kind cannot exfiltrate tenant data or alter tenant workloads.
-- **`--allowed-cidr` allowlist** bounds what `spec.clusters[*].allowedNetworks` can ever declare. Pod-CIDRs, WG-CIDRs, and service-CIDRs all flow through the same allowlist. A user who can author `ClusterMesh` objects cannot widen the address surface beyond what the host admin pre-approved.
-- **Per-Node containment** validates that every observed annotation (`Node.Spec.PodCIDRs`, `kilo.squat.ai/wireguard-ip`) lies within the cluster's own `allowedNetworks`. A tenant root forging an annotation that points at the host pod-CIDR, host WG-CIDR, or any other CIDR the tenant did not declare itself is rejected — the offending Node is skipped and never appears as a Peer on the host side.
-- **Trust direction by kubeconfig placement.** Whichever cluster holds the controller and the kubeconfig Secrets is the side that drives writes; the side whose kubeconfig is held cannot write back. In Cozystack, only the host holds tenant kubeconfigs — trust flows host → tenant.
-- **Cross-mesh isolation.** Each `ClusterMesh`'s Peers are labelled with the mesh name; the controller never deletes or modifies Peers belonging to a different mesh, and `allowedNetworks` overlap between meshes (not just within a single mesh) is rejected.
+- **In remote clusters**, the kubeconfig stored as a Secret on the controller side is bound to a minimal Role: read on `Node`, full access on `kilo.squat.ai/Peer`, nothing else. A leaked remote kubeconfig of this kind cannot exfiltrate workload data or alter unrelated resources in the remote cluster.
+- **RBAC on `ClusterMesh` is the address-surface chokepoint.** Without an additional in-controller allowlist, the only thing standing between a `ClusterMesh` author and the routing of every participating cluster is who has rights on the `ClusterMesh` resource. Deployments are expected to grant `create/update` on `ClusterMesh` only to a small set of trusted principals (in Cozystack: the tenant-provisioning controller, not tenants themselves). Defense-in-depth against a rogue `ClusterMesh` author is discussed as orthogonal future Kilo work in [Alternatives considered](#alternatives-considered).
+- **Per-Node containment** validates that every observed annotation (`Node.Spec.PodCIDRs`, `kilo.squat.ai/wireguard-ip`) lies within the cluster's own `allowedNetworks`. A remote-side attacker forging an annotation that points at another cluster's pod-CIDR, WG-CIDR, or any other CIDR the cluster did not declare itself is rejected — the offending Node is skipped and never appears as a Peer on any other side.
+- **Trust direction by kubeconfig placement.** Whichever cluster holds the controller and the kubeconfig Secrets is the side that drives writes; a cluster whose kubeconfig is held by another controller cannot write back. In a Cozystack-style deployment, only the host holds remote kubeconfigs — trust flows host → remote.
+- **Cross-mesh and cross-source isolation by label.** Every generated Peer is labelled with both the `ClusterMesh` name and the source-cluster name. The controller never deletes or modifies Peers belonging to a different mesh or a different source cluster, even when two controllers running on different "hub" clusters write into the same remote cluster. `allowedNetworks` overlap between meshes (not just within a single mesh) is rejected.
 
 ### Tenant-cluster compromise (full root on a tenant node)
 
@@ -287,10 +273,10 @@ A tenant attacker can do exactly the following, and no more:
 - **Rotate keypairs.** Republish a different `kilo.squat.ai/wireguard-public-key`. The controller will update the corresponding host-side Peer on the next reconcile. The result is equivalent to "the tenant generated a new legitimate keypair" — no escalation, only the (legitimate) ability to change one's own identity.
 - **Lie about `force-endpoint`.** Point it at any public IP. Host nodes will WG-handshake that IP; without the matching private key the handshake fails. Worst case: a small CPU cost on host nodes attempting failed handshakes. Existing Kilo limitation, not new.
 
-The tenant attacker **cannot**:
+The remote-side attacker **cannot**:
 
-- Inject a `Peer` with `allowedIPs` containing host pod-CIDR, host service-CIDR, or host's `kilo0` range — those CIDRs live in *other* `spec.clusters` entries (the host's own `allowedNetworks`), and per-Node containment rejects any tenant annotation pointing into them.
-- Affect routing for other tenants — their Peers are scoped by `ClusterMesh` label and address-space-disjoint by allowlist construction.
+- Inject a `Peer` with `allowedIPs` containing another cluster's pod-CIDR, service-CIDR, or `kilo0` range — those CIDRs live in *other* `spec.clusters` entries (the other cluster's own `allowedNetworks`), and per-Node containment rejects any annotation pointing into them.
+- Affect routing for unrelated peers — their Peers are scoped by `ClusterMesh` and source-cluster labels and their `allowedNetworks` are required to be pairwise disjoint across meshes.
 - Forge another peer's identity — that would require the other peer's WG private key, which never leaves its kg-agent.
 
 ## Failure and edge cases
@@ -298,18 +284,18 @@ The tenant attacker **cannot**:
 - **Service-bearing node failure** → workload schedulers (e.g. Rook) reschedule pods elsewhere; remote cryptokey routing follows the new pod IPs to live nodes; no data-path intervention required.
 - **Remote node failure** → only that node loses connectivity; other nodes in the same cluster continue working through their independent tunnels.
 - **Remote API unreachable** → controller backs off with exponential retry; existing Peers on other sides are not deleted speculatively. When the remote API returns, reconciliation catches up.
-- **`allowedNetworks` outside `--allowed-cidr`** → controller sets `NetworksNotAllowed=True` on the `ClusterMesh`, halts reconciliation, surfaces the condition in status. No Peer is ever written.
-- **`allowedNetworks` overlap, either within one `ClusterMesh` or across two** → controller sets `NetworksOverlap=True` on the affected meshes, halts reconciliation, surfaces the condition in status.
+- **`allowedNetworks` overlap, either within one `ClusterMesh` or across two** → controller sets `NetworksOverlap=True` on the affected meshes, halts reconciliation, surfaces the condition in status. No Peer with the offending CIDR is ever written.
 - **Tampered or out-of-range `kilo.squat.ai/wireguard-ip` annotation** (outside the cluster's own `allowedNetworks`, missing `/32`, or duplicated within the cluster) → that single Node is skipped, an event is surfaced, `status.clusters[<id>].skippedNodes` is incremented. The mesh stays Ready; other Nodes of the same cluster are unaffected.
 - **Tenant Node with `Node.Spec.PodCIDRs[0]` outside the cluster's `allowedNetworks`** → Node skipped, event surfaced, mesh stays Ready.
 - **Kilo PR #328 not merged upstream** → blocking dependency; the upstream effort for this controller and for `mesh-granularity=cross` will be coordinated.
 
 ## Testing
 
-- Unit tests for reconcile logic: synthetic Node lists with various combinations of annotations, expected Peer object shape.
-- Mesh-level validation tests: `allowedNetworks` outside `--allowed-cidr`, overlapping `allowedNetworks` within and across meshes — each must produce the corresponding status condition without writing any Peer.
+- Unit tests for reconcile logic: synthetic Node lists with various combinations of annotations, expected Peer object shape and label set.
+- Mesh-level validation tests: overlapping `allowedNetworks` within and across meshes — each must produce the `NetworksOverlap` status condition without writing any Peer with the offending CIDR.
 - Per-Node validation tests: tampered `kilo.squat.ai/wireguard-ip` (out of `allowedNetworks`, wrong prefix length, duplicate within cluster), `Node.Spec.PodCIDRs` out of `allowedNetworks` — each must skip only the offending Node, leave the mesh Ready, and emit the corresponding event.
-- RBAC tests: the controller's ServiceAccount is the only principal able to mutate `kilo.squat.ai/Peer` in any participating cluster; verify that other host-cluster components (tenant-provisioning controller, dashboard, cluster admins) are denied.
+- Label-isolation tests: two controllers writing into the same remote cluster with the same mesh name but different source-cluster names — neither must touch the other's Peers, even on orphan cleanup.
+- RBAC tests: the controller's ServiceAccount is the only principal able to mutate `kilo.squat.ai/Peer` in any participating cluster; verify that other components are denied.
 - Integration tests with `kind`: two clusters, install controller, validate end-to-end connectivity from a pod in one cluster to a pod in another.
 
 ## Rollout
@@ -323,10 +309,11 @@ This rollout covers the upstream controller only. Cozystack adoption is a separa
 ## Open questions
 
 1. **Repository name and CRD group**: `kilo-clustermesh` and `kilo.squat.ai/v1alpha1` are placeholders. The final names will be agreed with the Kilo maintainer at repository-creation time under `kilo-io`.
-2. **Cluster identifier scope**: should `spec.clusters` keys be free-form strings or follow a stricter schema (e.g. DNS-1123 labels) so they can be reused as label values? Likely the latter; to confirm during implementation.
+2. **Cluster identifier scope**: `spec.clusters[*].name` is used as a label value (`kilo-clustermesh.io/source-cluster`) and as a key in `status`. It needs DNS-1123 label-compatible validation. To confirm exact regex during implementation.
 3. **Transitive routing**: with three or more clusters in the same `ClusterMesh`, the controller currently builds a full mesh. Should it support partial topologies (e.g. star)? Out of scope for v1; the CRD shape allows it later.
-4. **Multi-controller scenarios**: in a deployment where two clusters each run their own controller, how should they coordinate? Likely via a "leader" cluster identified in the CRD; deferred.
-5. **Per-peer opt-in for received CIDRs**: today `allowedNetworks` is a unilateral declaration on the source side, plus a global allowlist on the controller. Should there additionally be a per-peer `acceptedNetworks` field, so a peer can refuse to accept some of what another peer publishes? Likely unnecessary given the controller-level allowlist, but worth revisiting once there are multi-tenant deployments with heterogeneous policies.
+4. **Multi-controller scenarios**: in a deployment where two clusters each run their own controller, how should they coordinate? Label-based isolation (above) prevents them from stomping on each other's Peers, but does not prevent two controllers from authoritatively declaring different opinions about the same source-cluster. Either out of scope (operators avoid this configuration) or to be resolved via a "leader" cluster identified in the CRD; deferred.
+5. **Per-peer opt-in for received CIDRs**: today `allowedNetworks` is a unilateral declaration on the source side. Should there additionally be a per-peer `acceptedNetworks` field, so a peer can refuse to accept some of what another peer publishes? Possibly relevant in deployments with heterogeneous trust policies; worth revisiting after the first round of usage.
+6. **Structured `allowedNetworks` fields**: keep the current flat list (one homogeneous validation list) or migrate to typed fields (`podCIDR`, `wireguardCIDR`, `additionalCIDRs`)? Squat raised this on the original PR ([review](https://github.com/cozystack/community/pull/7)); the current flat shape is intentionally narrow ("nothing else than what's listed here can end up in a Peer") and easy to migrate later. Deferred to v1alpha2 if needed.
 
 ## Alternatives considered
 
@@ -339,3 +326,7 @@ This rollout covers the upstream controller only. Cozystack adoption is a separa
 **Patching Kilo for health-aware peer selection**. Rejected because Kilo's design is explicitly declarative — kube-apiserver is the single source of truth, and runtime liveness is not consulted. Adding health-aware behaviour requires a substantial architectural change touching the reconcile loop, the Peer CRD, and the routes path. The maintenance burden of carrying such a fork outweighs the benefit when cross-mesh provides the desired property (no single point of failure on the data path) without any patch.
 
 **A Cozystack-internal `TenantMeshLink` controller (earlier draft of this proposal)**. The first iteration of this design lived inside Cozystack as a tenant-aware controller with a `TenantMeshLink` CRD. After discussion with the Kilo maintainer ([@squat](https://github.com/squat)) we moved to the present, tenant-agnostic design: a tenant-aware CRD is harder to upstream and locks Cozystack into carrying the controller alone. Moving the tenant model out of the controller and into the layer that creates `ClusterMesh` objects both opens the door to upstreaming under `kilo-io` and lets non-Cozystack users benefit from the same controller.
+
+**In-controller `--allowed-cidr` allowlist (earlier draft of this proposal)**. A previous iteration carried a deploy-time flag on the controller that bounded which CIDRs any `ClusterMesh` could declare in `allowedNetworks`. It was dropped after discussion: it functionally collapsed the "cluster admin" and "mesh admin" roles (every new mesh required editing the controller Deployment), and the defense it provided overlapped substantially with RBAC on `ClusterMesh` plus per-Node containment. The current design relies on RBAC as the address-surface chokepoint. Defense-in-depth at the *receiving* cluster's side (described next) is the better future direction.
+
+**Cluster-side defense via a Kilo-level `PeerClass`** (future Kilo work, [suggested by @squat](https://github.com/cozystack/community/pull/7) during review). Today an attacker who somehow obtains write access to `Peer` in a cluster (e.g. a rogue ClusterMesh controller, a misconfigured kubeconfig) can write any `allowedIPs` they like. A future Kilo enhancement could introduce a cluster-level allowlist for Peer `allowedIPs` — either as a `kg-agent` flag or as a `PeerClass` CRD declaring which CIDRs are permissible — so each cluster individually guards against rogue Peer creation, independent of any cross-cluster controller. This is orthogonal to the `ClusterMesh` controller and would benefit Kilo administration in general; tracked here as future work rather than as part of this proposal.
