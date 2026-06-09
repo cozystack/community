@@ -17,6 +17,17 @@ This repo contains (or will contain soon):
 
 We aim to make contributing to Cozystack open, transparent, and rewarding.
 
+## Where do I file?
+
+Cozystack work is split across two repositories. This repo is for **how we decide and what we should build**; the [cozystack/cozystack](https://github.com/cozystack/cozystack) repo is for **the product itself**.
+
+| You have… | Where it goes |
+|---|---|
+| A **bug** or a **concrete, scoped feature** | [cozystack/cozystack issues](https://github.com/cozystack/cozystack/issues/new/choose) |
+| A **usage question** or an early idea | [cozystack/cozystack Discussions](https://github.com/cozystack/cozystack/discussions) |
+| A **cross-cutting / architectural change** — affects multiple components or APIs, or needs a decision before code | A [design proposal](./design-proposals/README.md) (a PR) **here** |
+| **Governance, process, or community** matters | An issue **here** |
+
 ## Community Resources
 
 -   [Cozystack website](https://cozystack.io/)
@@ -39,9 +50,7 @@ Whether you're reporting an issue, proposing a feature, joining a working group,
     to ensure a respectful and inclusive environment for all community members.
 -   If you're using Cozystack, feel free to [add yourself to the ADOPTERS.md](https://github.com/cozystack/cozystack/blob/main/ADOPTERS.md)
     — we'd love to hear from you!
--   Thinking about a big feature or architectural change?
-    Start with our [design proposal guidelines](https://github.com/cozystack/cozystack/blob/main/docs/design-proposals/README.md)
-    to ensure a structured and collaborative discussion.
+-   Thinking about a big feature or architectural change? Start with our [design proposal guidelines](./design-proposals/README.md) to ensure a structured and collaborative discussion.
 
 ## Inspiration
 
