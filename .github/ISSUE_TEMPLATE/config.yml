@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🐛 Bug in Cozystack
+    url: https://github.com/cozystack/cozystack/issues/new/choose
+    about: Bugs live in the main cozystack repo, not here.
+  - name: ✨ Feature request
+    url: https://github.com/cozystack/cozystack/issues/new/choose
+    about: Concrete, scoped features go in the main cozystack repo.
+  - name: 📐 Design proposal / RFC
+    url: https://github.com/cozystack/community/tree/main/design-proposals
+    about: Architectural or cross-cutting changes — open a design-proposal PR (markdown) in this repo. Open a blank issue here only for governance, process, or community topics.
+  - name: 💬 Question or early idea
+    url: https://github.com/cozystack/cozystack/discussions
+    about: Usage questions and half-formed ideas — use the cozystack Discussions tab or Telegram (https://t.me/cozystack).
