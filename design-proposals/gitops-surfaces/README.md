@@ -102,25 +102,34 @@ The single most important design point. RBAC is object-level; the contract we ne
 
 #### Admin override layer (for UC1b — component parameters)
 
-Today, changing a downstream component's parameters (e.g. `linstor.autoDiskful.minutes`, a golden-image URL, a pinned version) means patching a *chart-owned* Package — the contested case. Instead, introduce a **clean override surface the platform chart reads but never owns**, extending the existing `cozystack-values` mechanism:
+Today, changing a downstream component's parameters (e.g. `linstor.autoDiskful.minutes`, a golden-image URL, a pinned version) means patching a *chart-owned* Package — the contested case. We solve it by **splitting the override layer out of the Package into its own resource**, extending the existing API with a third kind:
+
+| kind | owner | role |
+|---|---|---|
+| `PackageSource` | platform (unchanged) | charts + variants |
+| `Package` | the platform chart (`resource-policy: keep`) | the reconciled, system-owned layer |
+| `PackageValues` (new) | the admin repo | the human-owned override layer |
+
+A `PackageValues` object carries per-package admin overrides; the operator merges it over the matching Package's values when it builds the HelmRelease:
 
 ```yaml
-# carried on the hand-owned bootstrap Package (or a sibling cozystack-overrides Secret)
+apiVersion: cozystack.io/v1alpha1
+kind: PackageValues
+metadata:
+  name: cozystack.linstor      # 1:1 with the target Package by name
 spec:
   components:
-    platform:
+    linstor:
       values:
-        packageOverrides:
-          linstor:
-            autoDiskful:
-              minutes: 10
-          vm-default-images:
-            images:
-              - name: ubuntu-24.04
-                url: https://example/custom.img
+        autoDiskful:
+          minutes: 10
 ```
 
-Downstream package HelmReleases merge `packageOverrides.<name>` over their chart defaults. The admin then **only ever edits hand-owned objects** — no contention with helm-controller — and all admin config collapses to a single GitOps-managed surface, which is also the foundation for whole-cluster reproducibility (UC5).
+Because the chart never writes `PackageValues` and the admin never writes the chart-owned `Package`, **there is no field for the admin and helm-controller to fight over** — the force-ownership race is removed structurally, not merely sidestepped. This is *not* a sibling `cozystack-values`-style Secret (the operator hardcodes a single `valuesFrom` and resets others); `PackageValues` is a first-class CR the operator itself merges into `hr.Spec.Values`, so it cooperates with the existing reconcile path.
+
+The split is **additive**: with no `PackageValues` present, the operator path is byte-identical to today, so existing clusters are unaffected (see Upgrade compatibility). It also makes ownership enforceable by ordinary object-level RBAC — the admin GitOps SA gets write on `PackageValues` and read-only on `Package` — which is the discipline that keeps admins off chart-owned objects entirely, the foundation for whole-cluster reproducibility (UC5).
+
+*Alternative — `packageOverrides` on the bootstrap Package.* The same overrides can instead be carried as a `packageOverrides.<name>` map under `spec.components.platform.values` on the hand-owned bootstrap Package, with the platform chart merging them into each downstream Package at render time. This ships with no API change (pure chart templating) and collapses all admin config into one object, but it sidesteps the race rather than removing it, gives all-or-nothing RBAC on one god-object, and pushes list-vs-map merge correctness into per-package templates. Kept as a lighter-weight fallback; since `PackageValues` is additive, `packageOverrides` could even ship first as an interim.
 
 ### Tool 2 — Tenant GitOps (tenant, namespace scope)
 
@@ -143,14 +152,14 @@ A tenant must not be able to (a) reconcile into another namespace, or (b) borrow
 
 ## User-facing changes
 
-- **Admins:** a single `customizer.enabled` flag (plus `source`/`kustomization`/`rbac` blocks) in the platform values, off by default. When enabled, the admin manages the cluster from a git repo; component parameters are set via `packageOverrides`.
+- **Admins:** a single `customizer.enabled` flag (plus `source`/`kustomization`/`rbac` blocks) in the platform values, off by default. When enabled, the admin manages the cluster from a git repo; component parameters are set via `PackageValues` resources.
 - **Tenants:** a new **GitOps** entry in the app catalog. Instantiating it lets a tenant register a git repo that reconciles into their namespace. Sync status appears in the dashboard.
 - **Docs:** a new `operations/customizer` (admin) page and a tenant GitOps how-to, including the explicit trust model and the bootstrap-vs-downstream ownership rules.
 
 ## Upgrade and rollback compatibility
 
 - Fully **additive and opt-in**; existing clusters are unaffected until an operator enables a surface. No migration required.
-- The `packageOverrides` layer is backward compatible: absent the key, charts use their current defaults.
+- The `PackageValues` resource is additive: with none present, the operator builds HelmReleases exactly as today, so charts use their current defaults. (The `packageOverrides` alternative is equally backward compatible — absent the key, charts use their current defaults.)
 - **Rollback:** disabling a surface stops emitting its resources. Note that platform Packages carry `helm.sh/resource-policy: keep`, so the customizer Package and its child objects are **not** auto-deleted on disable — teardown is a documented manual step (this is existing platform behavior, called out here so it is not surprising).
 - Self-adoption of the bootstrap Package is reversible: stop reconciling it from the repo and resume hand-management; nothing about the object changes.
 
@@ -159,7 +168,7 @@ A tenant must not be able to (a) reconcile into another namespace, or (b) borrow
 This is the heart of the proposal; each tier has a distinct, **explicit** trust boundary.
 
 - **Tool 1 (admin):** repo write == cluster-admin, by design and by documentation. The curated ClusterRole in the prototype (patch-not-delete on Packages, no CRDs, etc.) is *defense against accident, not against intent* — anyone with repo write can escalate, so the docs must not over-claim a boundary. New trust surface introduced: an admin git repo + its credentials (protect like a kubeconfig), and a standing, self-healing reconciling credential whose blast radius equals an admin's.
-- **Tool 1 footguns to narrow** (they cost nothing functionally): source access should not let the customizer rewrite the platform's *own* supply chain (the `cozystack-packages` OCIRepository in `cozy-system`), so scope write away from `cozy-system`; and field ownership on downstream Packages should eventually be enforced by a `ValidatingAdmissionPolicy` scoped to the customizer SA that rejects changes to fields currently managed by helm-controller (detected via `managedFields`), leaving the hand-owned bootstrap Package free. Until then, the `packageOverrides` layer keeps admins off chart-owned objects entirely, so the contract is mostly avoided rather than merely documented.
+- **Tool 1 footguns to narrow** (they cost nothing functionally): source access should not let the customizer rewrite the platform's *own* supply chain (the `cozystack-packages` OCIRepository in `cozy-system`), so scope write away from `cozy-system`; and field ownership on downstream Packages should eventually be enforced by a `ValidatingAdmissionPolicy` scoped to the customizer SA that rejects changes to fields currently managed by helm-controller (detected via `managedFields`), leaving the hand-owned bootstrap Package free. Until then, the `PackageValues` resource keeps admins off chart-owned objects entirely — they write `PackageValues`, never the chart-owned `Package` — so the contract is structurally avoided rather than merely documented.
 - **Tool 2 (tenant):** the surface runs as the tenant's own SA, so it can do nothing the tenant cannot already do via the API. The new risk is **cross-namespace / SA-borrowing**, closed by the tenant shard lockdown (`--no-cross-namespace-refs`, forced `serviceAccountName`). Tenant-supplied input = the contents of a tenant-owned repo, bounded by `cozy:tenant:*`.
 - **Secrets:** both tiers may pull git credentials and SOPS keys. These are admin/tenant pre-created Secrets; the platform never generates or owns them.
 
@@ -167,23 +176,23 @@ This is the heart of the proposal; each tier has a distinct, **explicit** trust 
 
 - Missing `source.url` / `kustomization.path` when enabled → chart `fail`s at render; Flux surfaces the error on HelmRelease status (already implemented in the prototype).
 - Private repo without a `secretRef` → GitRepository reports auth failure on its status; no partial apply.
-- Admin manifest declares a chart-owned Package field directly (bypassing `packageOverrides`) → silently claimed from helm-controller until the admission policy lands; documented as advisory in the interim.
+- Admin manifest declares a chart-owned Package field directly (bypassing `PackageValues`) → silently claimed from helm-controller until the admission policy lands; documented as advisory in the interim.
 - Tenant Kustomization references a source in another namespace or a foreign SA → rejected by the tenant shard lockdown.
 - Customizer disabled then re-enabled → resources re-adopt cleanly (SSA, `resource-policy: keep`); no duplicate-creation errors.
-- `packageOverrides` set for a non-existent component → no-op; the override map is read only by the components that look for their key.
+- `PackageValues` for a non-existent Package → no-op; the operator has no Package to merge it into, and merge keys for absent components are ignored.
 
 ## Testing
 
 - **Helm unit tests** (`make unit-tests`): bundle wiring for the customizer (enabled / disabled / `disabledPackages`) — already in the prototype; add assertions that lock the RBAC surface (no `delete` on Packages, source write excluded from `cozy-system`).
-- **Helm unit tests** for `packageOverrides` merge precedence on at least one downstream package (e.g. linstor).
+- **Operator unit tests** for `PackageValues` merge precedence on at least one downstream package (e.g. linstor): map keys merge deep, list keys follow the documented policy, and an absent `PackageValues` leaves `hr.Spec.Values` byte-identical to today.
 - **Helm unit tests** for the tenant `gitops` app: SA is forced to `<tenant-name>`, sourceRef is in-namespace.
-- **e2e (BATS, `hack/e2e-apps/`):** enable the admin surface against a dev cluster, push a `packageOverrides` change, assert the downstream HelmRelease re-renders; create a tenant `gitops` app, assert it reconciles an Application CR and is denied a cross-namespace ref.
+- **e2e (BATS, `hack/e2e-apps/`):** enable the admin surface against a dev cluster, push a `PackageValues` change, assert the downstream HelmRelease re-renders; create a tenant `gitops` app, assert it reconciles an Application CR and is denied a cross-namespace ref.
 - **Manual:** `kubectl auth can-i --as=...` matrix for both SAs (already done for the admin SA in #2731); verify the tenant SA cannot reconcile outside its namespace.
 
 ## Rollout
 
 1. **Tool 1, Phase 1** — admin customizer system package + ownership-model docs ([#2731](https://github.com/cozystack/cozystack/pull/2731), in review). Narrow the two source/field footguns noted under Security.
-2. **Tool 1, Phase 2** — `packageOverrides` admin override layer. Highest leverage: unblocks safe component-parameter changes (UC1b) and whole-cluster reproducibility (UC5).
+2. **Tool 1, Phase 2** — the `PackageValues` admin override resource (new API kind + operator merge). Highest leverage: unblocks safe component-parameter changes (UC1b) and whole-cluster reproducibility (UC5). If the new kind needs to wait, the `packageOverrides` chart-only alternative can land first as an interim.
 3. **Tool 2, Phases 1–2** — tenant `gitops` app + tenant kustomize-controller shard with lockdown. The largest user-visible win.
 4. **Cross-cutting** — secrets-as-code + dashboard sync-status views.
 5. **Hardening** — field-ownership `ValidatingAdmissionPolicy` (separate proposal) and policy-as-code guardrails.
@@ -192,14 +201,15 @@ This is the heart of the proposal; each tier has a distinct, **explicit** trust 
 
 1. **`packages/system/fluxcd` vs `internal/fluxinstall`** — is the flux-operator-managed `FluxInstance` (`multitenant: false`) a separate reconciliation path from the operator-embedded controllers? This determines exactly which instance serves tenant Kustomizations and where the lockdown flags belong.
 2. **Tenant raw resources** — should the tenant SA ever hold raw `HelmRelease` / CR create rights, or stay confined to the curated Application abstraction? Affects how much of UC2 is "BYO manifests" vs "catalog apps from git."
-3. **Override layer shape** — `packageOverrides` on the bootstrap Package vs a dedicated `cozystack-overrides` Secret. The former keeps a single object; the latter decouples override lifecycle from the bootstrap Package.
+3. **`PackageValues` merge precedence and binding** — the precedence chain (chart defaults < `cozystack-values` < `Package` < `PackageValues`) and the list-vs-map merge policy need to be fixed and documented; and `PackageValues` must bind to its target Package (1:1 by name, as drafted, vs an explicit `spec.packageRef`). Secondary: whether to also keep the `packageOverrides` chart layer as a documented convenience or drop it once `PackageValues` lands.
 4. **Tenant GitOps delivery** — catalog app (recommended) vs a `spec.gitops` field on the `Tenant` CR. The app avoids an API change; the field is more discoverable.
 
 ## Alternatives considered
 
 - **Runtime mechanism — give admins/tenants raw Flux CRDs via RBAC, no chart.** Rejected: no curated trust tiers, no isolation defaults, and tenants would need source/kustomize RBAC plus a cross-namespace lockdown anyway. The primitive-as-a-package gives a consistent UX and safe defaults for the same underlying objects.
-- **Field ownership — solve UC1b with RBAC (`resourceNames` allow/deny on Packages).** Rejected: RBAC is object-level, but the contract is field-level (admin owns `spec.components.*.values`, chart owns `spec.variant` and structural fields). Denying the object re-introduces hand-management of the parameters admins most want; allowing it races helm-controller. The override layer plus a field-level admission policy is the correct axis.
-- **Field ownership — bespoke admission webhook now.** Deferred in favor of a `ValidatingAdmissionPolicy` (native, CEL, no webhook server) and, before either, the `packageOverrides` layer that avoids the contested objects entirely.
+- **Field ownership — solve UC1b with RBAC (`resourceNames` allow/deny on Packages).** Rejected: RBAC is object-level, but on a single Package the contract is field-level (admin owns `spec.components.*.values`, chart owns `spec.variant` and structural fields), and RBAC cannot express that. Splitting overrides into a separate `PackageValues` resource turns the field-level contract back into an object-level one — write `PackageValues`, read-only `Package` — which RBAC *can* enforce. Denying the chart-owned Package object outright would instead re-introduce hand-management of the parameters admins most want.
+- **Override layer — `packageOverrides` on the bootstrap Package (chart-only, no API change).** The override map lives under `spec.components.platform.values` and the platform chart merges it into each downstream Package at render time. Considered as the primary mechanism and kept as a lighter-weight alternative (see the Admin override layer section): it ships without touching the API but sidesteps the force-ownership race rather than removing it, gives all-or-nothing RBAC on one god-object, and pushes merge correctness into per-package templates. `PackageValues` is preferred; `packageOverrides` remains a valid interim because it is additive and independent.
+- **Field ownership — bespoke admission webhook now.** Deferred in favor of a `ValidatingAdmissionPolicy` (native, CEL, no webhook server) and, before either, the `PackageValues` split that keeps admins off the contested objects entirely.
 - **Tenant isolation — flip global Flux multitenancy.** Rejected as the default: it constrains the platform's own Kustomizations. A dedicated tenant shard matches the existing `flux-tenants` pattern and limits the blast radius.
 - **Tenant delivery — extend the `Tenant` CRD with a `gitops` field.** Viable, kept as an open question; the catalog app is preferred to avoid a core API change and to make the surface opt-in per tenant.
 - **One monolithic tool for all cases.** Rejected: admin and tenant surfaces have fundamentally different trust models, RBAC, and isolation requirements. They share a primitive, not an implementation.
