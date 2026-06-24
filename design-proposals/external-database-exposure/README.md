@@ -74,25 +74,38 @@ Two concrete problems, both solved by SNI-passthrough plus certificate reuse:
 ```mermaid
 flowchart TB
   subgraph ext["External clients"]
-    C1["psql<br/>SNI=db.alice.example.org:5432"]
-    C2["redis-cli<br/>SNI=cache.alice.example.org:6379"]
+    C1["psql<br/>SNI=db1.alice.example.org:5432"]
+    C2["psql<br/>SNI=db2.alice.example.org:5432"]
+    C3["redis-cli<br/>SNI=cache.alice.example.org:6379"]
   end
-  subgraph gw["Tenant Gateway — ONE LoadBalancer IP"]
-    L1["listener tls-db<br/>5432 / Passthrough"]
-    L2["listener tls-cache<br/>6379 / Passthrough"]
+  subgraph gw["Tenant Gateway — ONE LoadBalancer IP, one listener per engine type"]
+    L1["listener tls-postgres<br/>5432 / Passthrough<br/>hostname *.alice.example.org"]
+    L2["listener tls-redis<br/>6379 / Passthrough<br/>hostname *.alice.example.org"]
+  end
+  subgraph rt["Per-release TLSRoutes (SNI hostname)"]
+    R1["TLSRoute db1"]
+    R2["TLSRoute db2"]
+    R3["TLSRoute cache"]
   end
   subgraph pods["Operator-owned database pods"]
-    P1["postgres<br/>presents CNPG server cert"]
-    P2["redis<br/>presents operator server cert"]
+    P1["postgres db1<br/>presents CNPG server cert"]
+    P2["postgres db2<br/>presents CNPG server cert"]
+    P3["redis cache<br/>presents operator server cert"]
   end
   CA["&lt;release&gt;-ca-cert (ca.crt only)<br/>projected via tenantsecrets"]
-  C1 -->|"raw TLS, SNI-routed"| L1 -->|"no termination"| P1
-  C2 -->|"raw TLS, SNI-routed"| L2 -->|"no termination"| P2
+  C1 -->|"raw TLS, SNI"| L1
+  C2 -->|"raw TLS, SNI"| L1
+  C3 -->|"raw TLS, SNI"| L2
+  L1 -->|"SNI db1"| R1 -->|"no termination"| P1
+  L1 -->|"SNI db2"| R2 -->|"no termination"| P2
+  L2 -->|"SNI cache"| R3 -->|"no termination"| P3
   CA -.->|"verifies"| C1
-  CA -.->|"verifies"| C2
+  CA -.->|"verifies"| C3
 ```
 
-A Gateway listener is keyed by the tuple (port, protocol, hostname/SNI). SNI-based routing therefore works on any TCP port, not only 443 — a `TLSRoute` selects its backend by hostname regardless of the listener's port. "Share one IP via SNI" and "use the native port" are orthogonal, so the design takes both: one passthrough listener per engine on its native port — `tls-<release>` on 5432 for postgres, 6379 for redis, 27017 for sharded mongo, 3306 for mariadb — each `mode: Passthrough`, hostname `<release>.<apex>`, SNI-routed via a per-release `TLSRoute`. All of a tenant's database listeners live on the one tenant Gateway and therefore share its single IP.
+A Gateway listener is keyed by the tuple (port, protocol, hostname/SNI), and **multiple `TLSRoute` objects can attach to one listener**, each selecting its backend by its own `spec.hostnames`. SNI-based routing therefore works on any TCP port, not only 443, and — crucially — it does not need a listener per database. The design uses **one passthrough listener per engine type**, on that engine's native port, with a wildcard hostname: `tls-postgres` on 5432, `tls-redis` on 6379, `tls-mongos` on 27017, `tls-mariadb` on 3306 — each `mode: Passthrough`, hostname `*.<apex>` (or unrestricted), `AllowedRoutes` limited to `TLSRoute`. Every database release of that engine then attaches a per-release `TLSRoute` carrying `spec.hostnames: ["<release>.<apex>"]`, and the Gateway SNI-routes each connection to the right backend. All of a tenant's database listeners live on the one tenant Gateway and therefore share its single IP.
+
+This keeps listener consumption at **O(engine types)** — at most four or five — rather than O(database instances). A tenant running thirty Postgres releases spends one `tls-postgres` slot, not thirty, so the 64-listener budget (§3) stops being a per-database ceiling and the consolidation goal scales with instance count, not against it.
 
 Native ports are chosen over forcing everything onto 443 because the latter buys nothing: it does not improve IP consolidation (SNI already does that on any port) and it breaks client ergonomics and tooling defaults (`psql -h host` assumes 5432) while still demanding direct-TLS. The all-on-443 variant is retained as a documented opt-in for operators who want a single-port firewall surface (see Alternatives).
 
@@ -119,7 +132,7 @@ The headline payoff is IPv4 scarcity relief. Today ten external databases cost t
 
 The ceiling, stated honestly:
 
-- `Gateway.spec.listeners` is capped at 64. The tenant Gateway already spends slots on the http/https/https-apex listeners, the per-child-apex wildcard listeners, and the three default passthrough services. Database listeners draw from the same budget; an operator near the cap should split a high-fanout subtree onto its own Gateway via `tenant.spec.gateway=true`, as the controller already advises.
+- `Gateway.spec.listeners` is capped at 64. Because database listeners are **one per engine type** (§1), not one per release, their contribution to that budget is bounded by the four or five supported engines no matter how many instances a tenant runs; the per-release fan-out lands on `TLSRoute` objects, which are not capped. The remaining slots go to the http/https/https-apex listeners, the per-child-apex wildcard listeners, and the three default passthrough services. A tenant therefore approaches the cap through child-apex fan-out, not database fan-out; the controller's existing advice to split a high-fanout subtree onto its own Gateway via `tenant.spec.gateway=true` still applies there.
 - Multi-Gateway IP sharing is not possible today (the one-IP-per-tenant blocker above). The win is one IP per tenant Gateway. Lifting it to share an IP across Gateways depends on Cilium implementing ListenerSet (experimental in Gateway API v1.5.1, not implemented by Cilium 1.19.3).
 
 ### 4. Per-engine treatment
@@ -139,26 +152,30 @@ Kafka is deferred because its wire protocol redirects: the client connects to a 
 
 The trigger and listener synthesis stay in the controller; database charts do not render Gateway plumbing. Database charts already receive the `_cluster` values channel and read parts of it (for example `packages/apps/postgres/templates/db.yaml` reads `_cluster.scheduling`, and mongodb reads `_cluster["cluster-domain"]`), but they do not read the gateway-discovery keys that `cozystack-api` consumes (the gateway-enabled flag and the gateway name) and have no logic to locate the tenant Gateway. Teaching every database chart that discovery dance would duplicate it across five charts and couple application charts to networking topology. The controller already owns listener synthesis; keep it there.
 
-The existing `TLSPassthroughServices []string` field (`api/gateway/v1alpha1/tenantgateway_types.go`) is too weak for databases — a bare service name hardcodes the layer-7 convention of port 443 and hostname `<name>.<apex>`. Add one structured field alongside it, leaving the existing field untouched for backward compatibility:
+Two objects implement the model, at different cardinalities: one shared listener per engine type, and one `TLSRoute` per database release.
+
+The **listener** is the new API surface. The existing `TLSPassthroughServices []string` field (`api/gateway/v1alpha1/tenantgateway_types.go`) is too weak — a bare service name hardcodes the layer-7 convention of port 443 and hostname `<name>.<apex>`. Add one structured field alongside it, leaving the existing field untouched for backward compatibility:
 
 ```go
-// TLSPassthroughBackend declares a per-engine passthrough listener on a
-// native port, SNI-routed to a backend Service.
-type TLSPassthroughBackend struct {
-    Name       string `json:"name"`               // listener suffix -> "tls-<name>"
-    Port       int32  `json:"port"`               // native port (5432/6379/27017/3306)
-    Hostname   string `json:"hostname,omitempty"` // default "<name>.<apex>"
-    BackendRef ...    `json:"backendRef"`          // Service + port (cross-namespace via ReferenceGrant)
+// TLSPassthroughListener declares one shared passthrough listener for a
+// database engine type, on its native port, with a wildcard SNI hostname.
+// Every release of that engine attaches its own TLSRoute by SNI hostname.
+type TLSPassthroughListener struct {
+    Name     string `json:"name"`               // listener suffix -> "tls-<name>" (e.g. "postgres")
+    Port     int32  `json:"port"`               // native port (5432/6379/27017/3306)
+    Hostname string `json:"hostname,omitempty"` // wildcard SNI match, default "*.<apex>"
 }
 
-// TLSPassthroughBackends extends TLSPassthroughServices for engines that need
-// a native (non-443) port. Each entry renders one Passthrough listener
-// "tls-<name>" on .Port; a TLSRoute attaches by sectionName.
+// TLSPassthroughListeners renders one Passthrough listener "tls-<name>" on
+// .Port per entry, AllowedRoutes restricted to TLSRoute. Independent of the
+// layer-7 TLSPassthroughServices field.
 // +optional
-TLSPassthroughBackends []TLSPassthroughBackend `json:"tlsPassthroughBackends,omitempty"`
+TLSPassthroughListeners []TLSPassthroughListener `json:"tlsPassthroughListeners,omitempty"`
 ```
 
-The controller change is to extend the existing passthrough-listener loop to also iterate `TLSPassthroughBackends`, rendering each listener with the supplied `Port` instead of the hardcoded 443. The `TLSRoute` attaches by `sectionName: tls-<name>`, identical to the existing `api-tlsroute.yaml` pattern. The field is populated by the Tenant / HelmRelease orchestration layer that already knows both the tenant Gateway and the database release — not the database chart and not the human — so a database's surface stays a single `external`-adjacent toggle.
+The **route** is a standard Gateway API `TLSRoute` (no new type), rendered once per exposed database release: `spec.parentRefs` attaches to the shared `tls-<engine>` listener by `sectionName`, `spec.hostnames: ["<release>.<apex>"]` carries the SNI match, and `spec.rules[].backendRefs` is a standard `gwapiv1alpha2.BackendRef` (whose embedded `BackendObjectReference` points at the database Service on its native port, cross-namespace via `ReferenceGrant`).
+
+The controller change is to render, per `TLSPassthroughListeners` entry, one Passthrough listener on the supplied `Port` instead of the hardcoded 443, and to attach each per-release `TLSRoute` by `sectionName: tls-<name>` — the same attachment pattern as the existing `api-tlsroute.yaml`, except that many routes share one listener and the Gateway disambiguates them by SNI hostname. Both are populated by the Tenant / HelmRelease orchestration layer that already knows the tenant Gateway and the database release — not the database chart and not the human — so a database's surface stays a single `external`-adjacent toggle. The engine-type listener is created on first exposure of that engine and removed once its last release is gone; per-release add/remove only touches the route, never the shared listener.
 
 ### 6. Trust-anchor and SAN flow
 
@@ -170,24 +187,25 @@ A database gains an `external`-adjacent toggle to select passthrough/SNI mode. P
 
 ## Upgrade and rollback compatibility
 
-The default stays today's per-database LoadBalancer, so no existing external database changes its IP on upgrade. Passthrough/SNI mode is opt-in. Migrating an existing external database to SNI mode is a breaking, opt-in change — the IP changes and the client must be reconfigured (new host, direct-TLS for Postgres); it is not automatic. The existing `TLSPassthroughServices` field continues to work unchanged, and reverting the feature removes the new listener and field without touching the database's own PKI.
+The default stays today's per-database LoadBalancer, so no existing external database changes its IP on upgrade. Passthrough/SNI mode is opt-in. Migrating an existing external database to SNI mode is a breaking, opt-in change — the IP changes and the client must be reconfigured (new host, direct-TLS for Postgres); it is not automatic. The existing `TLSPassthroughServices` field continues to work unchanged, and reverting the feature removes the per-release routes and the engine-type listeners without touching the database's own PKI.
 
 ## Security
 
-The edge never holds the database's private key — the central strength of passthrough over termination. SNI is sent in cleartext on TLS 1.3 except under ECH, which database clients do not use, so the external hostname `<release>.<apex>` is observable on the wire; this is no worse than DNS or SNI exposure for any TLS service, and the payload stays encrypted end-to-end. A missing or mis-emitted SNI is a hard connection failure (a passthrough listener has no certificate to fall back to) — fail-closed, which is the secure default. Cross-namespace `backendRef` requires a `ReferenceGrant`, consistent with the existing attached-namespaces model. Because trust rides the `ca.crt`-only object, clients never receive private key material.
+The edge never holds the database's private key — the central strength of passthrough over termination. SNI is sent in cleartext on TLS 1.3 except under ECH, which database clients do not use, so the external hostname `<release>.<apex>` is observable on the wire; this is no worse than DNS or SNI exposure for any TLS service, and the payload stays encrypted end-to-end. A missing or mis-emitted SNI is a hard connection failure (a passthrough listener has no certificate to fall back to) — fail-closed, which is the secure default. Exposing a database externally with TLS explicitly off is not silently corrected: when `tls.enabled` is left unset the tri-state turns TLS on together with `external`, but an explicit `tls.enabled: false` combined with `external: true` is **rejected by a ValidatingAdmissionPolicy** — the same admission mechanism that already enforces tenant hostname/IP isolation — so a tenant cannot stand up a plaintext external endpoint by accident or by overriding the default, and the conflict surfaces as a clear admission error rather than a silent override the operator never sees. Cross-namespace `backendRef` requires a `ReferenceGrant`, consistent with the existing attached-namespaces model. Because trust rides the `ca.crt`-only object, clients never receive private key material.
 
 ## Failure and edge cases
 
 - A pre-PG17 or non-direct-TLS Postgres client sends no SNI → no route → connection reset/timeout (document the symptom).
-- The 64-listener budget is exceeded → the listener is rejected; mitigation is to split the high-fanout subtree onto its own Gateway.
-- `tls.enabled=false` while exposing externally → certificate SAN mismatch; the tri-state should auto-enable TLS with `external`.
+- The 64-listener budget is exceeded → the listener is rejected; because listeners are one per engine type this is reached only through child-apex fan-out, and the mitigation is to split that subtree onto its own Gateway.
+- An explicit `tls.enabled: false` together with `external: true` → rejected at admission by a ValidatingAdmissionPolicy, not silently overridden; an unset `tls` tri-state auto-enables TLS with `external`.
 - An operator expects multi-Gateway IP sharing → each Gateway still gets its own IP (expected under the Cilium constraint).
-- A database is deleted → its `TLSPassthroughBackends` entry and listener must be cleaned up so they do not orphan against the 64-listener cap.
+- A database is deleted → its per-release `TLSRoute` is removed; the shared engine-type listener is removed only when its last release is gone, so a single deletion never orphans a listener.
 
 ## Testing
 
 - Helm-template assertions that the certificate SAN includes `<release>.<apex>` per engine, mirroring the existing TLS test fixtures.
-- A controller unit test that a `TLSPassthroughBackends` entry renders a listener on the native port with `mode: Passthrough` and `AllowedRoutes` restricted to `TLSRoute`.
+- A controller unit test that a `TLSPassthroughListeners` entry renders a shared listener on the native port with `mode: Passthrough` and `AllowedRoutes` restricted to `TLSRoute`, and that two per-release `TLSRoute` objects on that one listener SNI-route to their respective backends.
+- An admission test that `tls.enabled: false` with `external: true` is rejected by the ValidatingAdmissionPolicy, while an unset `tls` is admitted and auto-enables.
 - An end-to-end test per fitting engine: connect from outside the cluster with SNI and `ca.crt`, and assert that the serial of the presented certificate equals the operator-issued internal certificate — proving reuse, not re-issuance.
 - A negative test: a client without SNI fails closed.
 
@@ -205,9 +223,9 @@ Kafka and non-sharded MongoDB are explicitly out of this rollout. Each phase shi
 - **MariaDB / MySQL connector conformance** — do the dominant connectors (libmysqlclient, MariaDB Connector/C, JDBC, Go drivers) emit SNI and do TLS-first such that passthrough routes correctly, or does any do a server-greeting-then-STARTTLS dance like pre-direct-TLS Postgres? Default-on versus opt-in for MariaDB hinges on this.
 - **Direct-TLS client floor for Postgres** — what fraction of the tenant base predates `sslnegotiation=direct`? Is a per-release attestation gate enough, given there is no graceful downgrade on a passthrough listener?
 - **Cilium passthrough on a non-443 port** — the existing passthrough listeners all run on 443; whether Cilium 1.19.3's Gateway implementation honors a `mode: Passthrough` listener on a native database port (5432/6379/27017/3306) and SNI-routes it is unverified and is the single biggest implementation risk. It is the Phase 1 validation gate in Rollout.
-- **TLSRoute ownership** — does the controller synthesize the `TLSRoute` alongside the listener (single source of truth, but the controller must know the backend Service), or does the database chart render it (the chart owns the backend selector, but must learn a gateway name/namespace it does not have today)? This decides whether database charts gain gateway-discovery logic.
-- **Who writes `TLSPassthroughBackends`** — the orchestration layer auto-appending on `external: true` plus passthrough mode, an operator-managed explicit list, or both; and which reconciliation owns add/remove and orphaned-listener cleanup on database deletion.
-- **64-listener budget accounting** — with the parent listeners, per-child-apex wildcards, default passthrough services, and N database listeners, what is the realistic per-tenant ceiling, and should the controller surface a status condition as the budget nears 64?
+- **TLSRoute ownership** — does the controller synthesize the per-release `TLSRoute` alongside the shared listener (single source of truth, but the controller must know the backend Service), or does the database chart render it (the chart owns the backend selector, but must learn a gateway name/namespace it does not have today)? This decides whether database charts gain gateway-discovery logic.
+- **Who writes the listener/route set** — the orchestration layer auto-creating the engine-type listener on first exposure and a per-release route on each `external: true` + passthrough, an operator-managed explicit list, or both; and which reconciliation owns route add/remove plus reference-counting the shared listener down to zero on the last database deletion.
+- **64-listener budget accounting** — with the parent listeners, per-child-apex wildcards, and default passthrough services now joined by one listener per database engine type (not per instance), what is the realistic per-tenant ceiling, and should the controller still surface a status condition as the budget nears 64?
 - **ListenerSet timeline** — multi-Gateway IP sharing is blocked on Cilium implementing ListenerSet. Do we design the field and status to be ListenerSet-ready now, or revisit when Cilium ships it? This determines whether one-IP-per-tenant is a permanent or temporary ceiling.
 
 ## Alternatives considered
