@@ -14,7 +14,6 @@ The choice of identity unit is the central decision in this proposal. A cozystac
 ## Scope and related proposals
 
 - **Implementation PR**: [`cozystack#3044`](https://github.com/cozystack/cozystack/pull/3044). Adds per-tenant realm provisioning, per-cluster client+groups, `--oidc-*` wiring on `KamajiControlPlane`, OIDC kubeconfig Secret, and dashboard exposure.
-- **Companion (Grafana side)**: [`design/grafana-keycloak-tenants`](../grafana-keycloak-tenants/) (separate proposal, same realm). Same per-tenant realm reused for tenant Grafana access.
 - **Deferred (separate proposal):** Bring-your-own OIDC for tenant clusters via Kubernetes structured authentication configuration. Not in this proposal; called out under Open questions.
 - **Deferred (separate proposal):** Custom `client.authentication.k8s.io` exec plugin doing RFC 8693 Token Exchange. Not in this proposal; called out under Alternatives considered.
 
@@ -225,8 +224,7 @@ No CLI changes in this proposal. A future `cozystack` CLI command for "give me a
 ## Rollout
 
 1. cozystack release N (this PR, [`#3044`](https://github.com/cozystack/cozystack/pull/3044)): per-tenant realm via `extra/oidc`, per-cluster client+groups+RBAC, OIDC kubeconfig Secret, dashboard exposure. `Tenant.spec.oidc` and `Kubernetes.spec.oidc.enabled` ship as `false` by default; no existing cluster is affected.
-2. cozystack release N+1: companion `grafana-keycloak-tenants` lands (separate proposal) — tenant Grafana reuses the same `tenant-<ns>` realm. Same client/group naming convention.
-3. cozystack release N+2 onward: bring the BYO-OIDC follow-up proposal forward (structured authentication configuration on `KamajiControlPlane`). Additive to this proposal — a tenant cluster will be able to trust both the platform-provided `tenant-<ns>` realm and a tenant-provided external issuer in parallel.
+2. cozystack release N+1 onward: bring the BYO-OIDC follow-up proposal forward (structured authentication configuration on `KamajiControlPlane`). Additive to this proposal — a tenant cluster will be able to trust both the platform-provided `tenant-<ns>` realm and a tenant-provided external issuer in parallel.
 
 ## Open questions
 
