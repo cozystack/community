@@ -31,7 +31,7 @@ Tenant Kubernetes clusters provisioned by the `kubernetes` app (`packages/apps/k
 - **`apps/tenant` chart** — owns the lifecycle of a tenant namespace, currently emits cozystack-basics values via a static template, exposes a flat `Tenant.spec.*` API.
 - **`apps/kubernetes` chart** — renders `Cluster`, `KamajiControlPlane`, `KubevirtCluster`, MachineDeployments, addons. Accepts `oidc` values today only as no-op fields; no resources rendered.
 - **`packages/extra/oidc/`** (new in cozystack#3044) — Helm chart owning the `ClusterKeycloakRealm` + bootstrap admin user for one tenant realm.
-- **`KamajiControlPlane`** — Kamaji's `tcp.kamaji.clastix.io/v1alpha1` CRD allows arbitrary `--oidc-*` flags via `spec.apiServer.extraArgs`. It also supports `spec.deployment.extraVolumes` + `spec.apiServer.extraVolumeMounts`, which matter for the BYO-OIDC follow-up but not for this proposal.
+- **`KamajiControlPlane`** — Kamaji's `tcp.kamaji.clastix.io/v1alpha1` CRD allows arbitrary apiserver flags via `spec.apiServer.extraArgs`, and supports `spec.deployment.extraVolumes` + `spec.apiServer.extraVolumeMounts` for mounting files into the apiserver pod. Both are used by Layer 5 to deliver a structured `AuthenticationConfiguration` to the apiserver.
 
 ### The problem
 
@@ -52,6 +52,7 @@ And whatever shape we ship has to fit within an existing structural reality: the
 - Default RBAC for OIDC identities is **view + admin split, not blanket cluster-admin**. The static admin kubeconfig stays as the break-glass path.
 - The full surface (realm + client + groups + RBAC + kubeconfig Secret) is declarative: `Tenant.spec.oidc=true` is enough.
 - The chart's existing API stays additive — clusters without `oidc.enabled` render the same objects as on `main`.
+- Authentication wiring is structured (`AuthenticationConfiguration`), not flag-based, so multi-issuer / BYO-OIDC and private-CA paths extend the same Secret in follow-up work instead of fighting the chart shape.
 
 ### Non-goals
 
@@ -109,21 +110,60 @@ Inside the tenant Kubernetes cluster, a bootstrap Job (Helm `post-install,post-u
 
 The static admin kubeconfig stays. It is the documented break-glass path when OIDC is misconfigured or the realm operator is down.
 
-### Layer 5 — KCP OIDC flag wiring
+### Layer 5 — KCP wired via structured authentication config file
 
-`apps/kubernetes/templates/cluster.yaml` adds `spec.apiServer.extraArgs` on `KamajiControlPlane` when `oidc.enabled` AND the realm is known (cozystack-basics emitted `_namespace.oidc-realm`):
+`apps/kubernetes/templates/cluster.yaml` extends the tenant's `KamajiControlPlane` to consume a **structured `AuthenticationConfiguration`** (`apiserver.config.k8s.io/v1beta1`) mounted as a file, rather than the legacy `--oidc-*` flag set. Three pieces line up:
 
-```yaml
-spec:
-  apiServer:
-    extraArgs:
-    - --oidc-issuer-url=https://keycloak.<root-host>/realms/<realm>
-    - --oidc-client-id=<ns>-kubernetes-<cluster>
-    - --oidc-username-claim=preferred_username
-    - --oidc-groups-claim=groups
-```
+1. `spec.apiServer.extraArgs` gains a single flag pointing the apiserver at the config file:
 
-If `oidc.enabled=true` but cozystack-basics has not yet emitted `_namespace.oidc-realm` (because the realm hasn't reconciled yet), the chart emits a soft beacon — a `ConfigMap` named `<cluster>-awaiting-oidc-realm`, status `awaiting-oidc-realm` — and **does not** add the extraArgs. Flux re-renders on its normal interval; once the realm value lands in namespace values, the next render produces the extraArgs and triggers a `KamajiControlPlane` patch. This sidesteps the Helm lookup re-render gap completely (no lookup is involved at all).
+   ```yaml
+   spec:
+     apiServer:
+       extraArgs:
+       - --authentication-config=/etc/kubernetes/authentication-config/config.yaml
+       extraVolumeMounts:
+       - name: authentication-config
+         mountPath: /etc/kubernetes/authentication-config
+         readOnly: true
+     deployment:
+       extraVolumes:
+       - name: authentication-config
+         secret:
+           secretName: <release>-oidc-authn-config
+           items:
+           - key: config.yaml
+             path: config.yaml
+   ```
+
+2. A per-cluster Secret `<release>-oidc-authn-config` carries the structured config — rendered by a sibling template `apps/kubernetes/templates/oidc-authn-config.yaml`:
+
+   ```yaml
+   apiVersion: apiserver.config.k8s.io/v1beta1
+   kind: AuthenticationConfiguration
+   jwt:
+   - issuer:
+       url: https://keycloak.<root-host>/realms/<realm>
+       audiences:
+       - <ns>-kubernetes-<cluster>
+     claimMappings:
+       username:
+         claim: preferred_username
+         prefix: ""
+       groups:
+         claim: groups
+         prefix: ""
+   ```
+
+3. Audience binding stays identical to the flag path: the `audiences:` entry in the structured config equals the per-cluster `KeycloakClient.spec.clientId`, so id_tokens minted for one cluster are rejected by every other cluster's apiserver.
+
+Why structured config rather than `--oidc-*` flags:
+
+- **Multi-issuer ready.** `AuthenticationConfiguration.jwt` is a list. The BYO-OIDC follow-up can add a tenant-provided issuer alongside the platform-provided one without rewiring the chart.
+- **Private-CA support is unblocked.** `issuer.certificateAuthority` accepts inline PEM, so a tenant's self-signed issuer (a common on-prem case) just works. The flag-based path could not.
+- **Hot reload.** Editing the Secret causes the apiserver to pick up new config without a pod restart (Kubernetes 1.30+).
+- **Single point of change.** Future claim mappings, validation rules, or CEL expressions extend one structured file instead of accreting flags.
+
+If `oidc.enabled=true` but cozystack-basics has not yet emitted `_namespace.oidc-realm` (because the realm hasn't reconciled yet), the chart emits a soft beacon — a `ConfigMap` named `<cluster>-awaiting-oidc-realm`, status `awaiting-oidc-realm` — and renders **none** of the three pieces above. Flux re-renders on its normal interval; once the realm value lands in namespace values, the next render produces the Secret, the extraArgs, and the volume wiring atomically, and Kamaji rolls the apiserver pod to pick them up. This sidesteps the Helm lookup re-render gap completely (no lookup is involved at all).
 
 ### Layer 6 — OIDC kubeconfig Secret in management namespace
 
@@ -228,7 +268,7 @@ No CLI changes in this proposal. A future `cozystack` CLI command for "give me a
 
 ## Open questions
 
-1. **BYO-OIDC** (`--authentication-config` on `KamajiControlPlane`). The Kamaji CRD already supports `extraVolumes` + `extraVolumeMounts`, so the file-mount mechanics are not blocked. The remaining design questions are: how the chart accepts a JWTAuthenticator inline vs. by Secret reference, how the per-cluster audience binding from this proposal composes with a BYO authenticator's own audience, and whether the per-cluster audience binding is even still required when a BYO issuer is configured (depends on the tenant's own threat model). Separate proposal.
+1. **BYO-OIDC** as additive entries on the same `AuthenticationConfiguration`. Layer 5 already mounts a structured config Secret into the apiserver, so file-mount mechanics are settled. The remaining design questions are around the chart API: how a tenant supplies a BYO `JWTAuthenticator` (a flat field on `Kubernetes.spec.oidc`, a free-form Secret reference, both), how a BYO authenticator's audience composes with the platform-provided per-cluster audience (parallel issuers vs. issuer-substitution), and whether the per-cluster audience binding is still required when a BYO issuer is configured (depends on the tenant's own threat model). Separate proposal.
 2. **Custom credential plugin for token exchange.** RFC 8693 (OAuth 2.0 Token Exchange) would let a tenant user log into the realm once and exchange that token for a per-cluster, audience-scoped token at use time. Keycloak supports it. Practical only if cozystack ships a `client.authentication.k8s.io` exec plugin; otherwise the per-cluster client-and-aud model in this proposal is already enough. Worth picking up only if multi-cluster login ergonomics become a real pain point.
 3. **`cozystack` CLI**: should there be a `cozystack kubeconfig --oidc <cluster>` command that materializes the OIDC kubeconfig + prints `kubectl oidc-login setup` instructions? Likely yes, follow-up.
 
@@ -243,5 +283,7 @@ No CLI changes in this proposal. A future `cozystack` CLI command for "give me a
 **RFC 8693 Token Exchange via a custom exec plugin.** Considered, deferred. Cleaner from a "single login, many clusters" perspective; the user logs into the realm and the plugin exchanges that for per-cluster audience-scoped tokens at use time, with Keycloak deciding entitlement. Shipping it depends on whether we want to maintain a `client.authentication.k8s.io` plugin in our distribution. Not required to ship per-tenant realms — they work today with stock `kubectl oidc-login`.
 
 **Embedding the OIDC kubeconfig directly in the existing admin-kubeconfig Secret.** Considered, rejected. The admin-kubeconfig Secret is the cluster-admin certificate path used by the platform itself (kcsi-controller, kccm, cluster-autoscaler all consume it). Adding tenant-user-facing OIDC fields next to a Secret consumed by platform controllers conflates audiences. A separate `kubernetes-<cluster>-oidc-kubeconfig` Secret keeps the user-facing surface visibly distinct, and gives the dashboard a clean object to expose under cozyrds `secrets.include`.
+
+**Legacy `--oidc-*` flag wiring instead of `--authentication-config`.** Rejected. The four-flag path (`--oidc-issuer-url` / `--oidc-client-id` / `--oidc-username-claim` / `--oidc-groups-claim`) is simpler to render — it's four `extraArgs` entries and no Secret — but it caps the apiserver at exactly one issuer, cannot trust a private-CA issuer (a hard blocker for a lot of on-prem corporate IdPs), and forces a follow-up rewrite to switch shapes when BYO-OIDC lands. Going structured from the first cut means the BYO-OIDC and private-CA follow-up proposals add entries to one already-mounted file, instead of re-architecting how the apiserver receives its authn config. The structural cost paid up front is small (one Secret + an extraVolumes/extraVolumeMounts pair on the KCP), the downstream cost saved is large.
 
 **Single global `kubernetes` Keycloak client shared by every tenant cluster.** Rejected. Would defeat per-cluster audience isolation entirely (`aud` would match everywhere). And would mean every tenant user could mint a token usable against every other tenant's cluster — only RBAC would stand between them, and `system:authenticated` already grants something. Per-cluster client is non-negotiable; the design question is "where do the clients live", which is what the rest of this proposal answers.
