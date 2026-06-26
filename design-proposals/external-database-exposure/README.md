@@ -14,7 +14,7 @@ This is the design-proposal artifact required by `cozystack/cozystack#2816`, and
 
 ## Scope and related proposals
 
-- **Depends on:** `design-proposals/unified-tls-pki` — provides the `<release>-ca-cert` key-free trust anchor that external clients use to verify the endpoint. This proposal does not re-specify it. It is a companion submission under the same epic, on its own branch; the path resolves once both proposals merge.
+- **Depends on:** `design-proposals/unified-tls-pki` — provides the `<release>-ca-cert` key-free trust anchor that external clients use to verify the endpoint. This proposal does not re-specify it. It is a companion submission under the same epic, on its own branch; the path resolves once both proposals merge. The dependency is **per-engine, not blanket**: an engine is exposable here only once its `ca.crt` is actually delivered under that contract, and the path differs by engine — redis self-publishes a key-free `<release>-ca-cert` through its forked operator, while postgres and mongodb obtain theirs through the extraction controller in `unified-tls-pki`. So SNI exposure for a given engine is gated on that engine's `unified-tls-pki` convergence, not merely on the contract existing.
 - **Umbrella:** `cozystack/cozystack#2811`. This proposal covers WS4 (`cozystack/cozystack#2815`, SNI exposure) and WS5 (`cozystack/cozystack#2816`, end-to-end TLS).
 - **Referenced, not designed here:** WS6 east-west / in-cluster CNI encryption (`cozystack/cozystack#2977`, PR `cozystack/cozystack#2984`). It is complementary defense-in-depth for pod-to-pod traffic and is explicitly out of scope (see Non-goals).
 
@@ -24,9 +24,15 @@ All repository paths below refer to the `cozystack/cozystack` repository.
 
 ### TLS-passthrough already exists
 
-Cozystack already runs Gateway API TLS-passthrough for layer-7 system services. The `TenantGateway` controller (`internal/controller/tenantgateway/reconciler.go`) renders, for each entry in `TenantGateway.Spec.TLSPassthroughServices`, a listener named `tls-<service>` on port 443 with `Protocol: TLS`, `Mode: Passthrough`, hostname `<service>.<apex>`, and `AllowedRoutes` restricted to `TLSRoute`. The default services are `api`, `vm-exportproxy`, and `cdi-uploadproxy`, each with a `TLSRoute` that attaches by `sectionName: tls-<service>` (for example `packages/system/cozystack-api/templates/api-tlsroute.yaml`). The platform runs Cilium 1.19.3 with Gateway API v1.5.1 CRDs and GatewayClass `cilium`; `TLSRoute` and passthrough are supported.
+Cozystack already runs Gateway API TLS-passthrough for layer-7 system services. The `TenantGateway` controller (`internal/controller/tenantgateway/reconciler.go`) renders, for each entry in `TenantGateway.Spec.TLSPassthroughServices`, a listener named `tls-<service>` on port 443 with `Protocol: TLS`, `Mode: Passthrough`, hostname `<service>.<apex>`, and `AllowedRoutes` restricted to `TLSRoute`. The default services are `api`, `vm-exportproxy`, and `cdi-uploadproxy`, each with a `TLSRoute` that attaches by `sectionName: tls-<service>` (for example `packages/system/cozystack-api/templates/api-tlsroute.yaml`). The platform runs Cilium 1.19.3 with GatewayClass `cilium`. `TLSRoute` is GA in the Gateway API Standard channel as `gateway.networking.k8s.io/v1` since Gateway API v1.5.0; Cilium 1.19.x still consumes it from the **experimental-channel** CRD, so that CRD must be installed and the operative API version for this design is Cilium's channel, not the upstream graduation. `mode: Passthrough` TLSRoute is supported in Cilium since 1.14.
 
 The mechanism this proposal needs is therefore already in production for layer-7 services. The work is to extend it to databases, which speak on native (non-443) ports.
+
+### Passthrough on a native port works; the real constraint is SNI-hostname overlap
+
+Routing a `mode: Passthrough` listener on a non-443 port is supported, not exotic: Cilium has shipped TLSRoute passthrough since 1.14, its own conformance fixtures exercise passthrough listeners on a non-443 port, and field reports route passthrough on database ports (for example a mongo `27017` case). The native port (5432/6379/27017/3306) is not the risk.
+
+The real constraint is **SNI-hostname uniqueness across listeners on one Gateway**. On every released Cilium up to and including 1.19.x, two listeners that share a hostname but differ in port — or a passthrough listener that shares a hostname with an HTTPS-terminate listener — collide and do not isolate correctly (the cross-port hostname-isolation defect; fixed by an upstream change that targets Cilium 1.20 and is not in any release tag as of this writing). This matters here because the listener model below puts every engine-type passthrough listener on the wildcard hostname `*.<apex>`, which is the same hostname the tenant Gateway's HTTPS-terminate listeners already use. This proposal keeps the flat `*.<apex>` scheme — for clean `<release>.<apex>` connection hostnames — and therefore **depends on Cilium 1.20** for correct multi-listener isolation. If that dependency is unacceptable, the documented fallback is distinct per-engine subdomains (`*.pg.<apex>`, `*.redis.<apex>`, …), which sidestep the overlap at the cost of longer hostnames and per-engine SAN/recipe changes. Either way this is the Phase 1 validation gate (Rollout): the gate validates the shared-hostname case on the target Cilium version, not merely that passthrough binds on a non-443 port.
 
 ### Each external database burns its own IP today
 
@@ -38,7 +44,7 @@ The external hostname is `<release>.<_namespace.host>`, where `_namespace.host` 
 
 ### The one-IP-per-tenant ceiling
 
-Multiple per-tenant Gateways cannot share a single LoadBalancer IP on current Cilium: every Gateway claims `443/TCP`, so `lbipam.cilium.io/sharing-key` is inactive on the port collision (`packages/extra/gateway/README.md`; upstream cilium#21270, cilium#42756). Within a single Gateway, a parent and its inheriting children share one IP. `Gateway.spec.listeners` is hard-capped at 64. The practical consequence: the unit of IP sharing is one tenant Gateway, and a tenant's database fan-out draws from the 64-listener budget shared with the existing http/https/https-apex and per-child-apex wildcard listeners.
+Multiple per-tenant Gateways cannot share a single LoadBalancer IP on current Cilium. Cilium LB-IPAM shares one IP across Services via `lbipam.cilium.io/sharing-key` only when their ports do not conflict; every Gateway claims `443/TCP`, so the shared-IP path is inactive on that port collision (`packages/extra/gateway/README.md`; the port-conflict rule is documented in the Cilium LB-IPAM docs). Within a single Gateway, a parent and its inheriting children share one IP. `Gateway.spec.listeners` is hard-capped at 64 (Gateway API CRD `MaxItems`). The practical consequence: the unit of IP sharing is one tenant Gateway, and a tenant's database fan-out draws from the 64-listener budget shared with the existing http/https/https-apex and per-child-apex wildcard listeners.
 
 ### The problem
 
@@ -107,13 +113,17 @@ A Gateway listener is keyed by the tuple (port, protocol, hostname/SNI), and **m
 
 This keeps listener consumption at **O(engine types)** — at most four or five — rather than O(database instances). A tenant running thirty Postgres releases spends one `tls-postgres` slot, not thirty, so the 64-listener budget (§3) stops being a per-database ceiling and the consolidation goal scales with instance count, not against it.
 
+**The shared-hostname dependency is load-bearing.** Putting `tls-postgres` (5432) and `tls-redis` (6379) both on `*.<apex>` means several listeners share one hostname across ports, and that hostname also overlaps the Gateway's HTTPS-terminate listeners. As noted in Context, Cilium isolates that case correctly only from 1.20 onward, so this scheme depends on Cilium 1.20. The per-release `TLSRoute` hostnames (`<release>.<apex>`) are always distinct and are not the issue; the overlap is at the listener level. The flat scheme is chosen for clean connection hostnames; distinct per-engine subdomains are the documented fallback if the Cilium 1.20 dependency is unacceptable.
+
 Native ports are chosen over forcing everything onto 443 because the latter buys nothing: it does not improve IP consolidation (SNI already does that on any port) and it breaks client ergonomics and tooling defaults (`psql -h host` assumes 5432) while still demanding direct-TLS. The all-on-443 variant is retained as a documented opt-in for operators who want a single-port firewall surface (see Alternatives).
 
-**The Postgres caveat is load-bearing.** libpq has historically performed a StartTLS-style negotiation: it sends a plaintext `SSLRequest` and waits for the server's single-byte reply *before* the TLS `ClientHello`. There is no SNI in the first packet, so a passthrough listener cannot route it. This is resolved by `sslnegotiation=direct` (libpq, PostgreSQL 17+), which sends the `ClientHello` immediately, carrying SNI. Postgres-over-passthrough is therefore conditional on direct-TLS-capable clients and is opt-in, not default-on.
+**The Postgres caveat is load-bearing.** libpq has historically performed a StartTLS-style negotiation: it sends a plaintext `SSLRequest` and waits for the server's single-byte reply *before* the TLS `ClientHello`. There is no SNI in the first packet, so a passthrough listener cannot route it. This is resolved by `sslnegotiation=direct` (libpq, PostgreSQL 17+), which sends the `ClientHello` immediately, carrying SNI. It comes with hard prerequisites, not preferences: the **server must also be PostgreSQL 17+**; `sslnegotiation=direct` requires `sslmode=require` or stronger; direct SSL mandates ALPN (`postgresql`); and SNI is emitted only when the client dials by **hostname** with `sslsni=1` (the default) — an IP literal carries no SNI. Driver coverage is uneven (recent pgjdbc 42.7.x and Npgsql 9.0+ support it; node-postgres historically did not). Any client older than these, against a pre-17 server, or with `sslmode` below `require`, falls back to the legacy negotiation and cannot be SNI-routed. Postgres-over-passthrough is therefore conditional on direct-TLS-capable clients and is opt-in, not default-on.
 
 ### 2. Certificate reuse is a property of passthrough (the WS5 core)
 
 Passthrough *is* the certificate reuse. Because the Gateway in `mode: Passthrough` does not terminate TLS, it forwards the raw handshake bytes to the backend pod. The certificate the external client validates is byte-identical to the operator-issued server certificate the database already presents internally — CNPG-managed for postgres, Strimzi-managed for kafka, PSMDB-managed for mongo. There is no second certificate, no re-encryption, and no new issuance. End-to-end TLS is a consequence of not terminating, not a feature to build.
+
+One subtlety the "single certificate" framing hides: an external client doing `sslmode=verify-full` (or the equivalent) validates the presented certificate's SANs against the hostname it dialed. CNPG presents one server certificate across its `-rw`/`-r`/`-ro` services with no per-listener split, so the external passthrough hostname `<release>.<apex>` **must be in that certificate's `serverAltDNSNames`** for verify-full to pass — which is exactly what the SAN hook below injects. Engines with a per-listener certificate model (Strimzi `brokerCertChainAndKey`) could serve a different cert externally, but the fitting engines here present one server cert, so "reuse" is literal.
 
 WS5 adds nothing beyond two hooks that already exist:
 
@@ -132,21 +142,21 @@ The headline payoff is IPv4 scarcity relief. Today ten external databases cost t
 
 The ceiling, stated honestly:
 
-- `Gateway.spec.listeners` is capped at 64. Because database listeners are **one per engine type** (§1), not one per release, their contribution to that budget is bounded by the four or five supported engines no matter how many instances a tenant runs; the per-release fan-out lands on `TLSRoute` objects, which are not capped. The remaining slots go to the http/https/https-apex listeners, the per-child-apex wildcard listeners, and the three default passthrough services. A tenant therefore approaches the cap through child-apex fan-out, not database fan-out; the controller's existing advice to split a high-fanout subtree onto its own Gateway via `tenant.spec.gateway=true` still applies there.
-- Multi-Gateway IP sharing is not possible today (the one-IP-per-tenant blocker above). The win is one IP per tenant Gateway. Lifting it to share an IP across Gateways depends on Cilium implementing ListenerSet (experimental in Gateway API v1.5.1, not implemented by Cilium 1.19.3).
+- `Gateway.spec.listeners` is capped at 64. Because database listeners are **one per engine type** (§1), not one per release, their contribution to that budget is bounded by the four or five supported engines no matter how many instances a tenant runs; the per-release fan-out lands on `TLSRoute` objects, which are not capped. The remaining slots go to the http/https/https-apex listeners, the per-child-apex wildcard listeners, and the three default passthrough services. A tenant therefore approaches the cap through child-apex fan-out, not database fan-out; the controller's existing advice to split a high-fanout subtree onto its own Gateway via `tenant.spec.gateway=true` still applies there. (The 64 cap is on one Gateway's inline `listeners` array; a future ListenerSet could raise the effective count, see Open questions.)
+- Multi-Gateway IP sharing is not possible today (the one-IP-per-tenant blocker above). The win is one IP per tenant Gateway. Lifting it depends on Cilium implementing ListenerSet, which would let many tenants' listeners be consolidated onto **one shared Gateway** (and thus one IP) — it does not make N separate Gateways share an IP. ListenerSet graduated toward the Gateway API Standard channel in v1.5, but Cilium does not implement it on any stable release (tracked by the Cilium CFP `cilium#42756`, implementation PR `cilium#46303` in progress).
 
 ### 4. Per-engine treatment
 
 | Engine | Native port | Fits SNI-passthrough? | Client requirement | Recommendation |
 | --- | --- | --- | --- | --- |
-| Redis | 6379 | Yes — immediate TLS, no pre-TLS negotiation | `--tls` + `ca.crt`; modern client emits SNI from a hostname | default-on candidate (cleanest fit) |
-| PostgreSQL (CNPG) | 5432 | Yes, only with direct-TLS | `sslnegotiation=direct` + `sslmode=verify-full` + `ca.crt` (libpq PG17+) | opt-in (pre-PG17 clients fail closed) |
+| Redis | 6379 | Yes — immediate TLS, no pre-TLS negotiation | `--tls` + `ca.crt`; modern client emits SNI from a hostname | cleanest fit; ships opt-in first, default-on candidate once validated |
+| PostgreSQL (CNPG) | 5432 | Yes, only with direct-TLS | `sslnegotiation=direct` + `sslmode=verify-full` + `ca.crt`, hostname (not IP); libpq PG17+ **and** server PG17+ | opt-in (pre-PG17 client or server fails closed) |
 | MongoDB — sharded (mongos) | 27017 | Yes — single stateless endpoint | `tls=true` + `tlsCAFile`; seed pointing at the SNI hostname | opt-in (sharded only) |
 | MariaDB | 3306 | Likely — modern connectors do TLS-first with SNI | TLS connector emitting SNI + `ca.crt`; verify per connector | opt-in pending connector conformance |
 | MongoDB — replica set | 27017 | No — per-member LB + `rs.conf` rewrite | n/a | deferred |
 | Kafka (Strimzi) | 9094 | No — per-broker advertised addresses | n/a | deferred |
 
-Kafka is deferred because its wire protocol redirects: the client connects to a bootstrap endpoint, receives metadata listing per-broker advertised host:port pairs, then opens direct connections to each broker. Strimzi's `type: loadbalancer` external listener provisions a LoadBalancer per broker plus a bootstrap LB precisely for this. A single SNI front cannot satisfy the per-broker fan-out. Making Kafka fit would require either per-broker SNI listeners and TLSRoutes (N listeners against the 64-listener cap, partially defeating the consolidation goal) plus rewriting Strimzi's advertised listeners, or a Kafka-aware re-advertising proxy — both out of scope. Revisit if per-broker SNI proves worth the listener budget.
+Kafka is deferred because its wire protocol redirects: the client connects to a bootstrap endpoint, receives metadata listing per-broker advertised host:port pairs, then opens direct connections to each broker. Strimzi's `type: loadbalancer` external listener provisions a LoadBalancer per broker plus a bootstrap LB precisely for this. A single SNI front cannot satisfy the per-broker fan-out — this is a topology problem, not a certificate one (Strimzi could serve any cert per listener). Making Kafka fit would require either per-broker SNI listeners and TLSRoutes (N listeners against the 64-listener cap, partially defeating the consolidation goal) plus rewriting Strimzi's advertised listeners, or a Kafka-aware re-advertising proxy — both out of scope. Revisit if per-broker SNI proves worth the listener budget.
 
 ### 5. API and controller extension
 
@@ -160,6 +170,13 @@ The **listener** is the new API surface. The existing `TLSPassthroughServices []
 // TLSPassthroughListener declares one shared passthrough listener for a
 // database engine type, on its native port, with a wildcard SNI hostname.
 // Every release of that engine attaches its own TLSRoute by SNI hostname.
+//
+// Validation contract (enforced by CEL / admission):
+//   - Name:     DNS-1123 label; unique within the list; renders as "tls-<Name>".
+//   - Port:     1..65535; unique within the list; must not collide with a
+//               synthesized layer-7 listener port (443) or another entry.
+//   - Hostname: optional; a valid DNS wildcard or exact hostname; defaults
+//               to "*.<apex>" when empty.
 type TLSPassthroughListener struct {
     Name     string `json:"name"`               // listener suffix -> "tls-<name>" (e.g. "postgres")
     Port     int32  `json:"port"`               // native port (5432/6379/27017/3306)
@@ -173,7 +190,7 @@ type TLSPassthroughListener struct {
 TLSPassthroughListeners []TLSPassthroughListener `json:"tlsPassthroughListeners,omitempty"`
 ```
 
-The **route** is a standard Gateway API `TLSRoute` (no new type), rendered once per exposed database release: `spec.parentRefs` attaches to the shared `tls-<engine>` listener by `sectionName`, `spec.hostnames: ["<release>.<apex>"]` carries the SNI match, and `spec.rules[].backendRefs` is a standard `gwapiv1alpha2.BackendRef` (whose embedded `BackendObjectReference` points at the database Service on its native port, cross-namespace via `ReferenceGrant`).
+The **route** is a standard Gateway API `TLSRoute` (no new type), rendered once per exposed database release: `spec.parentRefs` attaches to the shared `tls-<engine>` listener by `sectionName`, `spec.hostnames: ["<release>.<apex>"]` carries the SNI match, and `spec.rules[].backendRefs` is a standard `BackendRef` (whose embedded `BackendObjectReference` points at the database Service on its native port, cross-namespace via `ReferenceGrant`). `TLSRoute` is GA as `gateway.networking.k8s.io/v1` since Gateway API v1.5.0, but Cilium 1.19.x consumes the experimental-channel CRD — pin to whatever API version the targeted Cilium ships, not the upstream `v1` graduation.
 
 The controller change is to render, per `TLSPassthroughListeners` entry, one Passthrough listener on the supplied `Port` instead of the hardcoded 443, and to attach each per-release `TLSRoute` by `sectionName: tls-<name>` — the same attachment pattern as the existing `api-tlsroute.yaml`, except that many routes share one listener and the Gateway disambiguates them by SNI hostname. Both are populated by the Tenant / HelmRelease orchestration layer that already knows the tenant Gateway and the database release — not the database chart and not the human — so a database's surface stays a single `external`-adjacent toggle. The engine-type listener is created on first exposure of that engine and removed once its last release is gone; per-release add/remove only touches the route, never the shared listener.
 
@@ -183,7 +200,7 @@ End to end: the chart injects the external hostname `<release>.<apex>` into the 
 
 ## User-facing changes
 
-A database gains an `external`-adjacent toggle to select passthrough/SNI mode. Per-engine connection recipes are documented: `psql "sslnegotiation=direct sslmode=verify-full sslrootcert=ca.crt host=<release>.<apex>"`, `redis-cli --tls --cacert ca.crt -h <release>.<apex>`, `mongosh --tls --tlsCAFile ca.crt --host <release>.<apex>`, `mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=ca.crt -h <release>.<apex>`. Kafka and non-sharded MongoDB keep today's per-LoadBalancer behavior.
+A database gains an `external`-adjacent toggle to select passthrough/SNI mode. Per-engine connection recipes are documented: `psql "sslnegotiation=direct sslmode=verify-full sslrootcert=ca.crt host=<release>.<apex>"` (libpq and server both PG17+), `redis-cli --tls --cacert ca.crt -h <release>.<apex>`, `mongosh --tls --tlsCAFile ca.crt --host <release>.<apex>`, `mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=ca.crt -h <release>.<apex>`. Kafka and non-sharded MongoDB keep today's per-LoadBalancer behavior.
 
 ## Upgrade and rollback compatibility
 
@@ -195,8 +212,9 @@ The edge never holds the database's private key — the central strength of pass
 
 ## Failure and edge cases
 
-- A pre-PG17 or non-direct-TLS Postgres client sends no SNI → no route → connection reset/timeout (document the symptom).
+- A pre-PG17 (client or server) or non-direct-TLS Postgres client sends no SNI → no route → connection reset/timeout (document the symptom).
 - The 64-listener budget is exceeded → the listener is rejected; because listeners are one per engine type this is reached only through child-apex fan-out, and the mitigation is to split that subtree onto its own Gateway.
+- A passthrough listener shares a hostname with a terminate listener on Cilium &lt;1.20 → routing does not isolate correctly; mitigated by the Cilium 1.20 dependency or the distinct-subdomain fallback, and caught by the Phase 1 gate.
 - An explicit `tls.enabled: false` together with `external: true` → rejected at admission by a ValidatingAdmissionPolicy, not silently overridden; an unset `tls` tri-state auto-enables TLS with `external`.
 - An operator expects multi-Gateway IP sharing → each Gateway still gets its own IP (expected under the Cilium constraint).
 - A database is deleted → its per-release `TLSRoute` is removed; the shared engine-type listener is removed only when its last release is gone, so a single deletion never orphans a listener.
@@ -205,14 +223,14 @@ The edge never holds the database's private key — the central strength of pass
 
 - Helm-template assertions that the certificate SAN includes `<release>.<apex>` per engine, mirroring the existing TLS test fixtures.
 - A controller unit test that a `TLSPassthroughListeners` entry renders a shared listener on the native port with `mode: Passthrough` and `AllowedRoutes` restricted to `TLSRoute`, and that two per-release `TLSRoute` objects on that one listener SNI-route to their respective backends.
-- An admission test that `tls.enabled: false` with `external: true` is rejected by the ValidatingAdmissionPolicy, while an unset `tls` is admitted and auto-enables.
+- An admission test that `tls.enabled: false` with `external: true` is rejected by the ValidatingAdmissionPolicy, while an unset `tls` is admitted and auto-enables; and that the listener validation contract (name/port uniqueness, port range, 443 collision) is enforced.
 - An end-to-end test per fitting engine: connect from outside the cluster with SNI and `ca.crt`, and assert that the serial of the presented certificate equals the operator-issued internal certificate — proving reuse, not re-issuance.
 - A negative test: a client without SNI fails closed.
 
 ## Rollout
 
-1. API field plus controller listener rendering, no engine wired. **Gate:** confirm Cilium 1.19.3 actually renders a working `mode: Passthrough` listener on a non-443 port (for example 5432) and routes it by SNI — the existing passthrough services all run on 443, so this is unproven on a native database port and must be validated before any engine is wired.
-2. Redis (the cleanest fit, default-on candidate) behind an opt-in.
+1. API field plus controller listener rendering, no engine wired. **Gate:** on the target Cilium version, stand up a `mode: Passthrough` listener on a native database port (for example 5432) whose hostname `*.<apex>` overlaps the Gateway's terminate listeners, and confirm it SNI-routes to the right backend with exactly one Envoy filter chain. The risk is not the non-443 port (supported since Cilium 1.14) but the shared-hostname isolation that lands in Cilium 1.20; this gate must pass on the version actually deployed before any engine is wired, or the distinct-subdomain fallback adopted.
+2. Redis (the cleanest fit) behind an opt-in; default-on candidate once the gate and client-emits-SNI behavior are confirmed in practice.
 3. PostgreSQL (direct-TLS) and sharded MongoDB, opt-in.
 4. MariaDB after connector-conformance validation.
 
@@ -220,17 +238,18 @@ Kafka and non-sharded MongoDB are explicitly out of this rollout. Each phase shi
 
 ## Open questions
 
+- **Cilium shared-hostname isolation on the target version** — the listener model overlaps `*.<apex>` across the engine-type passthrough listeners and the HTTPS-terminate listeners, which Cilium isolates correctly only from 1.20. Do we pin Cilium 1.20 as a hard prerequisite for this feature, or ship the distinct-per-engine-subdomain scheme so it runs on 1.19.x? This is the single biggest implementation risk and the Phase 1 gate.
 - **MariaDB / MySQL connector conformance** — do the dominant connectors (libmysqlclient, MariaDB Connector/C, JDBC, Go drivers) emit SNI and do TLS-first such that passthrough routes correctly, or does any do a server-greeting-then-STARTTLS dance like pre-direct-TLS Postgres? Default-on versus opt-in for MariaDB hinges on this.
-- **Direct-TLS client floor for Postgres** — what fraction of the tenant base predates `sslnegotiation=direct`? Is a per-release attestation gate enough, given there is no graceful downgrade on a passthrough listener?
-- **Cilium passthrough on a non-443 port** — the existing passthrough listeners all run on 443; whether Cilium 1.19.3's Gateway implementation honors a `mode: Passthrough` listener on a native database port (5432/6379/27017/3306) and SNI-routes it is unverified and is the single biggest implementation risk. It is the Phase 1 validation gate in Rollout.
+- **Direct-TLS client/server floor for Postgres** — what fraction of the tenant base predates `sslnegotiation=direct` on either client (libpq PG17+, driver support) or server (PG17+)? Is a per-release attestation gate enough, given there is no graceful downgrade on a passthrough listener?
 - **TLSRoute ownership** — does the controller synthesize the per-release `TLSRoute` alongside the shared listener (single source of truth, but the controller must know the backend Service), or does the database chart render it (the chart owns the backend selector, but must learn a gateway name/namespace it does not have today)? This decides whether database charts gain gateway-discovery logic.
 - **Who writes the listener/route set** — the orchestration layer auto-creating the engine-type listener on first exposure and a per-release route on each `external: true` + passthrough, an operator-managed explicit list, or both; and which reconciliation owns route add/remove plus reference-counting the shared listener down to zero on the last database deletion.
-- **64-listener budget accounting** — with the parent listeners, per-child-apex wildcards, and default passthrough services now joined by one listener per database engine type (not per instance), what is the realistic per-tenant ceiling, and should the controller still surface a status condition as the budget nears 64?
-- **ListenerSet timeline** — multi-Gateway IP sharing is blocked on Cilium implementing ListenerSet. Do we design the field and status to be ListenerSet-ready now, or revisit when Cilium ships it? This determines whether one-IP-per-tenant is a permanent or temporary ceiling.
+- **64-listener budget accounting** — with the parent listeners, per-child-apex wildcards, and default passthrough services now joined by one listener per database engine type (not per instance), what is the realistic per-tenant ceiling, and should the controller surface a status condition as the budget nears 64?
+- **ListenerSet timeline** — consolidating onto one shared Gateway/IP is blocked on Cilium implementing ListenerSet (CFP `cilium#42756`, PR `cilium#46303`). Do we design the field and status to be ListenerSet-ready now, or revisit when Cilium ships it? This determines whether one-IP-per-tenant is a permanent or temporary ceiling.
 
 ## Alternatives considered
 
 - **Edge TLS termination plus re-encryption (`BackendTLSPolicy`).** Rejected: the edge holds keys, there are two certificates, and it defeats reuse. This is the recorded decision WS5 asks for — passthrough chooses application-level, CNI-agnostic TLS over edge termination.
+- **Distinct per-engine subdomains for the passthrough listeners** (`*.pg.<apex>`, `*.redis.<apex>`, …). Sidesteps the Cilium shared-hostname isolation defect on 1.19.x without waiting for 1.20, but at the cost of longer connection hostnames and per-engine SAN/recipe changes. Retained as the documented fallback; the flat `*.<apex>` scheme is preferred for clean hostnames where Cilium 1.20 is available.
 - **All-on-443 SNI.** Mirrors the existing three services exactly with no new port plumbing, retained as a documented opt-in, but rejected as the default for the client-ergonomics and direct-TLS-everywhere tax.
 - **Route-driven implicit listeners** — the controller watches `TLSRoute` objects (it already does) and auto-synthesizes a passthrough listener for any route targeting a non-443 port. Less API surface, but it inverts the explicit-intent model and makes the listener set implicit and hard to audit. Offered as a future ergonomic; the explicit field is recommended for v1.
 - **Per-broker SNI for Kafka.** Rejected for now (see the matrix); revisit if the listener-budget cost is justified.
