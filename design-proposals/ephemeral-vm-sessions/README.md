@@ -55,6 +55,18 @@ The clone-and-run loop is already expressible:
 
 `VMSession` is the thin wrapper that performs exactly this from a single master reference and reclaims the clone on delete. KubeVirt also ships a native `VirtualMachineClone` that copies a whole VM object at once — an alternative engine under the hood.
 
+### Lifecycle and desired state
+
+`VMSession` carries a declarative desired state — `spec.state: Running | Paused | Stopped` — and the controller reconciles the underlying VM to it:
+
+- **Running** — the clone runs (`vm-instance` `runStrategy: Always`).
+- **Paused** — the guest is frozen via KubeVirt's `pause` subresource: vCPUs stop and resume is near-instant. Note that pause keeps the guest RAM resident on the node — node resources are *not* freed. Good for short idle with instant resume, not for scale-to-zero.
+- **Stopped** — the VM is halted (`runStrategy: Halted`): node resources are freed, but the guest cold-boots on the next start; process and RAM state are lost, while the disk (and any persistent workspace volume) survive.
+
+Because pause is a KubeVirt subresource rather than a spec field, the controller invokes `pause`/`unpause` to drive the `Paused` state and uses `runStrategy` for `Running`/`Stopped`.
+
+**Limitation — warm resume.** Stable KubeVirt has no suspend-to-disk that both frees node resources *and* restores RAM/process state (a Firecracker-style snapshot). `VirtualMachineSnapshot` captures disk only; `memory-dump` is diagnostic and not restorable. So today `VMSession` offers fast-resume-but-resources-held (`Paused`) or resources-freed-but-cold (`Stopped`), not both. True warm, scale-to-zero resume with live processes is a gap that would need upstream KubeVirt work or an external CRIU-style layer; it is out of scope for v1 and tracked as a follow-up.
+
 ### Reachability
 
 The session VM is reached through the VM's own Service: `vm-instance` exposes ports with `external: true` and `externalPorts` (e.g. `[22]` for SSH, with public keys injected via cloud-init `nocloud`). A browser web-terminal is just another exposed port.
@@ -65,7 +77,7 @@ The session VM is reached through the VM's own Service: `vm-instance` exposes po
 
 ## User-facing changes
 
-A tenant creates a `VMSession` (or, in the alternative shape below, references a `VMTemplate` from a `VMInstance`), pointing at a master VM, and gets back a running, isolated clone with a known entry point. Deleting the session reclaims the clone. There is no change to existing VM workflows; the capability is additive and opt-in.
+A tenant creates a `VMSession` (or, in the alternative shape below, references a `VMTemplate` from a `VMInstance`), pointing at a master VM, and gets back a running, isolated clone with a known entry point. `spec.state` (`Running` / `Paused` / `Stopped`) controls the clone's lifecycle, and `spec.networkIsolation` opts the session into per-session network rules. Deleting the session reclaims the clone. There is no change to existing VM workflows; the capability is additive and opt-in.
 
 ## Upgrade and rollback compatibility
 
@@ -75,7 +87,9 @@ Additive: a new, optional resource. Existing clusters, manifests, and the curren
 
 The clone runs behind a VM (KVM) boundary and inherits Cozystack's tenant-level Cilium isolation, because it is a pod in the tenant namespace: by default a tenant may egress to the public internet (`toEntities: world`) but not to other tenants or arbitrary cluster pods, and the kube-apiserver is unreachable unless a workload is explicitly labelled `policy.cozystack.io/allow-to-apiserver`.
 
-One caveat: this isolation is tenant-scoped, not per-session. The default intra-tenant policy allows all pod-to-pod traffic inside a tenant, so two sessions in the same tenant are not isolated from each other today. Per-session (A↔B) isolation needs either one tenant/namespace per session, or a new per-session network-policy knob (see open questions).
+Per-session isolation is expressed through `spec.networkIsolation`, which the controller realises by creating a `SecurityGroup` (`sdn.cozystack.io/v1alpha1`) attached to the session's VM — the workload-level mechanism for declaring which peers a session may reach (public internet, named apps, CIDRs, FQDNs, other groups).
+
+One honest caveat: `SecurityGroup` is allow-only and additive, and the current tenant baseline is blanket-allow. So an allow-list does not yet *subtract* from the baseline — hard "deny RFC1918 / deny A↔B" enforcement depends on the platform's planned **default-deny tenant baseline** (future work in the SDN design). The clean end state is a default-deny baseline plus a per-session `SecurityGroup` that opens only the public internet: internet yes; private/internal/metadata/other-sessions no. `VMSession` adopts `SecurityGroup` now, so the intent is captured and ready, and gains full enforcement when default-deny lands; until then, hard A↔B isolation is available by running one tenant/namespace per session.
 
 Accepted residual risk: a session can exfiltrate its own data over the permitted public path — inherent to "internet access is required".
 
@@ -101,10 +115,11 @@ A manual vertical slice on the existing apps first: clone a master's disk → bo
 ## Open questions
 
 1. **Entity shape.** `VMSession` cloning an existing VM, or `VMTemplate` + a `templateRef` on `VMInstance` (see *Alternatives considered*)?
-2. **Placement / A↔B granularity.** Shared tenant plus a new per-session network policy, vs one tenant/namespace per session.
+2. **Placement / A↔B granularity.** One tenant/namespace per session (hard isolation today), or a shared tenant relying on per-session `SecurityGroup`s — which needs the default-deny tenant baseline (SDN future work) to actually enforce.
 3. **Cross-tenancy.** Do we need it at all — a master/template in one tenant cloned into sessions in other tenants, or a single source shared across tenants — and if so, how to implement it (cross-namespace clone permissions, a `cozy-public`-style shared catalog, or sub-tenants)?
 4. **Spin-up latency.** Cold clone+boot is seconds; acceptable per session, or is a pre-warmed pool wanted?
 5. **Running source.** Is cloning a running master/template (crash-consistency) needed, or is a stopped one enough?
+6. **Warm resume.** Is `Paused` (instant resume, but node resources stay held) enough, or is true scale-to-zero warm resume with live processes required — which is not available on stable KubeVirt and would need upstream or CRIU-style work?
 
 ## Alternatives considered
 
