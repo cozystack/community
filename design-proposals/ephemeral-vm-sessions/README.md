@@ -87,9 +87,9 @@ Additive: a new, optional resource. Existing clusters, manifests, and the curren
 
 The clone runs behind a VM (KVM) boundary and inherits Cozystack's tenant-level Cilium isolation, because it is a pod in the tenant namespace: by default a tenant may egress to the public internet (`toEntities: world`) but not to other tenants or arbitrary cluster pods, and the kube-apiserver is unreachable unless a workload is explicitly labelled `policy.cozystack.io/allow-to-apiserver`.
 
-Per-session isolation is expressed through `spec.networkIsolation`, which the controller realises by creating a `SecurityGroup` (`sdn.cozystack.io/v1alpha1`) attached to the session's VM — the workload-level mechanism for declaring which peers a session may reach (public internet, named apps, CIDRs, FQDNs, other groups).
+Per-session isolation ships inside the `VMSession` chart as a `CiliumNetworkPolicy` scoped to the session's VM (an `endpointSelector` on the session label), toggled by `spec.networkIsolation`. It allows egress to the public internet and DNS, and uses Cilium **deny rules** (`egressDeny` / `ingressDeny`) to block private and internal ranges (RFC1918, link-local), the cluster pod/service CIDRs and the kube-apiserver, and other sessions in the same tenant (A↔B).
 
-One honest caveat: `SecurityGroup` is allow-only and additive, and the current tenant baseline is blanket-allow. So an allow-list does not yet *subtract* from the baseline — hard "deny RFC1918 / deny A↔B" enforcement depends on the platform's planned **default-deny tenant baseline** (future work in the SDN design). The clean end state is a default-deny baseline plus a per-session `SecurityGroup` that opens only the public internet: internet yes; private/internal/metadata/other-sessions no. `VMSession` adopts `SecurityGroup` now, so the intent is captured and ready, and gains full enforcement when default-deny lands; until then, hard A↔B isolation is available by running one tenant/namespace per session.
+This holds regardless of the blanket-allow tenant baseline, because Cilium deny rules take precedence over allow rules — so the policy enforces "internet yes; private/internal/metadata/other-sessions no" without depending on a platform-wide default-deny baseline. Shipping the policy in the chart follows existing precedent: the tenant chart and the `cilium-networkpolicy` system package already ship CiliumNetworkPolicies, the latter using `ingressDeny`.
 
 Accepted residual risk: a session can exfiltrate its own data over the permitted public path — inherent to "internet access is required".
 
@@ -115,7 +115,7 @@ A manual vertical slice on the existing apps first: clone a master's disk → bo
 ## Open questions
 
 1. **Entity shape.** `VMSession` cloning an existing VM, or `VMTemplate` + a `templateRef` on `VMInstance` (see *Alternatives considered*)?
-2. **Placement / A↔B granularity.** One tenant/namespace per session (hard isolation today), or a shared tenant relying on per-session `SecurityGroup`s — which needs the default-deny tenant baseline (SDN future work) to actually enforce.
+2. **Placement / A↔B granularity.** The chart-shipped per-session `CiliumNetworkPolicy` (deny rules) isolates A from B within a shared tenant directly; is that enough, or is one tenant/namespace per session still wanted as a coarser, simpler boundary?
 3. **Cross-tenancy.** Do we need it at all — a master/template in one tenant cloned into sessions in other tenants, or a single source shared across tenants — and if so, how to implement it (cross-namespace clone permissions, a `cozy-public`-style shared catalog, or sub-tenants)?
 4. **Spin-up latency.** Cold clone+boot is seconds; acceptable per session, or is a pre-warmed pool wanted?
 5. **Running source.** Is cloning a running master/template (crash-consistency) needed, or is a stopped one enough?
