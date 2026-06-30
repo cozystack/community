@@ -1,289 +1,293 @@
-# Per-tenant Keycloak realms for tenant Kubernetes cluster OIDC
+# OIDC for tenant Kubernetes clusters
 
-- **Title:** `Per-tenant Keycloak realms for tenant Kubernetes cluster OIDC`
-- **Author(s):** `@IvanHunters`
-- **Date:** `2026-06-26`
+- **Title:** `OIDC for tenant Kubernetes clusters`
+- **Author(s):** `@IvanHunters` (revised with input from `@lllamnyp` and `@mattia-eleuteri`)
+- **Date:** `2026-06-26` (revised `2026-06-30`)
 - **Status:** Draft
 
 ## Overview
 
-Cozystack already exposes a flat `cozy` Keycloak realm that backs the management-cluster dashboard. This proposal adds OIDC to **tenant-owned Kubernetes clusters** — the clusters tenants spin up via the `kubernetes` application — using a **separate Keycloak realm per tenant**, not the flat `cozy` realm.
+Tenant-owned Kubernetes clusters — the clusters tenants spin up via the `kubernetes` application — ship today with a single user-facing path: a static `cluster-admin` kubeconfig. This proposal gives them per-user OIDC: real identities, per-user audit, group/role-based RBAC, and access rotation by disabling a user instead of rotating a shared certificate.
 
-The choice of identity unit is the central decision in this proposal. A cozystack tenant is an organizational boundary — a customer, a team, a project — that already owns its databases, VMs, ingress, RBAC, and now its own user directory. The platform-admin realm (`cozy`) and a tenant's user directory serve different populations and different trust models; collapsing them into one realm couples a platform-internal artifact to an externally-visible tenant surface. Per-cluster token isolation is delivered by a per-cluster public client inside the tenant realm, not by a separate directory.
+The central decision is **what identity unit backs that OIDC**, and how much of it ships in the first cut. An earlier revision of this document answered "a dedicated Keycloak realm per tenant" and proposed implementing it directly. After the OIDC design syncs and review feedback from `@lllamnyp` and `@mattia-eleuteri`, the proposal is reorganized around a **phased** model, because per-tenant realm and "log a user into a cluster via OIDC" turned out to be two different-sized problems:
 
-## Scope and related proposals
+- **Phase 1 (ship now):** a per-cluster **issuer selector** — `oidc: System | CustomConfig | None` — plus a per-cluster public client for audience isolation, wired through a structured `AuthenticationConfiguration`. No new realm, no auto-provisioned Keycloak groups. This authenticates users that already exist in the platform `cozy` realm, and lets a tenant point a cluster at their own IdP. It is what the [`cozystack#3044`](https://github.com/cozystack/cozystack/pull/3044) implementation should land.
+- **Phase 2 (deferred, may not be needed):** managed multi-tenant identity — letting a tenant own a directory the platform hosts. This is an IdP-as-a-service product and is scoped separately. Two candidate designs are compared below: **Keycloak Organizations** (lighter, recommended to evaluate first) and the **per-tenant realm** (the original design, retained here as the record).
 
-- **Implementation PR**: [`cozystack#3044`](https://github.com/cozystack/cozystack/pull/3044). Adds per-tenant realm provisioning, per-cluster client+groups, `--oidc-*` wiring on `KamajiControlPlane`, OIDC kubeconfig Secret, and dashboard exposure.
-- **Deferred (separate proposal):** Bring-your-own OIDC for tenant clusters via Kubernetes structured authentication configuration. Not in this proposal; called out under Open questions.
-- **Deferred (separate proposal):** Custom `client.authentication.k8s.io` exec plugin doing RFC 8693 Token Exchange. Not in this proposal; called out under Alternatives considered.
+The per-tenant-realm design is preserved in full under [Phase 2 — Option B](#option-b--per-tenant-realm-original-design-retained-as-record); it is no longer the Phase-1 baseline.
+
+## Decision and phasing
+
+| | Phase 1 (now) | Phase 2 (deferred) |
+| --- | --- | --- |
+| Identity source | platform `cozy` realm (`System`) or a tenant-provided issuer (`CustomConfig`) | a tenant-owned directory the platform hosts |
+| New realm per tenant | no | only under Option B |
+| Auto-provisioned Keycloak groups/clients lifecycle owned by the cluster | no | no (see [design principle 2](#2-couple-at-provisioning-decouple-at-ownership)) |
+| Per-cluster audience isolation | yes | yes |
+| Central-Keycloak load / billing impact | none beyond existing `cozy` | material — drives the Option A vs B choice |
+| Needs tenant-hierarchy inheritance | no (issuer is global for `System`) | yes — needs an explicit owner marker |
+
+The split is not arbitrary; it falls out of a few distinctions the earlier draft collapsed. Those are stated next, because they decide what belongs in Phase 1 and why Phase 2 may never be needed.
+
+## Design principles
+
+These four distinctions drive the rest of the proposal.
+
+### 1. Two orthogonal tasks, and "BYO for *what*"
+
+Treat every consumer of identity as choosing its own issuer: the Cozystack platform (console/API) is one consumer; each managed service (managed Kubernetes, and later managed Grafana, etc.) is another. `cozy` is simply the issuer Cozystack ships by default. Pointing a consumer at an *external* issuer is "BYO" — a **different task** from "use cozystack-provided identity," not a later phase of the same one. BYO then splits by target:
+
+- **BYO for a managed service** — the service trusts the external IdP *directly*. A tenant's Okta can be the issuer for their managed Kubernetes with **no relationship to `cozy`** — `cozy` is never in the path. This is exactly EKS `associate-identity-provider-config`: the cluster apiserver trusts your IdP; your IdP never touches AWS IAM. In this proposal that is the `CustomConfig` selector.
+- **BYO for Cozystack itself** — here, and only here, you *federate*: the external IdP is brokered into the platform identity so people sign into the Cozystack console with corporate credentials. Out of scope here; noted for completeness.
+
+Org count (single-org vs multi-org) does **not** pick the model. Which *consumer*, and whether a *preexisting IdP should own it*, does.
+
+### 2. Couple at provisioning, decouple at ownership
+
+A cluster may **request** identity wiring — that is exactly what the `System | CustomConfig | None` selector is — but it must **not own the lifecycle of IdP objects**. The earlier draft's lifecycle showed the failure mode: `Tenant.spec.oidc=false` deletes the realm *and all its users*, so a directory gets destroyed by toggling a Kubernetes auth flag. And in the BYO case there is no business creating groups inside someone else's IdP at all. Phase 1 keeps the cluster owning only disposable, cluster-scoped objects (RoleBindings), never directory objects.
+
+### 3. ops vs dev is authorization, not directory
+
+The relevant split inside a tenant's workforce:
+
+- **Infra admins / ops** — log into `cozy`, use the Cozystack API/console.
+- **Developers** — need `kubectl` against their clusters but are *not* allowed into the cloud console.
+
+Both are Phase-1 cases with no new realm. Ops are already in `cozy`. Developers either get a `cozy` identity that carries *no* console RBAC but a per-cluster `kubectl` grant (presence in the directory ≠ console access — authorization separates them), or the cluster trusts the company's own IdP directly (`CustomConfig`). A per-tenant realm would *fragment* one workforce across two platform-hosted directories, when the distinction is one of authorization.
+
+### 4. The identity boundary is the organization, not every tenant
+
+Cozystack tenancy is a tree — e.g. `tenant-root → organization → project`. The meaningful identity boundary is the **organization** (the customer-facing unit), not every nested tenant; projects should share their organization's identity rather than own a separate one. A per-tenant realm is the wrong granularity for a nested model — it forces solving "which tenant owns the realm" plus inheritance for every nested project. Any Phase-2 ownership marker therefore belongs at the organization level. (Raised by `@mattia-eleuteri`, who runs exactly this shape on the shared `cozy` realm + the `tenant-<name>-{view,use,admin,super-admin}` groups Cozystack already provisions.)
 
 ## Context
 
 ### The current shape
 
-Today the `cozy` realm exists for management-cluster platform admins. The dashboard, ArgoCD, and a few other platform components rely on it. Groups in `cozy` are `<tenant-ns>-*` membership markers used to grant management-cluster RBAC; they do not describe end-user identities owned by a tenant.
+The `cozy` realm exists for management-cluster platform users. The dashboard and other platform components rely on it. Its per-tenant groups are `tenant-<name>-{view,use,admin,super-admin}` (rendered by `packages/apps/tenant/templates/keycloakgroups.yaml`, all bound to the `keycloakrealm-cozy` `ClusterKeycloakRealm`); they grant management-cluster RBAC and already map onto the tenant tree.
 
-Tenant Kubernetes clusters provisioned by the `kubernetes` app (`packages/apps/kubernetes/`) ship with **one user-facing path**: the `kubernetes-<cluster>-admin-kubeconfig` Secret that the platform mints. The Secret contains a static `cluster-admin` certificate. Any human who needs `kubectl` against the cluster takes the same cert — there is no per-user identity, no per-user audit, no MFA, no group-based RBAC.
+Tenant Kubernetes clusters provisioned by the `kubernetes` app (`packages/apps/kubernetes/`) ship with **one user-facing path**: the `kubernetes-<cluster>-admin-kubeconfig` Secret (the Kamaji-minted `super-admin.svc` kubeconfig). Anyone who needs `kubectl` takes the same `cluster-admin` cert — no per-user identity, audit, MFA, or group-based RBAC.
 
-### Existing primitives
+### Existing primitives (verified against `main`)
 
-- **EDP Keycloak Operator** (`v1.edp.epam.com/v1alpha1`) — declares `ClusterKeycloakRealm`, `KeycloakClient`, `KeycloakRealmGroup`, `KeycloakClientScope` as Kubernetes CRDs. Already vendored and running in cozystack management clusters as part of the platform stack.
-- **`apps/tenant` chart** — owns the lifecycle of a tenant namespace, currently emits cozystack-basics values via a static template, exposes a flat `Tenant.spec.*` API.
-- **`apps/kubernetes` chart** — renders `Cluster`, `KamajiControlPlane`, `KubevirtCluster`, MachineDeployments, addons. Accepts `oidc` values today only as no-op fields; no resources rendered.
-- **`packages/extra/oidc/`** (new in cozystack#3044) — Helm chart owning the `ClusterKeycloakRealm` + bootstrap admin user for one tenant realm.
-- **`KamajiControlPlane`** — Kamaji's `tcp.kamaji.clastix.io/v1alpha1` CRD allows arbitrary apiserver flags via `spec.apiServer.extraArgs`, and supports `spec.deployment.extraVolumes` + `spec.apiServer.extraVolumeMounts` for mounting files into the apiserver pod. Both are used by Layer 5 to deliver a structured `AuthenticationConfiguration` to the apiserver.
-
-### The problem
-
-Tenant clusters need a real user identity model. Tenants need to:
-
-- Onboard their own people without involving cozystack platform admins.
-- Audit who ran `kubectl exec`.
-- Bind RBAC to groups, not to a single shared certificate.
-- Rotate access by disabling a user, not by rotating a cluster's kubeconfig.
-
-And whatever shape we ship has to fit within an existing structural reality: the `cozy` realm is **not a tenant directory**. Its groups are management-cluster permission markers (`<ns>-admins`, `<ns>-users`), populated by the platform operator at tenant-creation time. Using it as the place where a tenant's engineers and customers live couples a platform-internal trust artifact to a tenant-facing user surface, and forces every tenant user lifecycle event to flow through the platform admin.
+- **EDP Keycloak Operator** (`v1.edp.epam.com/v1alpha1`) — provides `ClusterKeycloak`, `ClusterKeycloakRealm`, `KeycloakClient`, `KeycloakClientScope`, `KeycloakRealmGroup`, `KeycloakRealmUser`, `KeycloakRealmIdentityProvider` (and more) as CRDs. Vendored under `packages/system/keycloak-operator/`.
+- **`cozy` realm** — defined in `packages/system/keycloak-configure/templates/configure-kk.yaml` (`ClusterKeycloakRealm` `realmName: cozy`).
+- **`apps/tenant` chart** — owns a tenant namespace; exposes a flat `Tenant.spec.*` API (today: `host`, `etcd`, `monitoring`, `ingress`, `gateway`, `seaweedfs`, `schedulingClass`, `resourceQuotas`). No `spec.oidc` yet.
+- **`apps/kubernetes` chart** — renders `Cluster`, `KamajiControlPlane`, `KubevirtCluster`, MachineDeployments, addons. No `oidc` field today. Default tenant k8s version is `v1.35`, so the apiserver supports structured `AuthenticationConfiguration` (stable since 1.30).
+- **`KamajiControlPlane`** — apiVersion `controlplane.cluster.x-k8s.io/v1alpha1` (the CAPI control-plane provider; not to be confused with the `tcp.kamaji.clastix.io` `TenantControlPlane` CRD). It accepts apiserver flags via `spec.apiServer.extraArgs` and supports `spec.deployment.extraVolumes` + `spec.apiServer.extraVolumeMounts`.
+- **Namespace value propagation** — `packages/system/cozystack-basics/templates/cozystack-values-secret.yaml` emits a per-namespace `_namespace` bundle (`host`, `etcd`, `ingress`, `gateway`, `monitoring`, `seaweedfs`, `schedulingClass`). Inheritance today is a **single-level parent lookup** (`packages/apps/tenant/templates/namespace.yaml`); there is no recursive walk-up of the tenant tree.
 
 ## Goals
 
-- Tenant admins manage their own users, groups, and password / MFA policy without platform-admin involvement.
-- Tenant Kubernetes clusters authenticate via OIDC against an issuer the tenant controls.
-- Per-cluster token replay is impossible: a token minted for cluster A is rejected by cluster B even within the same tenant.
-- Default RBAC for OIDC identities is **view + admin split, not blanket cluster-admin**. The static admin kubeconfig stays as the break-glass path.
-- The full surface (realm + client + groups + RBAC + kubeconfig Secret) is declarative: `Tenant.spec.oidc=true` is enough.
-- The chart's existing API stays additive — clusters without `oidc.enabled` render the same objects as on `main`.
-- Authentication wiring is structured (`AuthenticationConfiguration`), not flag-based, so multi-issuer / BYO-OIDC and private-CA paths extend the same Secret in follow-up work instead of fighting the chart shape.
+- A tenant cluster can authenticate `kubectl` users via OIDC: either against `cozy` (`System`) or a tenant-provided issuer (`CustomConfig`).
+- Per-cluster token replay is impossible: a token minted for cluster A is rejected by cluster B, even within one tenant.
+- Default RBAC is a **view + admin split, not blanket cluster-admin**, expressed declaratively. The static admin kubeconfig stays as break-glass.
+- Authentication wiring is structured (`AuthenticationConfiguration`), so multi-issuer / BYO and private-CA paths extend the same Secret instead of fighting the chart shape.
+- The chart API stays additive — clusters without OIDC render exactly as on `main`.
+- No cluster owns the lifecycle of IdP directory objects ([principle 2](#2-couple-at-provisioning-decouple-at-ownership)).
 
 ### Non-goals
 
-- **BYO-OIDC for tenant clusters.** Deferred; needs structured authentication configuration, which is a follow-up proposal.
-- **Multi-issuer tenant clusters.** Single issuer per `KamajiControlPlane`; multi-issuer is a structured-auth-config feature.
-- **Custom credential plugin / RFC 8693 token exchange.** A possible future optimization; not required to ship per-tenant realms.
-- **Federation of tenant realms to external corporate IdPs.** Out of scope of this proposal. A tenant admin can configure Keycloak's standard upstream federation (LDAP, SAML, social) inside the tenant realm if they want; that's a `keycloakctl` action, not a chart change.
-- **Cross-cluster SSO inside one tenant.** Each tenant cluster has its own audience; one realm login, one set of issued tokens, multiple per-cluster audiences are issued separately. Token-exchange is a separate proposal.
+- **Managed multi-tenant identity / IdP-as-a-service.** That is Phase 2.
+- **Federating an external IdP into the platform realm** ("BYO for Cozystack itself").
+- **Custom credential plugin / RFC 8693 token exchange.** Possible future optimization; not required.
+- **Cross-cluster SSO inside one tenant.** Each cluster has its own audience.
 
-## Design
+## Phase 1 — issuer selector + per-cluster client
 
-### Layer 1 — Per-tenant realm
+This is what ships in [`cozystack#3044`](https://github.com/cozystack/cozystack/pull/3044).
 
-When `Tenant.spec.oidc=true`, the tenant's `apps/tenant` HelmRelease renders a sub-HR pointing at `packages/extra/oidc/`. That chart owns:
+### Consume-side API
 
-- One `ClusterKeycloakRealm` CR named `tenant-<ns>` (where `<ns>` is the tenant namespace, which is realm-wide unique). The realm carries default authentication flows from the Keycloak operator and is wired to the platform's master `ClusterKeycloak`.
-- One bootstrap `KeycloakRealmUser` representing the tenant admin, with credentials sourced from a Secret that already exists in the tenant namespace (`<ns>-admin-credentials`).
-
-Realm naming is `tenant-<ns>`, not `<ns>`, to avoid the chance that a tenant namespace collides with an unrelated realm name (e.g. `cozy`, `master`, an operator-managed realm).
-
-### Layer 2 — Realm propagation through the tenant hierarchy
-
-Cozystack tenant namespaces form a hierarchy: a tenant with `oidc=false` inherits its parent's realm. The propagation does **not** use Helm `lookup`. It uses cozystack-basics's static namespace-values emission:
-
-- `packages/core/cozystack-basics/templates/_namespace.tpl` emits `_namespace.oidc-realm` into the per-namespace values bundle that every chart in the namespace reads.
-- The value is computed by walking up the tenant hierarchy at template-render time inside cozystack-basics: take the closest ancestor (including self) with `_cluster.oidc-enabled=true` and emit its realm name.
-- `apps/kubernetes` reads `._namespace.oidc-realm` at render time. No Helm `lookup`. No re-render gap. The value is materialized into the same values Secret that already gates every other namespace-level concern (DNS suffix, ingress class, storage class).
-
-This is the same shape as how `_namespace.dns-suffix` and `_namespace.kubelet-image-credential-provider-config` are already propagated. The OIDC realm rides the same channel.
-
-### Layer 3 — Per-cluster public client (audience binding)
-
-For each `Kubernetes` CR in the tenant namespace with `oidc.enabled=true`, `apps/kubernetes` renders:
-
-- One `KeycloakClient` in `tenant-<ns>` realm with `spec.clientId: <ns>-kubernetes-<cluster>`, `publicClient: true`, PKCE required, redirect URIs limited to `http://localhost:8000` and `http://localhost:18000` (the kubelogin and oidc-login default ports).
-- One `KeycloakClientScope` with an `oidc-usermodel-attribute-mapper` (audience mapper) so the issued `id_token.aud` equals the clientId.
-
-`clientId` is realm-wide unique. Two clusters with the same short name in different namespaces get different clientIds because the namespace prefix is part of the id. The audience binding is the per-cluster isolation primitive: an id_token minted for `<ns-a>-kubernetes-prod` carries `aud: <ns-a>-kubernetes-prod`, and a different cluster's apiserver — configured with `--oidc-client-id=<ns-b>-kubernetes-prod` — rejects it. No tenant-side coordination needed.
-
-### Layer 4 — Two-tier RBAC groups
-
-`apps/kubernetes` renders **two** `KeycloakRealmGroup` CRs per cluster:
-
-- `<cluster>-view` (metadata.name) with `spec.name: <ns>-kubernetes-<cluster>-view` (realm-wide unique).
-- `<cluster>-admin` (metadata.name) with `spec.name: <ns>-kubernetes-<cluster>-admin`.
-
-Tenant admin assigns Keycloak users to whichever group is appropriate through the standard Keycloak admin UI inside `tenant-<ns>`. Group membership ends up as `groups:` claim in the id_token.
-
-Inside the tenant Kubernetes cluster, a bootstrap Job (Helm `post-install,post-upgrade` hook, ServiceAccount scoped to the tenant namespace, pod labeled `policy.cozystack.io/allow-to-apiserver: "true"` so Cilium permits the egress to the management apiserver) applies two `ClusterRoleBinding`s:
-
-- `oidc-<cluster>-view` → `ClusterRole/view`, subject `Group: <ns>-kubernetes-<cluster>-view`.
-- `oidc-<cluster>-admin` → `ClusterRole/cluster-admin`, subject `Group: <ns>-kubernetes-<cluster>-admin`.
-
-`view` is the upstream kube-default ClusterRole — read-mostly, no secrets, no exec. `cluster-admin` is the upstream kube-default escalation. The chart **does not** invent a third role. A tenant who wants finer-grained roles authors them in their own GitOps repo and binds them to additional Keycloak groups themselves.
-
-The static admin kubeconfig stays. It is the documented break-glass path when OIDC is misconfigured or the realm operator is down.
-
-### Layer 5 — KCP wired via structured authentication config file
-
-`apps/kubernetes/templates/cluster.yaml` extends the tenant's `KamajiControlPlane` to consume a **structured `AuthenticationConfiguration`** (`apiserver.config.k8s.io/v1beta1`) mounted as a file, rather than the legacy `--oidc-*` flag set. Three pieces line up:
-
-1. `spec.apiServer.extraArgs` gains a single flag pointing the apiserver at the config file:
-
-   ```yaml
-   spec:
-     apiServer:
-       extraArgs:
-       - --authentication-config=/etc/kubernetes/authentication-config/config.yaml
-       extraVolumeMounts:
-       - name: authentication-config
-         mountPath: /etc/kubernetes/authentication-config
-         readOnly: true
-     deployment:
-       extraVolumes:
-       - name: authentication-config
-         secret:
-           secretName: <release>-oidc-authn-config
-           items:
-           - key: config.yaml
-             path: config.yaml
-   ```
-
-2. A per-cluster Secret `<release>-oidc-authn-config` carries the structured config — rendered by a sibling template `apps/kubernetes/templates/oidc-authn-config.yaml`:
-
-   ```yaml
-   apiVersion: apiserver.config.k8s.io/v1beta1
-   kind: AuthenticationConfiguration
-   jwt:
-   - issuer:
-       url: https://keycloak.<root-host>/realms/<realm>
-       audiences:
-       - <ns>-kubernetes-<cluster>
-     claimMappings:
-       username:
-         claim: preferred_username
-         prefix: ""
-       groups:
-         claim: groups
-         prefix: ""
-   ```
-
-3. Audience binding stays identical to the flag path: the `audiences:` entry in the structured config equals the per-cluster `KeycloakClient.spec.clientId`, so id_tokens minted for one cluster are rejected by every other cluster's apiserver.
-
-Why structured config rather than `--oidc-*` flags:
-
-- **Multi-issuer ready.** `AuthenticationConfiguration.jwt` is a list. The BYO-OIDC follow-up can add a tenant-provided issuer alongside the platform-provided one without rewiring the chart.
-- **Private-CA support is unblocked.** `issuer.certificateAuthority` accepts inline PEM, so a tenant's self-signed issuer (a common on-prem case) just works. The flag-based path could not.
-- **Hot reload.** Editing the Secret causes the apiserver to pick up new config without a pod restart (Kubernetes 1.30+).
-- **Single point of change.** Future claim mappings, validation rules, or CEL expressions extend one structured file instead of accreting flags.
-
-If `oidc.enabled=true` but cozystack-basics has not yet emitted `_namespace.oidc-realm` (because the realm hasn't reconciled yet), the chart emits a soft beacon — a `ConfigMap` named `<cluster>-awaiting-oidc-realm`, status `awaiting-oidc-realm` — and renders **none** of the three pieces above. Flux re-renders on its normal interval; once the realm value lands in namespace values, the next render produces the Secret, the extraArgs, and the volume wiring atomically, and Kamaji rolls the apiserver pod to pick them up. This sidesteps the Helm lookup re-render gap completely (no lookup is involved at all).
-
-### Layer 6 — OIDC kubeconfig Secret in management namespace
-
-Once the bootstrap Job has applied the two CRBs inside the tenant cluster, the same Job writes a Secret in the management cluster's tenant namespace:
+`Kubernetes.spec.oidc` gains a selector (default `None`, fully backward-compatible):
 
 ```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: kubernetes-<cluster>-oidc-kubeconfig
-  namespace: <ns>
-stringData:
-  issuer-url: <issuer>
-  client-id: <ns>-kubernetes-<cluster>
-  realm: <realm>
-  group-view: <ns>-kubernetes-<cluster>-view
-  group-admin: <ns>-kubernetes-<cluster>-admin
-  server-url: <tenant cluster API URL>
-  kubeconfig: |
-    apiVersion: v1
-    kind: Config
-    # ...embeds the cluster CA + an exec auth block calling `kubectl oidc-login`
+spec:
+  oidc:
+    mode: System          # System | CustomConfig | None
+    # users: bind identities to cluster RBAC without creating any Keycloak group
+    users:
+    - email: alice@example.com
+      role: admin         # admin | view
+    - email: bob@example.com
+      role: view
 ```
 
-`packages/system/kubernetes-rd/cozyrds/kubernetes.yaml` lists this Secret name in `spec.secrets.include[].resourceNames`, so the cozystack dashboard exposes it to tenant viewers alongside the existing admin-kubeconfig Secret. Tenant users `kubectl get secret kubernetes-<cluster>-oidc-kubeconfig -o jsonpath='{.data.kubeconfig}' | base64 -d > ~/.kube/config-<cluster>` and `kubectl oidc-login` does the rest.
+- `System` — trust the platform `cozy` realm via a per-cluster client (below).
+- `CustomConfig` — trust a tenant-provided issuer directly (BYO for a managed service); the tenant supplies an `AuthenticationConfiguration` (inline or via `secretRef`). `cozy` is not in the path.
+- `None` — no OIDC (today's behavior).
 
-### Lifecycle
+The enum is intentionally open for Phase 2: a future `KeycloakRealm` and/or `Organization` value selects a tenant-owned directory once Phase 2 lands — `oidc: System | CustomConfig | Organization | KeycloakRealm | None`.
 
-```mermaid
-flowchart LR
-    Tenant[Tenant CR<br/>spec.oidc=true] --> TenantHR[apps/tenant HR]
-    TenantHR --> OIDCHR[extra/oidc sub-HR]
-    OIDCHR --> Realm[ClusterKeycloakRealm<br/>tenant-ns]
-    Realm --> RealmAdmin[KeycloakRealmUser<br/>tenant-admin]
-    TenantHR --> Basics[cozystack-basics<br/>emits _namespace.oidc-realm]
-    Basics --> NSVals[namespace values Secret]
-    NSVals --> KubeHR[apps/kubernetes HR per cluster]
-    KubeHR --> KCP[KamajiControlPlane<br/>--oidc-* extraArgs]
-    KubeHR --> Client[KeycloakClient<br/>ns-kubernetes-cluster]
-    KubeHR --> Groups[KeycloakRealmGroup x2<br/>-view, -admin]
-    KubeHR --> Job[bootstrap Job]
-    Job --> CRB[2x ClusterRoleBinding<br/>inside tenant cluster]
-    Job --> Sec[oidc-kubeconfig Secret<br/>in mgmt ns]
-    Sec --> Dash[exposed via cozyrds]
+### Layer A — `cozy` as the `System` default
+
+`System` needs zero new identity infrastructure: `cozy` already exists and already holds the tenant's people. It is the natural zero-config default. The "no IdP of their own" shop — cited as the batteries-included case — *already has a directory* (`cozy`), because its people already log into Cozystack; the batteries-included win is "your Cozystack login works on your cluster," not "here is a fresh empty realm to populate."
+
+### Layer B — per-cluster public client (audience binding)
+
+For each `Kubernetes` CR with `oidc.mode: System`, `apps/kubernetes` renders, **in the `cozy` realm**:
+
+- One `KeycloakClient` with `spec.clientId: <ns>-kubernetes-<cluster>`, `publicClient: true`, PKCE required, redirect URIs limited to `http://localhost:8000` / `http://localhost:18000` (kubelogin / oidc-login default ports).
+- One `KeycloakClientScope` with an audience mapper so `id_token.aud` equals the clientId.
+
+`clientId` is realm-wide unique (namespace-prefixed). The audience binding is the per-cluster isolation primitive: a token for `<ns-a>-kubernetes-prod` carries `aud: <ns-a>-kubernetes-prod`, and a different cluster's apiserver — configured for its own audience — rejects it. This per-cluster client is non-negotiable; a single shared client would let any tenant user mint a token usable against every cluster.
+
+### Layer C — structured authentication config on the KamajiControlPlane
+
+`apps/kubernetes/templates/cluster.yaml` wires the `KamajiControlPlane` to a structured `AuthenticationConfiguration` (`apiserver.config.k8s.io/v1beta1`) mounted as a file — not the legacy `--oidc-*` flags.
+
+```yaml
+spec:
+  apiServer:
+    extraArgs:
+    - --authentication-config=/etc/kubernetes/authentication-config/config.yaml
+    extraVolumeMounts:
+    - name: authentication-config
+      mountPath: /etc/kubernetes/authentication-config
+      readOnly: true
+  deployment:
+    extraVolumes:
+    - name: authentication-config
+      secret:
+        secretName: <release>-oidc-authn-config
+        items:
+        - key: config.yaml
+          path: config.yaml
 ```
 
-- **Create**: `Tenant.spec.oidc=true` → realm appears → cozystack-basics emits realm into namespace values → all `Kubernetes` CRs in the namespace re-render with OIDC wired in on next Flux interval.
-- **Inherit**: child tenant with `oidc=false` reads parent's `_namespace.oidc-realm` from its own namespace values. Same wiring as create.
-- **Add a cluster**: a new `Kubernetes` CR in an OIDC-enabled tenant gets its own client+groups+CRBs+Secret automatically. No tenant-admin intervention.
-- **Delete a cluster**: Helm `pre-delete` hook Job removes the per-cluster CRBs inside the tenant cluster, removes the OIDC kubeconfig Secret in the management cluster, and lets Flux garbage-collect the per-cluster `KeycloakClient` and `KeycloakRealmGroup`s.
-- **Disable OIDC on a tenant**: `Tenant.spec.oidc=false` removes the `extra/oidc` sub-HR. The Keycloak operator removes the realm and its users. Per-cluster wiring on this tenant's `Kubernetes` CRs falls back to the no-OIDC render (KCP extraArgs removed; admin kubeconfig stays).
+The Secret `<release>-oidc-authn-config` carries:
 
-## User-facing changes
+```yaml
+apiVersion: apiserver.config.k8s.io/v1beta1
+kind: AuthenticationConfiguration
+jwt:
+- issuer:
+    url: https://keycloak.<root-host>/realms/cozy     # System; or the tenant issuer for CustomConfig
+    audiences:
+    - <ns>-kubernetes-<cluster>                        # equals the per-cluster clientId
+  claimMappings:
+    username:
+      claim: preferred_username
+      prefix: ""
+    groups:
+      claim: groups
+      prefix: ""
+```
 
-- Tenant `Kubernetes` CRD gains an `oidc.enabled` bool. Default `false`. When `true` it is a no-op until the namespace's `_namespace.oidc-realm` is populated.
-- `Tenant` CRD gains a flat `spec.oidc` bool. Default `false`. When `true` the tenant gets its own realm.
-- Dashboard: in an OIDC-enabled namespace, the cluster page shows a new `kubernetes-<cluster>-oidc-kubeconfig` Secret alongside the existing admin-kubeconfig Secret.
-- Keycloak admin UI: the tenant admin sees a new realm `tenant-<ns>` and is the bootstrap admin of it. Group assignments for tenant users live there.
+Why structured config rather than flags:
 
-No CLI changes in this proposal. A future `cozystack` CLI command for "give me a ready-to-use OIDC kubeconfig for cluster X" is an obvious follow-up.
+- **Multi-issuer ready.** `jwt` is a list — `CustomConfig` (and a future Phase-2 issuer) add entries without rewiring the chart.
+- **Private-CA support.** `issuer.certificateAuthority` accepts inline PEM, so a tenant self-signed issuer (common on-prem) works. The flag path cannot.
+- **Single point of change.** Future claim mappings / CEL extend one file.
 
-## Upgrade and rollback compatibility
+### Layer D — RBAC without auto-provisioned groups
 
-- **Backward compatibility (no OIDC):** clusters without `oidc.enabled` render the same set of objects as on `main`. helm-unittest covers the 0-document and 0-extraArgs cases for `apps/kubernetes`.
-- **Upgrade from OIDC-disabled to OIDC-enabled:** flip `Tenant.spec.oidc=true` and `Kubernetes.spec.oidc.enabled=true`. Standard HR upgrade, no migrations, no controller cooperation beyond Flux + Keycloak operator.
-- **Rollback from OIDC-enabled to OIDC-disabled:** flip the bools back. Bootstrap-Job cleanup hook runs on pre-delete; the static admin kubeconfig path is untouched throughout.
-- **Existing dev clusters with no realm**: chart emits the soft `awaiting-oidc-realm` beacon and keeps the KCP unmodified. Operator sees a clear status on the ConfigMap and can fix the realm out-of-band without the chart wedging.
+Phase 1 does **not** create Keycloak groups. The `users:` map binds identities directly to cluster RBAC. A bootstrap Job (Helm `post-install,post-upgrade` hook; ServiceAccount scoped to the tenant namespace; pod labeled `policy.cozystack.io/allow-to-apiserver: "true"`, matching the existing cluster-autoscaler / kccm / CSI-controller egress pattern) applies, inside the tenant cluster, one `ClusterRoleBinding` per listed user:
+
+- `role: admin` → `ClusterRole/cluster-admin`, subject `User: <issuer-username>`.
+- `role: view` → `ClusterRole/view`, subject `User: <issuer-username>`.
+
+These bindings are disposable, cluster-scoped objects — the cluster owns them, never any directory object ([principle 2](#2-couple-at-provisioning-decouple-at-ownership)). This also avoids creating groups inside a tenant's own IdP in the `CustomConfig` case, and avoids any collision with the existing `tenant-<name>-*` groups in `cozy`. A tenant wanting finer-grained roles or group-based binding authors them in their own GitOps and binds to the `groups:` claim themselves; nothing in Phase 1 blocks that.
+
+The static admin kubeconfig stays as the documented break-glass path.
+
+### Layer E — OIDC kubeconfig Secret
+
+The same Job writes a `kubernetes-<cluster>-oidc-kubeconfig` Secret in the management tenant namespace (issuer-url, client-id, server-url, and a ready `kubeconfig` with a `kubectl oidc-login` exec block). `packages/system/kubernetes-rd/cozyrds/kubernetes.yaml` already lists `kubernetes-<cluster>-admin-kubeconfig` under `spec.secrets.include[].resourceNames`; this adds the OIDC Secret name alongside it so the dashboard exposes it to tenant viewers.
+
+### Note on propagation
+
+Phase 1 needs **no** tenant-hierarchy walk: with `System` the issuer is the single global `cozy`, and `CustomConfig` is explicit per cluster. The recursive realm inheritance the earlier draft described does not exist today (propagation is single-level — see Context) and is **not** introduced in Phase 1. It becomes relevant only in Phase 2, where it should use an explicit owner marker rather than walk-up depth (see below).
+
+## Phase 2 — managed multi-tenant identity (deferred)
+
+Letting a tenant own a directory the platform provisions, hosts, and that tenants self-administer is **IdP-as-a-service** — an entire product category (Cognito, Auth0, WorkOS exist solely for this). It is neither of the Phase-1 tasks, it loads the central platform Keycloak, and it raises a billing question ("how is a tenant's directory metered?"). It must be scoped and designed on its own, not as a side effect of the kube-apiserver OIDC PR. It may also never be needed: per principles 1–4, the ops/dev populations are already served in Phase 1.
+
+> **This section is not a finalized design.** It maps the problem space and records the candidate options; it does not pick one. Phase 2 will require its own design proposal with a dedicated review round and explicit decisions — at minimum: the issuer/directory ownership model, billing/metering for hosted identity, multi-level tenant inheritance, and the security-boundary trade-off (per-realm isolation vs. Organizations-as-membership) — before any implementation begins. The material below is input to that round, not its conclusion.
+
+If/when it is taken up, two designs are on the table.
+
+### Option A — Keycloak Organizations (evaluate first)
+
+Keycloak Organizations (a per-realm feature; being exposed upstream in [`cozystack/cozystack#3031`](https://github.com/cozystack/cozystack/pull/3031)):
+
+- One shared `cozy` realm; one **Organization per organization-tenant**.
+- Per-org domains, membership, and **per-org IdP brokering** — which is the BYO-for-Cozystack story scoped to the customer rather than per-cluster.
+- Honors "decouple at ownership" naturally: the platform owns the realm; the customer owns their Organization (members + brokered IdP). No realm proliferation, no per-tenant Keycloak hosting, no central-Keycloak realm explosion.
+
+Caveat (from `@mattia-eleuteri`): Organizations are membership + brokering + attributes, **not** a hard security boundary — clients and roles stay realm-level. So Organizations *complement* the per-cluster client + RBAC model rather than replacing it. For the nested `organization → project` shape this is the right granularity, and it is markedly lighter than a realm per tenant.
+
+### Option B — per-tenant realm (original design, retained as record)
+
+The original proposal. Kept here in full because it is the strongest *isolation* answer (realm-level config isolation, per-realm auth flows) if a tenant genuinely needs that — at the cost of central-Keycloak load and lifecycle/granularity complexity.
+
+- **Realm.** `Tenant.spec.oidc=true` renders a sub-HR (`packages/extra/oidc/`, new in `cozystack#3044`) owning one `ClusterKeycloakRealm` `tenant-<ns>` wired to the platform master `ClusterKeycloak`, plus a bootstrap `KeycloakRealmUser`.
+- **Per-cluster client + audience** inside `tenant-<ns>` (as in Phase 1 Layer B, but in the tenant realm).
+- **Groups.** Two `KeycloakRealmGroup`s per cluster (`-view`, `-admin`) mapped to `ClusterRole/view` and `ClusterRole/cluster-admin` inside the tenant cluster.
+- **Propagation.** A realm hint flows through the namespace-values channel.
+
+Known costs, which are why this is no longer the default:
+
+- **Central-Keycloak load / billing** — N realms vs. 1. This is the load concern; it needs a billing model. A mitigation discussed on the syncs is to run Keycloak as an *External App inside the tenant namespace* (billing becomes trivial — it is just API + DB pods), at the cost of nested-tenant wiring.
+- **Lifecycle coupling** — provisioning the realm from `Tenant.spec.oidc` means a Kubernetes toggle owns a directory's lifecycle (violates [principle 2](#2-couple-at-provisioning-decouple-at-ownership)).
+- **Granularity** — a realm per *tenant* is finer than the organization boundary ([principle 4](#4-the-identity-boundary-is-the-organization-not-every-tenant)); it forces "which tenant owns the realm" + inheritance for every nested project.
+
+### How to choose, and the inheritance marker
+
+Pick by the actual driver. If the driver is **per-customer identity + BYO IdP** (the common case), Option A covers it at a fraction of the operational cost. Only reach for Option B if a tenant needs realm-level config isolation that Organizations cannot give. Either way, the owner of the Organization/realm should be an **explicit marker on the owning (organization-level) tenant**, with inheritance resolving to that ancestor — not a fragile single-/multi-level walk-up of the tree (`@mattia-eleuteri`).
 
 ## Security
 
-- **Trust domains stay separate.** `cozy` realm continues to back platform-admin SSO and management-cluster RBAC. `tenant-<ns>` realms back tenant cluster auth. A compromise of a tenant realm cannot escalate into platform-admin RBAC because no group in `tenant-<ns>` is referenced from any management-cluster RoleBinding.
-- **Per-cluster audience binding.** Token minted for `aud: <ns>-kubernetes-A` is rejected by cluster B's apiserver (its `--oidc-client-id` is different). No webhook required, no extra moving parts.
-- **`system:authenticated` exposure.** Every OIDC-authenticated user lands in `system:authenticated` and gets the kube-default `system:discovery` / `system:basic-user` / `system:public-info-viewer` rights. This is true for **any** OIDC integration on kube-apiserver, including BYO-OIDC. The per-cluster audience binding makes this safe: the token can only reach the cluster it was issued for.
-- **Bootstrap Job ServiceAccount.** Restricted to its tenant namespace + a single Role granting it write access to two specific Secret names (`kubernetes-<cluster>-admin-kubeconfig` for read, `kubernetes-<cluster>-oidc-kubeconfig` for write). Cilium egress restricted by the `policy.cozystack.io/allow-to-apiserver` label, matching the existing pattern used by cluster-autoscaler, kccm, and the CSI controller.
-- **No platform-admin path into tenant data.** The platform admin can read tenant realm contents via the master Keycloak (operationally, that is the same as today for `cozy`), but RBAC inside tenant clusters is entirely driven by tenant-realm group membership, which only the tenant admin manages.
+- **Trust domains stay separate.** Phase 1 `System` reuses `cozy` but binds tenant-cluster access only through per-cluster clients + cluster-local RoleBindings; no `tenant-<name>-*` `cozy` group is referenced from a tenant *cluster* binding, and no tenant-cluster identity is referenced from a management-cluster binding.
+- **Per-cluster audience binding.** A token for `aud: <ns>-kubernetes-A` is rejected by cluster B. No webhook, no extra moving parts.
+- **`system:authenticated` exposure.** Every OIDC-authenticated user lands in `system:authenticated` with the kube-default discovery rights — true for *any* OIDC integration. The per-cluster audience binding makes it safe: a token only reaches the cluster it was issued for.
+- **`CustomConfig` trust.** With BYO, the cluster trusts the tenant's issuer directly; `cozy` is not in the path, so a tenant IdP compromise is contained to that tenant's own cluster(s).
+- **Bootstrap Job ServiceAccount.** Scoped to its tenant namespace + write access to the specific OIDC-kubeconfig Secret; Cilium egress gated by `policy.cozystack.io/allow-to-apiserver`.
 
 ## Failure and edge cases
 
-- **`oidc.enabled=true` but cozystack-basics hasn't emitted `_namespace.oidc-realm` yet** → chart emits `<cluster>-awaiting-oidc-realm` ConfigMap, leaves KCP unchanged. Next Flux reconcile picks up the realm value.
-- **`oidc.enabled=true` but the platform-level OIDC flag is off** → chart `fail`s the render with a clear error pointing at the platform flag.
-- **Realm deletion while clusters in the namespace still have `oidc.enabled=true`** → admission protection: the Keycloak operator's `ClusterKeycloakRealm` finalizer holds until child `KeycloakClient`s are gone. The tenant chart's pre-delete order is realm-last.
-- **Tenant realm operator down** → realm CR stays Pending. Soft beacon ConfigMap stays. KCP unmodified. Clusters keep working via static admin kubeconfig.
-- **Bootstrap Job egress blocked by Cilium policy** → Job pod is labeled `policy.cozystack.io/allow-to-apiserver: "true"`; the existing apiserver-egress allow rule (already used by cluster-autoscaler / kccm / kcsi-controller) covers it. Without the label, `kubectl apply` of the Secret times out and the Job fails — surfaced in HR status.
-- **kubectl client without `oidc-login` plugin** → user sees a clear error from kubectl. Documented prerequisite alongside the kubeconfig Secret in the dashboard.
-- **Two tenants try to claim the same realm name** → realm names are `tenant-<ns>`, and `<ns>` is globally unique inside a cozystack management cluster. No collision.
+- **`oidc.mode: System` but the platform OIDC prerequisite is missing** → chart `fail`s the render with a clear message.
+- **`CustomConfig` with an unreachable/invalid issuer** → apiserver rejects tokens; admin kubeconfig keeps working (break-glass).
+- **Bootstrap Job egress blocked by Cilium** → Job pod carries `policy.cozystack.io/allow-to-apiserver: "true"`; without it the apply times out and the Job fails (surfaced in HR status).
+- **`kubectl` without the `oidc-login` plugin** → clear client-side error; documented prerequisite next to the kubeconfig Secret.
+- **Deeper tenant nesting (Phase 2)** → resolved via the explicit owner marker, not walk-up depth.
 
 ## Testing
 
-- **helm-unittest** for `apps/kubernetes` covers: oidc-disabled baseline (no KCP args, no Keycloak objects, no Job); oidc-enabled but realm pending (soft beacon, no KCP args); oidc-enabled and realm ready (4-document Keycloak render — client + scope + view group + admin group; 5-document Job render — SA + Role + RB + install Job + cleanup Job).
-- **helm-unittest** for `apps/tenant` covers: `Tenant.spec.oidc=false` (no oidc sub-HR), `Tenant.spec.oidc=true` (oidc sub-HR rendered, points at `extra/oidc`).
-- **helm-unittest** for `extra/oidc` covers: `ClusterKeycloakRealm` shape, bootstrap admin user, default authentication flow values.
+- **helm-unittest** for `apps/kubernetes`: `oidc.mode: None` baseline (zero new objects, zero extraArgs); `System` (per-cluster `KeycloakClient` + scope, authn-config Secret, KCP extraArgs/volumes, one CRB per `users` entry); `CustomConfig` (authn-config Secret from supplied config, no Keycloak objects in `cozy`).
 - **bats e2e** under `hack/e2e-apps/`:
-  - `kubernetes-oidc.bats`: cluster with `oidc.enabled=true`; verifies KeycloakClient/groups land, KCP gets `--oidc-*` args, two CRBs land inside the tenant cluster, oidc-kubeconfig Secret exists with the expected fields, pre-delete hook removes everything.
-  - `tenant-oidc.bats`: tenant with `Tenant.spec.oidc=true`; verifies realm appears, realm admin user appears, child tenants inherit via `_namespace.oidc-realm`.
-  - `tenant-oidc-inheritance.bats`: child tenant with `oidc=false` under a parent with `oidc=true`; verifies the inherited realm wiring on its `Kubernetes` CRs.
-- **Manual e2e on a dev cluster:** create a `Kubernetes` CR with `oidc.enabled=true` in an OIDC-enabled tenant, log into the Keycloak realm as the bootstrap admin, create a user, put them in `-view`, kubectl with the oidc kubeconfig, verify access is read-only, move user to `-admin`, verify access is cluster-admin.
+  - `kubernetes-oidc-system.bats`: `oidc.mode: System` with a `users` map; verify client+scope land in `cozy`, KCP gets `--authentication-config`, the right CRBs land in the tenant cluster, the oidc-kubeconfig Secret exists; `view` user is read-only, `admin` user is cluster-admin; teardown removes the CRBs + Secret.
+  - `kubernetes-oidc-customconfig.bats`: `oidc.mode: CustomConfig` with a BYO issuer; verify the apiserver trusts it and nothing is created in `cozy`.
+- **Manual e2e:** drive both modes end-to-end on a dev cluster.
+
+(Phase-2 testing is scoped with the Phase-2 proposal.)
 
 ## Rollout
 
-1. cozystack release N (this PR, [`#3044`](https://github.com/cozystack/cozystack/pull/3044)): per-tenant realm via `extra/oidc`, per-cluster client+groups+RBAC, OIDC kubeconfig Secret, dashboard exposure. `Tenant.spec.oidc` and `Kubernetes.spec.oidc.enabled` ship as `false` by default; no existing cluster is affected.
-2. cozystack release N+1 onward: bring the BYO-OIDC follow-up proposal forward (structured authentication configuration on `KamajiControlPlane`). Additive to this proposal — a tenant cluster will be able to trust both the platform-provided `tenant-<ns>` realm and a tenant-provided external issuer in parallel.
+1. **Phase 1** ([`#3044`](https://github.com/cozystack/cozystack/pull/3044)): `Kubernetes.spec.oidc` selector (`System | CustomConfig | None`, default `None`), per-cluster client, structured authn-config, `users`-based RBAC, OIDC kubeconfig Secret, dashboard exposure. No existing cluster is affected.
+2. **Phase 2** (separate proposal, if needed): managed multi-tenant identity — evaluate Option A (Keycloak Organizations) before Option B (per-tenant realm), driven by whether the requirement is per-customer IdP brokering or realm-level isolation.
 
 ## Open questions
 
-1. **BYO-OIDC** as additive entries on the same `AuthenticationConfiguration`. Layer 5 already mounts a structured config Secret into the apiserver, so file-mount mechanics are settled. The remaining design questions are around the chart API: how a tenant supplies a BYO `JWTAuthenticator` (a flat field on `Kubernetes.spec.oidc`, a free-form Secret reference, both), how a BYO authenticator's audience composes with the platform-provided per-cluster audience (parallel issuers vs. issuer-substitution), and whether the per-cluster audience binding is still required when a BYO issuer is configured (depends on the tenant's own threat model). Separate proposal.
-2. **Custom credential plugin for token exchange.** RFC 8693 (OAuth 2.0 Token Exchange) would let a tenant user log into the realm once and exchange that token for a per-cluster, audience-scoped token at use time. Keycloak supports it. Practical only if cozystack ships a `client.authentication.k8s.io` exec plugin; otherwise the per-cluster client-and-aud model in this proposal is already enough. Worth picking up only if multi-cluster login ergonomics become a real pain point.
-3. **`cozystack` CLI**: should there be a `cozystack kubeconfig --oidc <cluster>` command that materializes the OIDC kubeconfig + prints `kubectl oidc-login setup` instructions? Likely yes, follow-up.
+1. **`CustomConfig` API shape** — inline `AuthenticationConfiguration` vs. `secretRef` vs. both; how a BYO audience composes with (or replaces) the per-cluster audience.
+2. **Phase 2 trigger** — what concrete tenant requirement would justify Phase 2 at all, and does Option A satisfy it without Option B.
+3. **`cozystack` CLI** — a `cozystack kubeconfig --oidc <cluster>` helper that materializes the OIDC kubeconfig + prints `kubectl oidc-login setup`. Likely yes, follow-up.
 
 ## Alternatives considered
 
-**Flat `cozy` realm + per-cluster public client.** The most direct alternative to per-tenant realms: one realm contains every human, per-cluster audience binding does the isolation. Rejected for this proposal because it forces every tenant end-user into the management-cluster's platform-admin realm. Two consequences make this structural, not cosmetic: (1) the platform admin must provision and lifecycle every tenant's people (or build a sync from each tenant's source of truth into `cozy`), which is exactly the directory-management workload that a per-tenant realm sidesteps; (2) `cozy`'s existing groups already participate in management-cluster RBAC, so blending in tenant users requires careful policy work to make sure `tenant-<ns>-*` group membership in `cozy` doesn't accidentally collide with platform RBAC's `<ns>-admins` / `<ns>-users` groups. The per-tenant realm gives the tenant admin a directory they actually own, in the same way every other cozystack tenant subsystem (databases, VMs, ingress) is owned by the tenant.
+**Per-tenant realm as the Phase-1 baseline (the earlier version of this doc).** Reframed, not discarded — see [Phase 2 — Option B](#option-b--per-tenant-realm-original-design-retained-as-record). It is an IdP-as-a-service product (central-Keycloak load, billing, lifecycle coupling, organization-vs-tenant granularity), so it does not belong in the kube-apiserver OIDC cut. The earlier draft rejected the flat-`cozy` + per-cluster-client option on the grounds that it "forces tenant end-users into the platform realm" — but `System` does not: it authenticates the people already in `cozy`, and `CustomConfig` covers everyone who should come from an external IdP.
 
-**Bring-your-own OIDC as the only path.** Rejected for v1. Many tenants will not have an existing corporate IdP — internal teams, OSS deployers, individual developers running cozystack on their hardware. They need a working out-of-the-box solution. Per-tenant realms provide one without precluding BYO: the BYO follow-up is purely additive to this design (a second JWTAuthenticator entry on the same `KamajiControlPlane`).
+**Keycloak Organizations.** Now a first-class Phase-2 option (Option A), not a rejected alternative.
 
-**EKS-style flat IAM + webhook.** Rejected for cozystack. EKS-style auth is webhook-based because AWS's identity model lives outside the cluster (IAM is per AWS account, one tenant per account). Cozystack is multi-tenant inside one management cluster, which is the case EKS does not model. A central webhook on every tenant cluster's auth hot path is an HA security-critical service per cluster; per-realm audience binding gets the same isolation property without operating that service.
+**BYO-OIDC as the only path.** Rejected as the *only* path: many tenants have no IdP and need a zero-config default — `System` is that default. BYO is the `CustomConfig` selector, shipped in Phase 1 alongside it.
 
-**RFC 8693 Token Exchange via a custom exec plugin.** Considered, deferred. Cleaner from a "single login, many clusters" perspective; the user logs into the realm and the plugin exchanges that for per-cluster audience-scoped tokens at use time, with Keycloak deciding entitlement. Shipping it depends on whether we want to maintain a `client.authentication.k8s.io` plugin in our distribution. Not required to ship per-tenant realms — they work today with stock `kubectl oidc-login`.
+**EKS-style flat IAM + webhook.** Rejected: a central webhook on every cluster's auth hot path is an HA-critical per-cluster service; per-cluster audience binding gets the isolation without operating it. (EKS's direct-trust `associate-identity-provider-config` is, by contrast, exactly the `CustomConfig` model.)
 
-**Embedding the OIDC kubeconfig directly in the existing admin-kubeconfig Secret.** Considered, rejected. The admin-kubeconfig Secret is the cluster-admin certificate path used by the platform itself (kcsi-controller, kccm, cluster-autoscaler all consume it). Adding tenant-user-facing OIDC fields next to a Secret consumed by platform controllers conflates audiences. A separate `kubernetes-<cluster>-oidc-kubeconfig` Secret keeps the user-facing surface visibly distinct, and gives the dashboard a clean object to expose under cozyrds `secrets.include`.
+**RFC 8693 Token Exchange via a custom exec plugin.** Deferred: cleaner "single login, many clusters," but depends on maintaining a `client.authentication.k8s.io` plugin. The per-cluster client + audience model works today with stock `kubectl oidc-login`.
 
-**Legacy `--oidc-*` flag wiring instead of `--authentication-config`.** Rejected. The four-flag path (`--oidc-issuer-url` / `--oidc-client-id` / `--oidc-username-claim` / `--oidc-groups-claim`) is simpler to render — it's four `extraArgs` entries and no Secret — but it caps the apiserver at exactly one issuer, cannot trust a private-CA issuer (a hard blocker for a lot of on-prem corporate IdPs), and forces a follow-up rewrite to switch shapes when BYO-OIDC lands. Going structured from the first cut means the BYO-OIDC and private-CA follow-up proposals add entries to one already-mounted file, instead of re-architecting how the apiserver receives its authn config. The structural cost paid up front is small (one Secret + an extraVolumes/extraVolumeMounts pair on the KCP), the downstream cost saved is large.
+**Embedding the OIDC kubeconfig in the existing admin-kubeconfig Secret.** Rejected: that Secret is the platform's cluster-admin cert path (consumed by kccm, CSI controller, cluster-autoscaler); a separate `kubernetes-<cluster>-oidc-kubeconfig` keeps the user-facing surface distinct and gives the dashboard a clean object to expose.
 
-**Single global `kubernetes` Keycloak client shared by every tenant cluster.** Rejected. Would defeat per-cluster audience isolation entirely (`aud` would match everywhere). And would mean every tenant user could mint a token usable against every other tenant's cluster — only RBAC would stand between them, and `system:authenticated` already grants something. Per-cluster client is non-negotiable; the design question is "where do the clients live", which is what the rest of this proposal answers.
+**Single global `kubernetes` Keycloak client shared by every cluster.** Rejected: defeats per-cluster audience isolation; every user could mint a token usable against every cluster.
+
+## Acknowledgements
+
+This revision folds in the OIDC design-sync decisions and review feedback from `@lllamnyp` (the Phase-1/Phase-2 split, the "BYO for what" taxonomy, and "couple at provisioning, decouple at ownership") and `@mattia-eleuteri` (the organization-level identity boundary, Keycloak Organizations as the lighter Phase-2 path, and the explicit-owner inheritance marker).
