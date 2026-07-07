@@ -91,8 +91,8 @@ The remote peer targets a virtual "service-exposure" address that the gateway ow
 The tenant app never routes to the remote address directly; it talks to a **local Service** whose endpoint is the gateway VM.
 
 1. The app connects to a local Service name the chart creates (e.g. `remote-db.<tenant>.svc:port`) — the only app-side change is the target hostname.
-2. The node routes the `ClusterIP` to the gateway VM.
-3. **DNAT**: the local listener → the real remote `IP:port` behind the tunnel; the VM encrypts and sends it over the tunnel; SNAT into the tunnel's inner subnet lets replies return.
+2. The node routes the `ClusterIP` to the gateway VM on a **per-target-unique listener port** (the local Service still exposes the standard port, e.g. 5432, mapped to a unique port on the VM). The uniqueness is required so the VM can tell apart multiple remote targets that share the same destination port.
+3. **DNAT**: that unique local listener port → the real remote `IP:port` behind the tunnel; the VM encrypts and sends it over the tunnel; SNAT into the tunnel's inner subnet lets replies return.
 
 **Rejected alternative — a static route on the shared default-VPC router.** Injecting a tenant's remote RFC1918 CIDR into the cluster-wide default router risks cross-tenant address collisions and leakage. The local-Service approach keeps every remote address strictly inside the tenant's gateway VM.
 
@@ -113,6 +113,20 @@ VyOS terminates both natively and the DNAT/SNAT bridging is identical — only t
 
 - **VyOS appliance (recommended).** A single network OS does IPsec, WireGuard, native DNAT/SNAT, and firewalling; no separate proxy needed; configured declaratively via cloud-init.
 - **Alpine + libreswan/strongSwan (or wireguard-tools) + haproxy.** A leaner, self-composed image if a network-OS dependency is undesirable; more moving parts.
+
+### High availability
+
+HA splits by failure mode:
+
+- **Planned maintenance (node drain):** KubeVirt **live-migration** relocates the gateway VM with its state intact (conntrack, tunnel SA, pod IP preserved) — no tunnel drop. Preferred for maintenance; needs no standby. (Requires migratable storage — see the storage caveat below.)
+- **Unplanned node/VM failure:** needs a standby plus a failover trigger. Two mechanisms, both examined on kube-ovn (see [Testing](#testing) for the shared-VIP validation):
+
+  1. **Service-fronted active/passive.** The external `LoadBalancer` (tunnel) and internal `ClusterIP` (outbound) Services select whichever gateway pod is active; failover = re-pointing endpoints when the active goes unready. The stable address is the Service VIP (CNI-managed) — no floating L2 VIP, so no port-security interaction at all. Cost: needs a small leader-election/lease agent (or controller) to flip the active endpoint, and failover takes seconds (endpoint reconvergence). CNI-agnostic.
+  2. **Shared VIP via kube-ovn allowed-address-pairs (AAP).** A kube-ovn `Vip` plus the `ovn.kubernetes.io/aaps` pod annotation adds *only* the VIP to the port's OVN `port_security` (which stays enforced) — validated: the VIP is reachable, moves between the two gateway pods through OVN on owner change, and any other source address is still dropped, so anti-spoofing is **scoped rather than disabled** and the VM stays fully tenant-controlled (no need to withhold direct VM/cloud-init access). **Caveat:** VRRP advertisements (IP proto 112) do not reach the peer pod, so keepalived split-brains and cannot elect a master over the pod network. Root cause (independently verified): the CNI drops *all* non-TCP/UDP/ICMP/SCTP IP protocols pod-to-pod — in policy-enforced tenant pods this is **Cilium's conntrack** (`bpf_lxc.c`, "CT: Unknown L4 protocol"), and without a policy it is the OVS datapath; it is **not** geneve/inter-node-specific (same-node pods drop it too). This is the same root cause that makes native ESP need UDP encapsulation. To use this path the election must therefore run over a side-channel (e.g. the gateway pair's own tunnel link) or be driven by a controller; the AAP VIP move itself is proven. Also the `aaps` annotation must be baked into the KubeVirt VM's pod template (the current `VMInstance` chart does not expose it), and the VIP rides the pod's real MAC (keep the VyOS default — no virtual-MAC).
+
+**Recommendation:** iteration 1 ships a single gateway VM with live-migration for maintenance, and treats automatic unplanned-failure HA as a follow-up — neither mechanism is a clean drop-in today (Service-based needs a controller; AAP needs the VRRP-advert-delivery issue resolved).
+
+**Storage caveat:** live-migration and single-VM reschedule need migratable/replicated storage — but replicated (DRBD) StorageClasses expose 4K sectors, so the image needs the `blockSize` override to boot (see [Failure and edge cases](#failure-and-edge-cases)). A two-VM active/passive pair can instead use node-local 512-native disks.
 
 ## User-facing changes
 
@@ -158,12 +172,12 @@ Purely additive and opt-in. No migration; existing clusters, manifests, and APIs
 
 ## Failure and edge cases
 
-- **Missing SNAT → inbound reply black-holed.** Without the source-NAT rule the app replies to an unroutable tunnel address and the flow times out. SNAT is mandatory (validated).
+- **Missing SNAT → inbound reply black-holed.** Without the source-NAT rule the app replies to an unroutable tunnel address and the flow times out. SNAT is mandatory (validated). It also keeps the gateway **anti-spoofing-clean**: every packet it emits onto the pod network carries its own pod IP, so the CNI's port-security never sees a foreign source — the dataplane needs no port-security relaxation (that only arises for shared-VIP HA; see High availability).
 - **MTU / double encapsulation.** The overlay already lowers MTU and the tunnel adds overhead; without MSS clamping (and/or a lowered tunnel MTU) large TCP packets black-hole. The gateway sets an MSS clamp by default.
-- **Native ESP dropped by the CNI overlay (IPsec).** On Cilium/kube-ovn, native ESP (IP proto 50) does not traverse the overlay even pod-to-pod; ESP-in-UDP (forced UDP encapsulation) is required unconditionally (validated — see Testing). WireGuard, being UDP-native, is unaffected.
+- **Native ESP dropped pod-to-pod (IPsec).** The CNI drops non-TCP/UDP/ICMP/SCTP IP protocols between pods — native ESP (proto 50) included — so ESP-in-UDP (forced UDP encapsulation) is required unconditionally (validated). In policy-enforced tenant pods the dropper is Cilium's conntrack ("Unknown L4 protocol"); it is not geneve-specific (same root cause as the VRRP/proto-112 case — see Testing). WireGuard, being UDP-native, is unaffected.
 - **DNAT must target stable `ClusterIP`s**, never ephemeral pod IPs.
 - **Source IP is lost inbound** (SNAT) — only relevant for apps with source-IP ACLs.
-- **VM image must be bootable and 512-native.** DRBD-backed (4K-sector) StorageClasses cannot boot a 512-native GPT image; the disk must sit on a 512-native StorageClass or use a KubeVirt `blockSize` override. The image must ship a real bootloader (validated the hard way — see Testing).
+- **VM image must be bootable and 512-native.** DRBD-backed (4K-sector) StorageClasses cannot boot a 512-native GPT image; the disk must sit on a 512-native StorageClass or use a KubeVirt `blockSize` override (e.g. `blockSize.custom.logical: 512` / `physical: 4096` on the disk spec). The image must ship a real bootloader (validated the hard way — see Testing).
 - **Single gateway is a per-tenant SPOF** until HA is added (open question).
 
 ## Testing
@@ -180,19 +194,21 @@ The design was **prototyped and validated end-to-end** on a development Cozystac
 
 **Key finding — native ESP is dropped by the CNI overlay.** IKE (UDP) negotiated and the SA came up, but the ESP data plane was silently dropped even pod-to-pod (receiver saw zero ESP, 100% loss). Forcing ESP-in-UDP encapsulation on both peers restored bidirectional traffic. Consequence: on an overlay CNI the IPsec backend must always force UDP encapsulation — and **WireGuard, being UDP-native, sidesteps this entirely**, which is a strong argument for it as the default backend.
 
+**HA mechanism validation (kube-ovn AAP).** Separately validated (kube-ovn v1.15.10): a `Vip` + `ovn.kubernetes.io/aaps` pod annotation shares a VIP across the two gateway VM pods with `port_security` kept **on**. Proven: (1) without AAP the VIP is dropped (GARP/ping blocked); (2) with AAP the VIP is reachable and lands on the active pod; (3) forcing the active down moves the VIP to the standby through OVN; (4) a bogus source address from the VM is still dropped — anti-spoofing is scoped, not disabled. **Not** working: VRRP advertisements (IP proto 112) do not reach the peer pod, so keepalived cannot elect over the pod network — the election needs a side-channel or controller (see [High availability](#high-availability)). Independently re-verified with a minimal repro: the CNI drops *all* non-TCP/UDP/ICMP/SCTP IP protocols (112, 50, 47, 4) pod-to-pod, both same-node and cross-node — so this is **not** the geneve tunnel. In policy-enforced tenant pods the dropper is **Cilium's conntrack** (`bpf_lxc.c`, "CT: Unknown L4 protocol"); without a policy it is the OVS datapath. This is the same root cause as the native-ESP drop above. An upstream issue, if pursued, targets Cilium (a known conntrack limitation); the OVS-side drop is not yet root-caused.
+
 Planned automated coverage before implementation lands: helm-unittest for chart rendering across backends; an e2e that stands up the two-VM topology and asserts the inbound/outbound flows and the SNAT-required and MSS behaviors.
 
 ## Rollout
 
 - **Phase 1 — IPsec backend** (prototype validated): ship `site-gateway` with the IPsec backend (forced UDP encapsulation) + the inbound/outbound NAT machinery.
 - **Phase 2 — WireGuard backend**: validate WireGuard over the overlay and, if confirmed simpler/robust, make it the default `tunnel.type`.
-- **Phase 3 — hardening**: HA (active/standby, shared VIP), tunnel-state observability in the dashboard, MSS/MTU auto-tuning.
+- **Phase 3 — hardening**: HA (see [High availability](#high-availability) — Service-based or AAP shared-VIP), tunnel-state observability in the dashboard, MSS/MTU auto-tuning.
 
 ## Open questions
 
-- **Secret handling.** Best shape for mounting PSK/cert/WireGuard-key material into the guest without persisting it in plaintext cloud-init at rest.
+- **Secret handling.** Deliver PSK/cert/WireGuard-key material to the guest without persisting it in plaintext cloud-init at rest — candidate: mount the referenced `Secret` as a separate config disk (or fetch it on first boot via a small init) instead of inlining it in the VM spec; the post-reconciliation read-access boundary needs to be defined.
 - **VIP allocation.** One LoadBalancer VIP per gateway vs. sharing; interaction with the tenant's LB address pool and quotas.
-- **HA.** Is active/standby (e.g. VRRP + shared VIP) in scope for a later iteration? A single VM is a per-tenant SPOF.
+- **HA mechanism.** Given VRRP advertisements do not cross the kube-ovn overlay (see Testing), which failover trigger to standardize on — Service/endpoint-based (needs a controller/lease) or AAP shared-VIP with election over a side-channel — and baking the `aaps` annotation into the `VMInstance` chart's pod template.
 - **Observability.** Surfacing tunnel state (SA up/down, rekey, counters) through existing dashboards.
 - **MTU auto-tuning.** Derive the MSS clamp / tunnel MTU from the detected overlay MTU, or require an explicit value.
 - **WireGuard backend.** Validate the handshake/SA over the overlay and confirm identical DNAT/SNAT bridging before defaulting to it.
