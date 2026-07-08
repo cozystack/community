@@ -27,13 +27,13 @@ Third, `#18` lists publication validation as an open question, and `#12`'s `cozy
 
 ## Goals
 
-Provide an in-cluster backend that powers the dashboard marketplace view: a small set of endpoints in `cozystack-api`, a `TapIndex` cache controller, and well-defined RBAC for connecting and disconnecting taps. The backend is the in-cluster / dashboard equivalent of `#12`'s `cozypkg tap` / `untap`, creating and removing the same resources.
+**In-cluster backend.** Provide an in-cluster backend that powers the dashboard marketplace view: a small set of endpoints in `cozystack-api`, a `TapIndex` cache controller, and well-defined RBAC for connecting and disconnecting taps. The backend is the in-cluster / dashboard equivalent of `#12`'s `cozypkg tap` / `untap`, creating and removing the same resources.
 
-Thread a pull credential through the one-command tap so connecting a private repository is a single operation, with the credential set as `spec.secretRef` on the Flux source that `cozypkg tap` (or the backend endpoint) already creates — exactly as `cozystack/cozystack#2472` does for the platform source. No CRD change is required.
+**One-command private taps.** Thread a pull credential through the one-command tap so connecting a private repository is a single operation, with the credential set as `spec.secretRef` on the Flux source that `cozypkg tap` (or the backend endpoint) already creates — exactly as `cozystack/cozystack#2472` does for the platform source. No CRD change is required.
 
-Provide a `cozypkg validate` subcommand that lints a candidate repository offline — reusing the same `PackageSource` / schema / `helm lint` checks `#12`'s `cozypkg push` runs at publish time — and reuse it in a GitHub Actions workflow that gates PRs to the index repository.
+**Publication validation.** Provide a `cozypkg validate` subcommand that lints a candidate repository offline — reusing the same `PackageSource` / schema / `helm lint` checks `#12`'s `cozypkg push` runs at publish time — and reuse it in a GitHub Actions workflow that gates PRs to the index repository.
 
-Keep the existing External-Apps pipeline unchanged. All additions are additive tooling and endpoints: existing public installs see zero behaviour change, and no CRD field is added or migrated.
+**Strictly additive.** Keep the existing External-Apps pipeline unchanged. All additions are additive tooling and endpoints: existing public installs see zero behaviour change, and no CRD field is added or migrated.
 
 ## Non-goals
 
@@ -46,6 +46,47 @@ Commercial / paid-operator marketplace. Acknowledged in `#18` as a later, separa
 Cross-tap dependency resolution with version constraints. Within a single tapped repository `dependsOn` already works; cross-tap version-constrained resolution is not addressed here.
 
 ## Design
+
+### Architecture
+
+Two additions carry the design: the `cozystack-api` marketplace endpoints plus the `TapIndex` cache (blue, new here), and the credential threaded onto the Flux source that a tap already creates. Everything else is the existing `PackageSource` / Flux pipeline `#18` and `#12` describe.
+
+```mermaid
+flowchart TB
+    subgraph clients["Operator surface"]
+        ui["Dashboard<br/>marketplace view"]
+        cli["cozypkg CLI"]
+    end
+
+    subgraph api["cozystack-api"]
+        ep["marketplace endpoints<br/>GET / POST / DELETE /marketplace/*"]
+        cache["TapIndex cache<br/>watches artifact revision"]
+    end
+
+    subgraph pipe["Existing PackageSource / Flux pipeline"]
+        ps["PackageSource"]
+        src["Flux source<br/>OCIRepository / GitRepository<br/>spec.secretRef when private"]
+        sec["Secret<br/>pull credential"]
+        ag["ArtifactGenerator<br/>then ExternalArtifact"]
+        hr["HelmRelease"]
+    end
+
+    reg[("OCI registry<br/>tapped repo artifact")]
+
+    ui --> ep
+    cli -. "tap --secret" .-> ep
+    ep -->|"create / list / delete"| ps
+    ep -->|create when private| src
+    ep -->|create when inline creds| sec
+    cache -. watch .-> src
+    cache -->|"parse PackageSource + ApplicationDefinition"| ep
+    ps --> ag --> hr
+    sec -. secretRef .-> src
+    src -->|authenticated pull| reg
+
+    classDef new fill:#e6f3ff,stroke:#3366aa,color:#000
+    class ep,cache new
+```
 
 ### Backend endpoints in `cozystack-api`
 
@@ -76,6 +117,18 @@ This is exactly symmetric with `cozystack/cozystack#2472` (merged): that change 
 A new `cozypkg validate <repository-url>[@<tag>]` subcommand pulls the artifact (or fails); validates the `PackageSource` and each `ApplicationDefinition` against the published OpenAPI / `cozyvalues-gen` schema — the same validation `#12`'s `cozypkg push` runs at publish time, exposed as a standalone offline command; for each declared component, runs `helm lint` on every `Component.Path`; verifies that every `dependsOn` resolves either inside the same repository or in a known cozystack-shipped source; flags components with `install.privileged: true` so the operator sees a privileged badge in the dashboard before install; and, with `--require-signature`, performs cosign verification (Flux `OCIRepository` artifact verification, as `#12` recommends).
 
 The same logic runs in a GitHub Actions workflow in the index repository (`#18`'s meta-index / `#12`'s `cozystack/packages-index`), triggered on PRs that add or modify an entry. The workflow resolves the entry's OCI ref and tag from the diff, runs the validator, annotates the PR with the report, and blocks merge on hard failures. It does not replace maintainer review; it lowers the cost of that review by surfacing structural failures up front.
+
+```mermaid
+flowchart LR
+    author["Repository author"] -->|"cozypkg push"| art[("OCI artifact")]
+    author -->|"PR: add index entry"| idx["Index repo<br/>meta-index / packages-index"]
+    idx -->|on PR| ci["GitHub Actions<br/>validate.yaml"]
+    ci -->|"cozypkg validate"| checks["pull + schema + helm lint<br/>+ dependsOn + privileged<br/>+ cosign --require-signature"]
+    checks -->|pass| review["Maintainer review<br/>then merge"]
+    checks -->|hard failure| block["Block merge<br/>annotate PR"]
+```
+
+The same `cozypkg validate` runs in both places: locally by the author and in CI on the index, so a submission fails fast at the author's desk rather than in someone else's cluster.
 
 ### External catalog (design only, deferred)
 
