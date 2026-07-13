@@ -107,7 +107,7 @@ A `TapIndex` cache controller in the same binary watches each tap's Flux source 
 `cozypkg tap` and the `POST /marketplace/taps` endpoint already create the Flux source, so threading credentials is a change to that creation step, not to any CRD:
 
 - `cozypkg tap <oci-ref> --secret <name>` (and a `secretRef` field on the POST body) sets `spec.secretRef` on the `OCIRepository`/`GitRepository` it creates.
-- The Secret lives in the same namespace as that Flux source — the tap's target namespace, which for community taps is the `community.`-prefixed namespace `#12` uses. Flux source-controller resolves `secretRef` in the source's own namespace, so there is no cross-namespace lookup to special-case.
+- The Secret lives in the same namespace as that Flux source. Community taps place both the Flux source and its pull Secret in a single fixed, dotless namespace, `cozy-community`; the `community.` prefix stays only on the cluster-scoped `PackageSource` name (`community.<org>.<repo>`, per `#12`), for collision-avoidance. A namespace cannot carry that prefix: `PackageSource` is cluster-scoped and has no namespace of its own, and namespace names are RFC 1123 labels that forbid dots. Both the `POST /marketplace/taps` handler and `cozypkg tap --secret` create the Secret in `cozy-community`, so they agree on one place. Flux source-controller resolves `secretRef` in the source's own namespace, so there is no cross-namespace lookup to special-case.
 - Secret format depends on source kind, matching what Flux source-controller documents and what `#2472` already wired for the platform source: `kubernetes.io/dockerconfigjson` for OCI; Opaque with `username`+`password` or `bearerToken` for Git over HTTPS; Opaque with `identity` (PEM private key) and `known_hosts` for Git over SSH.
 
 This is exactly symmetric with `cozystack/cozystack#2472` (merged): that change made the operator set `spec.secretRef` on the platform source it generates; this makes `cozypkg tap` / the backend do the same for every user-tapped repository. No field is added to `PackageSourceRef`: it is a by-name reference to an already-created source, and the `PackageSource` reconciler only reads it to build the `ArtifactGenerator` — it never creates the Flux source, so a `secretRef` on the ref would have no reconcile path. Because nothing on the CRD changes, no migration is needed.
@@ -116,16 +116,25 @@ This is exactly symmetric with `cozystack/cozystack#2472` (merged): that change 
 
 A new `cozypkg validate <repository-url>[@<tag>]` subcommand pulls the artifact (or fails); validates the `PackageSource` and each `ApplicationDefinition` against the published OpenAPI / `cozyvalues-gen` schema — the same validation `#12`'s `cozypkg push` runs at publish time, exposed as a standalone offline command; for each declared component, runs `helm lint` on every `Component.Path`; verifies that every `dependsOn` resolves either inside the same repository or in a known cozystack-shipped source; flags components with `install.privileged: true` so the operator sees a privileged badge in the dashboard before install; and, with `--require-signature`, performs cosign verification (Flux `OCIRepository` artifact verification, as `#12` recommends).
 
-The same logic runs in a GitHub Actions workflow in the index repository (`#18`'s meta-index / `#12`'s `cozystack/packages-index`), triggered on PRs that add or modify an entry. The workflow resolves the entry's OCI ref and tag from the diff, runs the validator, annotates the PR with the report, and blocks merge on hard failures. It does not replace maintainer review; it lowers the cost of that review by surfacing structural failures up front.
+The same logic runs in a GitHub Actions workflow in the index repository (`#18`'s meta-index / `#12`'s `cozystack/packages-index`), triggered on PRs that add or modify an entry. The workflow resolves the entry's OCI ref and tag from the diff, runs the validator, annotates the PR with the report, and blocks merge on hard failures.
+
+Following krew-index, the gate is two-lane rather than requiring a human on every submission:
+
+- **A version bump of an existing entry by its owner** auto-merges on green validation, gated on the new tag being signed by the entry's *recorded* cosign identity, not merely by the PR author's GitHub account. This keeps the routine day-to-day path (a new release of an already-listed repository) fast.
+- **A new entry, or any change to `source.url`, maintainer, or signing identity** requires maintainer review, because those are the security-relevant edits.
+
+Three consequences follow. First, cosign verification is **mandatory on the gate**, not the opt-in `--require-signature` used at the author's desk: the trust anchor is the signing identity, so a bump fails if the new artifact is not signed by the originally approved identity (krew's "still the same plugin" invariant). Second, this bounds the arbitrary-outbound-fetch surface the CI otherwise exposes: on the auto-merge fast path `source.url` is unchanged and already approved, so only new-entry and url-change PRs reach an untrusted fetch, and those stay behind maintainer review with a scheme/host allowlist or a network-sandboxed validator. Third, each index entry carries an explicit **owner and signing identity/issuer**, and an author-side release action (a `krew-release-bot` analog) opens the bump PR, so authors never hand-edit the index.
 
 ```mermaid
 flowchart LR
     author["Repository author"] -->|"cozypkg push"| art[("OCI artifact")]
-    author -->|"PR: add index entry"| idx["Index repo<br/>meta-index / packages-index"]
+    bot["release action<br/>(krew-release-bot analog)"] -->|"PR: bump existing entry"| idx["Index repo<br/>meta-index / packages-index"]
+    author -->|"PR: new entry / url or identity change"| idx
     idx -->|on PR| ci["GitHub Actions<br/>validate.yaml"]
-    ci -->|"cozypkg validate"| checks["pull + schema + helm lint<br/>+ dependsOn + privileged<br/>+ cosign --require-signature"]
-    checks -->|pass| review["Maintainer review<br/>then merge"]
-    checks -->|hard failure| block["Block merge<br/>annotate PR"]
+    ci -->|"cozypkg validate<br/>+ mandatory cosign verify"| checks{"green?"}
+    checks -->|"hard failure"| block["Block merge<br/>annotate PR"]
+    checks -->|"owner bump, signed by<br/>recorded identity"| auto["Auto-merge"]
+    checks -->|"new / url / identity change"| review["Maintainer review<br/>then merge"]
 ```
 
 The same `cozypkg validate` runs in both places: locally by the author and in CI on the index, so a submission fails fast at the author's desk rather than in someone else's cluster.
@@ -142,7 +151,7 @@ CRD: none. Private-repository support needs no CRD field — the credential is s
 
 Dashboard: a marketplace view backed by the new `/marketplace/*` endpoints. Tapped repositories are visible, packages browsable, installs flow through the existing Package-creation path.
 
-Index repository: a new `validate.yaml` GitHub Actions workflow.
+Index repository: a new `validate.yaml` GitHub Actions workflow with a two-lane merge policy (owner version-bump auto-merges on signed validation; new entries and security-relevant edits go to maintainer review). Index entries gain an explicit owner and signing identity/issuer.
 
 ## Upgrade and rollback compatibility
 
@@ -150,7 +159,7 @@ Strictly additive, with no CRD change at all. The new endpoints are net-new path
 
 ## Security
 
-The trust boundary `#18` and `#12` describe — tapping a third-party repository runs that repository's charts in the operator's cluster — is preserved. The publication CI gate is the first line of defence on the index side, but it does not endorse content; it only checks structural validity. Maintainer review remains required for every PR, and community taps stay namespaced (`community.` prefix, per `#12`) so they cannot shadow official package names.
+The trust boundary `#18` and `#12` describe — tapping a third-party repository runs that repository's charts in the operator's cluster — is preserved. The publication CI gate is the first line of defence on the index side, but it does not endorse content; it only checks structural validity. Maintainer review is required for new entries and for any change to `source.url`, maintainer, or signing identity, while owner version-bumps auto-merge on validation that is signed by the entry's recorded cosign identity (see Publication validation). Community taps keep the `community.` prefix on their cluster-scoped `PackageSource` name (per `#12`), so they cannot shadow official package names.
 
 Privileged components are surfaced both at validation time (the CI workflow emits a warning and labels the entry) and at install time (`cozypkg add` prompts for confirmation unless `--allow-privileged` is passed).
 
@@ -184,7 +193,7 @@ External catalog hostname. `marketplace.cozystack.io`, `apps.cozystack.io`, `hub
 
 Privileged-tap policy. Should a cluster be configurable to refuse tapping any repository whose components declare `privileged: true`, regardless of operator approval? Deferred to a follow-up.
 
-Verified-vs-community labelling. Who maintains the verified allowlist and on what criteria, building on `#12`'s opt-in `verified` flag in index entries. Maintainer-side governance question.
+Verified-vs-community labelling. Who maintains the verified allowlist and on what criteria, building on `#12`'s opt-in `verified` flag in index entries. With the two-lane gate, the entry's recorded signing identity is a natural anchor for a `verified` badge (mandatory-signed and identity-stable), but who curates the allowlist remains a maintainer-side governance question.
 
 ## Alternatives considered
 
