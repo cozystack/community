@@ -4,7 +4,7 @@
 - **Title:** `Unified TLS and PKI model for managed applications`
 - **Author(s):** `@lexfrei`
 - **Date:** `2026-06-24`
-- **Status:** Review
+- **Status:** Accepted
 
 ## Overview
 

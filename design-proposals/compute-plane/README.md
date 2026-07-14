@@ -4,7 +4,7 @@
 - **Title:** `ComputePlane: a managed, isolated environment for running code-executing apps`
 - **Author(s):** `@kvaps`
 - **Date:** `2026-06-23`
-- **Status:** Draft
+- **Status:** Accepted
 
 ## Overview
 
