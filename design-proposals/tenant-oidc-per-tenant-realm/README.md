@@ -3,7 +3,7 @@
 - **Title:** `OIDC for tenant Kubernetes clusters`
 - **Author(s):** `@IvanHunters` (revised with input from `@lllamnyp` and `@mattia-eleuteri`)
 - **Date:** `2026-06-26` (revised `2026-06-30`)
-- **Status:** Draft
+- **Status:** Accepted
 
 ## Overview
 

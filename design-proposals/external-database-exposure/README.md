@@ -4,7 +4,7 @@
 - **Title:** `External database exposure via Gateway API TLS-passthrough (SNI) and end-to-end TLS`
 - **Author(s):** `@lexfrei`
 - **Date:** `2026-06-24`
-- **Status:** Review
+- **Status:** Accepted
 
 ## Overview
 
