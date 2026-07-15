@@ -106,10 +106,10 @@ MVP ships the `postgres` (CNPG) adapter. Follow-ups: `mariadb`, `redis`, `mongod
 
 - `min ≤ desired ≤ max`; at most `behavior.*.step` replicas per decision.
 - `desired ≥ QuorumFloor(app)`. For CNPG the floor is `maxSyncReplicas + 1`: the chart documents `maxSyncReplicas` as "must be less than total replicas", and dropping to/below it makes CNPG cap/reject the change and can starve synchronous commits (writes stall). The floor also never leaves fewer than `minSyncReplicas` standbys available. Pin this to the CNPG version cozystack ships, since the sync-replica API changed across versions.
-- **Quorum-floor precedence.** `maxSyncReplicas` can be changed by the tenant after the DHA is created, so at runtime `QuorumFloor` may exceed the DHA's `minReplicas` or even `maxReplicas`. On conflict the **quorum floor wins**: `desired` is clamped *up* to the floor (even above `maxReplicas`) and `ScalingLimited=True` is set, so the precedence is unambiguous for implementers — never let `min`/`max` push the cluster below a safe quorum.
+- **Precedence — quota > quorum floor > min/max.** `maxSyncReplicas` is tenant-mutable after the DHA is created, so at runtime `QuorumFloor` (`maxSyncReplicas + 1`) may exceed `minReplicas`/`maxReplicas`, and may even exceed what the tenant quota permits. The resolution order is fixed and unambiguous: (1) the **tenant quota is a hard ceiling and is never exceeded**; (2) subject to that, the **quorum floor wins** over `minReplicas`/`maxReplicas` — `desired` is clamped *up* to the floor (even above `maxReplicas`), never letting `min`/`max` push the cluster below a safe quorum. When these two rules collide irreconcilably — the quorum floor does not fit the quota (raised `maxSyncReplicas` + tight quota) — the operator does **not** patch and freezes with `ScalingLimited=True` reason `QuorumExceedsQuota` (alert), rather than exceeding quota (which would only hit the StuckScaling path) or scaling below a safe quorum.
 - **Lag brake:** replication lag above `maxReplicationLagSeconds` forbids both scale-down and scale-up (`AbleToScale=False`). The lag signal is **write-activity gated** — it uses byte-based lag (`pg_wal_lsn_diff(pg_current_wal_lsn(), replayed_lsn)`) and/or only trusts the seconds-based value while the primary LSN is advancing, so an idle primary does not produce a false freeze during the low-load windows scale-down targets.
 - **Cooldown / stabilization:** separate windows for scale-up and (longer) scale-down; scale-down only when the signal held for the whole window.
-- **Single-flight:** one change at a time; the next decision only after `operational=true && availableReplicas == replicas`.
+- **Single-flight with convergence deadline:** one change at a time; the next decision only after `operational=true && availableReplicas == replicas`. Because that gate can never clear if a scale-up cannot converge — a new standby rejected by ResourceQuota admission, an unbindable PVC, or an unschedulable pod — a patched change must reach convergence within `behavior.convergenceDeadlineSeconds` (default a small multiple of the scale-up window). On timeout the operator surfaces `AbleToScale=False` with reason `StuckScaling`, alerts, and **rolls `replicas` back to `status.lastConvergedReplicas`**, releasing single-flight so a subsequent scale-down (which may itself relieve the pressure) is not blocked. `status.lastConvergedReplicas` records the last count that reached `availableReplicas == replicas`. Note the tenant-quota pre-check is advisory (a concurrent allocation can consume quota between check and pod creation), so this stuck path is reachable in practice, not just in theory.
 - **Tenant quota:** the new replica count × preset resources must fit the tenant quota; otherwise `ScalingLimited=True`.
 - **Fail-safe freeze:** if vmselect is unreachable or the metric is missing, do not scale (never scale blind); alert.
 - **dryRun:** decisions are written to status/events but no patch is applied.
@@ -132,6 +132,7 @@ spec:
   behavior:
     scaleUp:   { stabilizationWindowSeconds: 300,  step: 1 }
     scaleDown: { stabilizationWindowSeconds: 1800, step: 1 }
+    convergenceDeadlineSeconds: 900          # patched scale must converge within this, else StuckScaling + roll back
   constraints:
     respectQuorum: true
     maxReplicationLagSeconds: 30
@@ -140,9 +141,10 @@ spec:
 status:
   currentReplicas: 3
   desiredReplicas: 4
+  lastConvergedReplicas: 3                    # last count that reached availableReplicas == replicas
   lastScaleTime: "..."
   currentMetrics: [ { type: ReadConnections, averageValue: "210" } ]
-  conditions: [ ScalingActive, AbleToScale, ScalingLimited ]
+  conditions: [ ScalingActive, AbleToScale, ScalingLimited ]   # reasons incl. StuckScaling, QuorumExceedsQuota
 ```
 
 When several `metrics` are set, the desired count is the **maximum** of the per-metric desired counts (HPA semantics). The dashboard can surface the DHA status and scaling events like it does for other application sub-resources. When no DHA references an application, nothing changes.
@@ -164,9 +166,11 @@ When several `metrics` are set, the desired count is the **maximum** of the per-
 - vmselect unreachable or metric missing → the autoscaler freezes (no scaling) and surfaces `AbleToScale=False`; alert fires.
 - Replication lag above the configured threshold **and the primary is actively writing** → no scale-up and no scale-down until lag recovers. An idle primary does not trip the brake (write-activity gating).
 - Scale still in flight (`availableReplicas != replicas`) → single-flight; the next decision waits for convergence, preventing thrashing.
+- Scale-up patched but never converges (quota-rejected standby, unbindable PVC, unschedulable pod) → after `convergenceDeadlineSeconds` the operator surfaces `AbleToScale=False(StuckScaling)`, alerts, and rolls `replicas` back to `status.lastConvergedReplicas`, so the autoscaler is not frozen and a relieving scale-down can proceed.
 - Target is a sharded engine (e.g. ClickHouse, or MongoDB with `sharding: true`) → `ScalingActive=False` with a clear reason; no action.
 - Desired count would drop to/below the quorum floor (`maxSyncReplicas + 1`) → clamped to the floor; `ScalingLimited=True`.
 - Tenant quota exceeded on scale-up → clamped; `ScalingLimited=True`.
+- Quorum floor exceeds the tenant quota (raised `maxSyncReplicas` + tight quota) → no patch; freeze with `ScalingLimited=True(QuorumExceedsQuota)` and alert — quota is never exceeded and quorum is never violated.
 - A competing writer claims `replicas` → SSA conflict surfaced as a condition; the autoscaler does not enter a write war.
 
 ## Testing
