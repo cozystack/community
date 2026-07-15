@@ -3,7 +3,7 @@
 - **Title:** `Tenant-managed site-to-site connectivity via gateway VMs (site-router and site-gateway)`
 - **Author(s):** `@myasnikovdaniil`
 - **Date:** `2026-07-08`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
@@ -20,7 +20,7 @@ Neither is a fallback for the other — a cluster admin can offer either or both
 
 ## Scope and related proposals
 
-- **[#29 structured external exposure](https://github.com/cozystack/community/pull/29).** The tunnel's own external entry point (the UDP listener the remote peer dials) is published through the structured `ServiceExposure` / `ExposureClass` primitives from #29 rather than a bespoke `LoadBalancer` path; that exposure class must support **UDP** (IKE/NAT-T 4500, WireGuard).
+- **[#29 structured external exposure](https://github.com/cozystack/community/pull/29) — blocking dependency.** The tunnel's own external entry point (the UDP listener the remote peer dials) is published through the structured `ServiceExposure` / `ExposureClass` primitives from #29 rather than a bespoke `LoadBalancer` path, and that exposure class **must support UDP** (IKE/NAT-T 4500, WireGuard) — which #29 does not yet provide. This proposal declares #29 (with UDP support) an **explicit blocker for Phase 1**: implementation cannot land until #29 ships. If #29 stalls, the fallback is a bespoke UDP `LoadBalancer` Service on the gateway as a stopgap — explicitly a temporary path to be migrated onto the #29 contract once available, not a parallel long-term mechanism.
 - **[#7 ClusterMesh / Kilo](https://github.com/cozystack/community/pull/7).** Complementary and a different niche — a routed WireGuard node-to-node mesh between cooperative Kubernetes clusters. See [Alternatives considered](#alternatives-considered).
 - **Deferred here:** a platform-run (non-VM) managed variant; HTTP/L7 ingress (the existing tenant Ingress / Gateway API covers public HTTP); a per-tenant egress IP (future work — the gateway VM is its natural home later).
 
@@ -65,7 +65,7 @@ Both apps share roughly 80% of their implementation — the VM appliance, the tu
 | Source IP | not preserved (SNAT) | preserved |
 | Reachability | per host:port | whole subnet + ICMP |
 | Config surface | `exposedServices` / `remoteTargets` (per-target ports) | `remoteCIDRs` / static routes / BGP |
-| Security posture | fully contained | port_security relaxed (scoped is the target state) |
+| Security posture | fully contained | port_security scoped to declared remote CIDRs (Phase 1 acceptance) |
 | Topology-advertising apps | need per-member advertised addresses | transparent |
 
 Why two apps rather than one `mode:` toggle: the two have divergent values schemas (per-target ports vs CIDRs/BGP), asymmetric controllers (routed needs a privileged CNI-mediation controller; NAT needs none), and different security postures a cluster admin may want to gate independently. Sharing the implementation (a common VyOS-driving controller core + image + base chart) keeps this from becoming duplicated code.
@@ -87,15 +87,23 @@ flowchart TB
     gw --> a & b
 ```
 
-**Tunnel backend — IPsec or WireGuard.** VyOS terminates both natively and `tunnel.type` selects per peer. **WireGuard is the simpler default on an overlay CNI** — UDP-native (a single configurable UDP port), so it rides the pod overlay as ordinary UDP with no ESP, no NAT-T, and no forced encapsulation; static keypairs, no IKE, smaller header overhead (see the validated finding in [Testing](#testing)). **IPsec is for interop** — much external/enterprise gear only speaks IKEv2/IPsec; supported, with the encapsulation requirement in [Testing](#testing).
+**Tunnel backend — IPsec or WireGuard.** VyOS terminates both natively and `tunnel.type` selects the backend. **IPsec is the default** — the remote side of a site-to-site tunnel is dictated by whatever the external site already runs, and much external/enterprise gear only speaks IKEv2/IPsec, so IPsec is the broadest-interop starting point (with the forced-UDP-encapsulation requirement in [Testing](#testing)). **WireGuard is the simpler backend on an overlay CNI** — UDP-native (a single configurable UDP port), so it rides the pod overlay as ordinary UDP with no ESP, no NAT-T, and no forced encapsulation; static keypairs, no IKE, smaller header overhead (see the validated finding in [Testing](#testing)). The default is not a strong statement of preference: the tenant picks the backend their site requires, so IPsec stays the default for interop breadth and WireGuard is a first-class alternative rather than a successor.
 
 **Tunnel entry point.** Published via #29 `ServiceExposure` + `ExposureClass` (UDP), not a bespoke `LoadBalancer` — one shared external-address contract for both apps.
 
-**Day-2 configuration.** cloud-init provisions the VM only at first boot (KubeVirt bakes it into a static disk that is regenerated only on VM restart), so ongoing changes — add/rotate a peer, add a target or route — are driven by a **platform controller talking to the guest's own management API**. For VyOS the HTTPS API applies an atomic set/delete batch, so a change touches only the affected config and unrelated tunnels stay up. The management-API key is generated at runtime and seeded once via first-boot cloud-init; the API is reachable by the platform only (see [Security](#security)). A first iteration may fall back to "config change = VM restart" if called out explicitly.
+**Day-2 configuration.** cloud-init provisions the VM only at first boot (KubeVirt bakes it into a static disk that is regenerated only on VM restart), so ongoing changes — rotate the peer's keys/PSK, add a target or route — are driven by a **platform controller talking to the guest's own management API**. For VyOS the HTTPS API applies an atomic set/delete batch, so a change touches only the affected config and the running tunnel stays up (each app instance terminates a single peer — see [Values schema](#user-facing-changes) and the multi-peer [open question](#open-questions)). The management-API key is generated at runtime and seeded once via first-boot cloud-init; the API is reachable by the platform only (see [Security](#security)). A first iteration may fall back to "config change = VM restart" if called out explicitly.
 
 **Controller & low-level entities.** Tenant input stays in the catalog-app values (no new CRD); validation is the values schema plus controller-side reconcile checks surfaced as status conditions. A platform controller reconciles the VM + tunnel and pushes rendered config to the guest. The controller is split behind a small backend interface so the neutral VyOS-driving core (render → push → observe → status) is shared, and each app implements only its own materialization and any CNI mediation. The two apps differ sharply here: `site-router` carries a CNI-mediation controller (below); `site-gateway` needs none.
 
-**Image.** A VyOS appliance image (IPsec, WireGuard, native DNAT/SNAT, routing, and firewalling in one network OS), published by the platform as a reproducible, KubeVirt-consumable artifact.
+**Image.** A VyOS appliance image (IPsec, WireGuard, native DNAT/SNAT, routing, and firewalling in one network OS), published by the platform as a reproducible, KubeVirt-consumable artifact. See [Image lifecycle](#image-lifecycle) for how it is built and updated.
+
+### Image lifecycle
+
+VyOS has no free LTS channel — only the rolling release is freely buildable — so the appliance image cannot be pinned to a vendor-maintained LTS and must be built and patched by the platform. This is handled the same way Cozystack already builds its other bootable-node artifacts:
+
+- **Build in the monorepo.** The image is built from a pinned VyOS rolling snapshot in-repo, alongside the existing node-image builds (the Talos image build is the live example; the previously shipped Ubuntu image build, now retired, followed the same shape). The build is reproducible and pinned to a specific upstream commit/date rather than tracking `latest`, so a given Cozystack release maps to an exact image.
+- **Patch cadence.** Because the base is rolling, CVE and dependency patching happens by re-pinning to a newer VyOS snapshot and rebuilding as part of the normal monorepo release cadence — the same place Talos bumps land. Security-relevant rebuilds can be cut out-of-band on the same pipeline.
+- **How a running gateway consumes an update.** The image backs a KubeVirt VM disk, so adopting a new image means booting the VM from the new disk — i.e. a **VM restart, which drops the tunnel** for the reconnect window. This is deliberately decoupled from **day-2 config** changes (peer keys, targets, routes), which are applied live via the guest management API and never require a restart (see the Day-2 paragraph above). Image updates are therefore the *only* routine tunnel-dropping operation; for planned image upgrades KubeVirt live-migration does **not** help (a new disk is a new boot, not a migration), so an image bump is an explicit maintenance action. Making it non-disruptive depends on the active/passive HA path (roll one gateway at a time behind the fronting Service) — see [High availability](#high-availability).
 
 ### `site-gateway` — NAT mode
 
@@ -116,9 +124,9 @@ flowchart TB
 
 The decrypted packet is forwarded onto the tenant network **without NAT**; the return path is the kube-ovn `ovn.kubernetes.io/routes` namespace annotation (inherited onto pods at creation by the kube-ovn webhook), so the **client source IP is preserved** and whole-subnet reachability + ICMP work. This is the mode for cases where the remote side authorizes by source IP, or needs to reach a whole subnet, or where the app advertises its own topology (members' real addresses are directly reachable).
 
-**CNI-mediation controller.** A tenant cannot annotate its own namespace or touch `port_security`, so the platform controller mediates: validate declared remote CIDRs (disjoint from pod/service/join/node networks; cross-tenant overlap is fine — routes are namespace-scoped), set the namespace routes annotation, scope/relax `port_security` on the gateway VM port, and clean everything up on deletion. Because the annotation is applied at pod **creation**, existing tenant workloads gain reachability only after they are rolled; the controller reports the pods whose annotation lags the namespace ("pods pending route") rather than restarting anything.
+**CNI-mediation controller.** A tenant cannot annotate its own namespace or touch `port_security`, so the platform controller mediates: validate declared remote CIDRs, set the namespace routes annotation, scope/relax `port_security` on the gateway VM port, and clean everything up on deletion. The **remote-CIDR deny-set** a declared CIDR must not overlap is explicit: the cluster **pod / service / join / node** networks (hijacking in-cluster traffic), **`169.254.0.0/16` link-local incl. the cloud metadata endpoint `169.254.169.254`** (credential/SSRF exposure), the platform **LoadBalancer / egress IP pool**, the **host loopback `127.0.0.0/8`**, and the **default route `0.0.0.0/0`** and any prefix so broad it would blackhole cluster traffic (routed mode advertises specific remote networks, never a default route). Cross-tenant overlap between two tenants' *remote* CIDRs is fine — routes are namespace-scoped. A rejected CIDR does not silently no-op: the controller **surfaces the rejection as a `status` condition on the app instance** (`Reason: InvalidRemoteCIDR`, naming the offending CIDR and the network it collides with) and refuses to program the route, so the tenant sees why in the dashboard rather than getting a half-configured gateway. Because the annotation is applied at pod **creation**, existing tenant workloads gain reachability only after they are rolled; the controller reports the pods whose annotation lags the namespace ("pods pending route") rather than restarting anything.
 
-**Security posture.** Routed mode relaxes `port_security` on the gateway port. Containment comes from Cilium's sender-side egress enforcement — the endpoint identity is compiled into the per-endpoint eBPF program, so a spoofed source cannot widen the reachable set beyond the tenant tree + world. The target state is **scoped** `port_security` (the declared remote CIDRs added to the port's allowed addresses). Residual risks are documented in [Security](#security).
+**Security posture.** Routed mode adjusts `port_security` on the gateway port so the guest's routed (non-pod-IP) source addresses are not dropped. The shipped state is **scoped** `port_security` — only the declared remote CIDRs are added to the port's allowed addresses, a **Phase 1 acceptance criterion**, not a later hardening step. Defense in depth beyond that comes from Cilium's sender-side egress enforcement — the endpoint identity is compiled into the per-endpoint eBPF program, so even a spoofed source cannot widen the reachable set beyond the tenant tree + world. Residual risks are documented in [Security](#security).
 
 **Transport note.** Routed mode carries transparent L3 for TCP/UDP/ICMP/SCTP only — non-standard IP protocols (ESP, GRE, VRRP) still do not cross the pod fabric (same root cause as the ESP finding in [Testing](#testing)). It is kube-ovn-specific and requires the remote CIDR to be disjoint from cluster networks.
 
@@ -128,8 +136,8 @@ Two catalog apps appear in the tenant dashboard, sharing the tunnel/peer/resourc
 
 ```yaml
 # site-gateway (NAT)
-## @param tunnel.type {string} Backend: "wireguard" (default; UDP-native) or "ipsec".
-tunnel: { type: wireguard }
+## @param tunnel.type {string} Backend: "ipsec" (default; broadest interop) or "wireguard" (UDP-native, simpler on an overlay CNI).
+tunnel: { type: ipsec }
 ## @param peer.address {string} Public address of the remote peer / WireGuard endpoint.
 peer:
   address: ""
@@ -144,8 +152,8 @@ resources: { cpu: "1", memory: "1Gi" }
 
 ```yaml
 # site-router (routed)
-## @param tunnel.type {string} Backend: "wireguard" (default) or "ipsec".
-tunnel: { type: wireguard }
+## @param tunnel.type {string} Backend: "ipsec" (default; broadest interop) or "wireguard" (UDP-native, simpler on an overlay CNI).
+tunnel: { type: ipsec }
 ## @param peer.address {string} Public address of the remote peer / WireGuard endpoint.
 peer:
   address: ""
@@ -160,6 +168,8 @@ bgp: { enabled: false }
 resources: { cpu: "1", memory: "1Gi" }
 ```
 
+**One peer per instance.** The schema is deliberately **singular `peer:`**, not `peers: []` — each app instance terminates exactly one site-to-site tunnel. A tenant that needs to reach two external sites deploys two instances; the shared foundation makes an instance cheap (one small VM), instances are independently sized/gated/observable, and a blast radius stays scoped to one tunnel. This avoids the breaking-change trap of shipping singular now and retrofitting a list later. Whether a genuine multi-peer single-instance mode is ever warranted (e.g. hub-and-spoke to many sites behind one VM) is deferred as an explicit [open question](#open-questions) rather than pre-committed in the schema.
+
 A cluster admin can enable/disable `site-router` independently — its kube-ovn coupling and `port_security` relaxation may not be wanted on every cluster. No existing app, CRD, or API changes.
 
 ## Upgrade and rollback compatibility
@@ -170,10 +180,10 @@ Purely additive and opt-in. No migration; existing clusters, manifests, and APIs
 
 - **Contained privilege (both apps).** The privileged dataplane lives in a VM guest kernel isolated by hardware virtualization; a compromise inside the gateway cannot manipulate the host node's networking or observe other tenants, and the platform never hands a tenant a privileged host-cluster pod.
 - **`site-gateway` is fully contained.** SNAT keeps every packet the gateway emits on its own pod IP, so the CNI's port-security never sees a foreign source and needs no relaxation.
-- **`site-router` relaxes port_security** on the gateway port (scoped is the target state). Containment is Cilium's sender-side egress enforcement; residual risks to document: intra-namespace identity spoofing (receiver-side identity resolved from source IP) and spoofed-source egress where SNAT is absent.
+- **`site-router` scopes port_security** on the gateway port to the declared remote CIDRs (a Phase 1 acceptance criterion — the port is never shipped fully open). Defense in depth is Cilium's sender-side egress enforcement; residual risks to document: intra-namespace identity spoofing (receiver-side identity resolved from source IP) and spoofed-source egress where SNAT is absent.
 - **Managed apps untouched**; a firewall allow-list on the gateway makes exposure explicit; all state is tenant-scoped.
 - **Secret handling.** A tenant does not create `Secret` objects directly; as with the existing managed apps (`apps/vpn`, `postgres`, `mariadb`) the app chart templates the `Secret` into the tenant namespace from the app values — autogenerating material when it is not supplied and using `lookup` to keep it stable across reconciles. The design minimizes what must be shipped: for **WireGuard** the tenant's private key is generated in-chart (never entered) and only its public key is surfaced for the remote side, while the peer's public key + endpoint are ordinary non-secret values — so no tenant secret is shipped at all. The one genuinely secret tenant input is the **IPsec PSK** (it must match the remote peer, so it cannot be autogenerated); it rides a values field into the chart-templated `Secret`, with the same plaintext-in-values-at-rest exposure the platform is already addressing for database passwords. The management-API key is generated at runtime, never entered.
-- **Management API is platform-only.** The guest's config API is network-restricted so only the platform controller can reach it.
+- **Management API is platform-only — enforced outside tenant control.** The guest's config API is the controller's only write path, so the guard against a tenant reaching it directly must be one the tenant *cannot* remove. A NetworkPolicy in the tenant's own namespace is therefore **not** sufficient — the tenant could delete it and then push arbitrary VyOS config, bypassing all controller-side CIDR/target validation. The enforcement must live in the platform's control, not the tenant's: a platform-owned cluster-scoped network policy (e.g. a `CiliumClusterwideNetworkPolicy`) that admits only the controller's identity, and/or binding the management API to an interface/address that is not routable from tenant pods. The **API key is generated at runtime and stored in a platform-controller-namespace Secret — never in a tenant-readable Secret** — so even API reachability does not hand the tenant credentials. This is the one area to **re-verify against the existing production implementation** before Phase 1 acceptance: confirm the shipped guard is genuinely tenant-immutable and the key never lands in the tenant namespace.
 
 ## Failure and edge cases
 
@@ -187,7 +197,12 @@ Purely additive and opt-in. No migration; existing clusters, manifests, and APIs
 
 ## Testing
 
-The design was **prototyped and validated end-to-end** on a development Cozystack cluster (KubeVirt, Cilium + kube-ovn, LINSTOR), using two gateway VMs — one acting as the tenant gateway, one simulating the external site — with a real tenant-managed Postgres as the inbound target. The **NAT (`site-gateway`) inbound/outbound paths** were validated with the IPsec backend; the **routed (`site-router`) path and the WireGuard backend** are the next to validate (open questions). All items passed:
+Validation comes from two independent sources, so **both modes are backed by evidence**:
+
+- **Routed (`site-router`) — validated in production.** The routed dataplane described here is not speculative: it is the mechanism already running in an existing production Cozystack implementation, deployed for real tenants (and set up by hand for clients before it was productized). The routed mode, its kube-ovn routes annotation, and IPsec termination in a gateway VM are proven in that deployment — which is why Phase 1 leads with it and why it is the primary mode tenants ask for.
+- **NAT (`site-gateway`) — prototyped end-to-end.** The NAT paths were **prototyped and validated end-to-end** on a development Cozystack cluster (KubeVirt, Cilium + kube-ovn, LINSTOR), using two gateway VMs — one acting as the tenant gateway, one simulating the external site — with a real tenant-managed Postgres as the inbound target, on the IPsec backend.
+
+The **WireGuard backend** over the overlay is the remaining item to validate before it is offered as a first-class alternative (see [open questions](#open-questions)). The dev-cluster prototype items below all passed:
 
 | # | Item | Result |
 |---|------|--------|
@@ -197,7 +212,7 @@ The design was **prototyped and validated end-to-end** on a development Cozystac
 | 4 | SNAT-required negative test (removing SNAT black-holes the reply) | PASS |
 | 5 | MTU / MSS clamp (tunnel MTU 1320, clamp 1280; multi-MB transfer, no stall) | PASS |
 
-**Key finding — native ESP is dropped by the CNI overlay.** IKE (UDP) negotiated and the SA came up, but the ESP data plane was silently dropped even pod-to-pod (receiver saw zero ESP, 100% loss). Forcing ESP-in-UDP encapsulation on both peers restored bidirectional traffic. On an overlay CNI the IPsec backend must therefore always force UDP encapsulation — and **WireGuard, being UDP-native, sidesteps this entirely**, which is a strong argument for it as the default backend.
+**Key finding — native ESP is dropped by the CNI overlay.** IKE (UDP) negotiated and the SA came up, but the ESP data plane was silently dropped even pod-to-pod (receiver saw zero ESP, 100% loss). Forcing ESP-in-UDP encapsulation on both peers restored bidirectional traffic. On an overlay CNI the IPsec backend must therefore always force UDP encapsulation — and **WireGuard, being UDP-native, sidesteps this entirely**. This makes WireGuard operationally simpler on the overlay, but it does not change the default: IPsec stays the default for interop breadth and the tenant picks the backend their external site requires (see [Design](#design)).
 
 **Non-standard-protocol drop (informs HA).** Independently re-verified with a minimal repro: the CNI drops *all* non-TCP/UDP/ICMP/SCTP IP protocols (proto 112/50/47/4) pod-to-pod, both same-node and cross-node — so it is **not** the geneve tunnel. In policy-enforced tenant pods the dropper is **Cilium's conntrack** (`bpf_lxc.c`, "CT: Unknown L4 protocol"); without a policy it is the OVS datapath. This is the same root cause as the native-ESP drop, and it is why keepalived/VRRP cannot elect over the pod network (see [High availability](#high-availability)). Separately, a kube-ovn `Vip` + `ovn.kubernetes.io/aaps` annotation was validated to share a VIP across two gateway pods with `port_security` kept **on** (the VIP moves on owner change and a bogus source is still dropped — anti-spoofing scoped, not disabled).
 
@@ -209,21 +224,22 @@ Deferred for the first iteration: a **single gateway VM with KubeVirt live-migra
 
 ## Rollout
 
-- **Phase 1 — `site-router` (routed), IPsec backend**: the routed dataplane plus its CNI-mediation controller (CIDR validation, routes annotation, scoped `port_security`), with **MSS clamping** and **tunnel-state observability** (SA up/down, rekey, counters) surfaced from the start. Routed is the primary mode tenants ask for. (Note: the end-to-end prototype so far validated the NAT dataplane, so routed carries the first round of validation here.)
-- **Phase 2 — `site-gateway` (NAT)**: the inbound/outbound DNAT/SNAT machinery (prototype-validated) with forced UDP encapsulation.
-- **Phase 3 — WireGuard backend**: validate over the overlay and, if confirmed simpler/robust, make it the default `tunnel.type`.
-- **Phase 4 — the rest**: HA (Service-fronted active/passive), scoped `port_security` for routed, per-tenant egress IP.
+- **Phase 1 — `site-router` (routed), IPsec backend** *(blocked on [#29](#scope-and-related-proposals) shipping UDP exposure)*: the routed dataplane plus its CNI-mediation controller (remote-CIDR validation against the full deny-set, routes annotation), with **MSS clamping** and **tunnel-state observability** (SA up/down, rekey, counters) surfaced from the start. **Scoped `port_security` is a Phase 1 acceptance criterion, not a later relaxation** — the gateway port must be scoped to the declared remote CIDRs before Phase 1 is accepted, so the weakest security posture never ships as the released state. This mode is validated in the existing production implementation, which is why it leads. The one thing to resolve *within* this phase is the kube-ovn allowed-address-pairs CIDR support scoped `port_security` needs (see [open questions](#open-questions)); it is a Phase 1 blocker, not a reason to defer scoping.
+- **Phase 2 — `site-gateway` (NAT)**: the inbound/outbound DNAT/SNAT machinery (prototype-validated) with forced UDP encapsulation. Fully contained (SNAT), so no `port_security` relaxation at all.
+- **Phase 3 — WireGuard backend**: validate the handshake/SA over the overlay and offer it as a **first-class alternative** backend. **The default stays IPsec** — the tenant picks the backend their site requires, so WireGuard is added alongside IPsec, never promoted over it.
+- **Phase 4 — the rest**: HA (Service-fronted active/passive), per-tenant egress IP.
 
-Ordering leads with routed because it is the primary requested mode; the shared foundation is built once and both apps sit on it.
+Ordering leads with routed because it is the primary requested mode and the one already proven in production; the shared foundation is built once and both apps sit on it. Scoped `port_security` and MSS clamping are in Phase 1 by design so the first release is not the least-secure one.
 
 ## Open questions
 
 - **IPsec PSK at rest.** WireGuard ships no tenant secret (its key is autogenerated in-chart); the IPsec PSK is the one tenant-supplied secret — decide whether it stays a values field templated into a `Secret` (like DB passwords today — plaintext in values at rest) or gets a write-only / dashboard-mediated affordance.
-- **Tunnel exposure via #29.** Confirm the `ExposureClass` UDP support and how the tunnel endpoint address interacts with the tenant's LB pool and quotas.
+- **Tunnel exposure via #29 (blocking).** #29 with **UDP** `ExposureClass` support is a declared Phase 1 blocker (see [Scope](#scope-and-related-proposals)); the open detail is how the tunnel endpoint address interacts with the tenant's LB pool and quotas, and whether the stopgap bespoke UDP `LoadBalancer` is needed if #29 slips.
 - **Topology-advertising apps under NAT.** Whether per-member advertised addressing for Kafka / Mongo / Redis-Cluster / Cassandra under `site-gateway` is worth a tunnel-backed `ExposureClass` (needs per-member granularity #29 does not have today) or is simply left to `site-router`.
 - **HA mechanism.** Given VRRP does not cross the overlay (see Testing), standardize on Service/endpoint-based failover (needs a controller/lease) vs an AAP shared-VIP with side-channel election.
-- **Scoped port_security for `site-router`.** kube-ovn allowed-address-pairs need CIDR support to add the declared remote CIDRs to the port (OVN itself accepts `MAC IP/mask`).
-- **WireGuard backend.** Validate the handshake/SA over the overlay and confirm identical bridging before defaulting to it.
+- **Scoped port_security for `site-router` (Phase 1 blocker).** Scoped `port_security` is a Phase 1 acceptance criterion (see [Rollout](#rollout)), so this must be resolved *within* Phase 1, not deferred: kube-ovn allowed-address-pairs need CIDR support to add the declared remote CIDRs to the port (OVN itself accepts `MAC IP/mask`). Confirm how the existing production implementation scopes the port today and reuse that approach.
+- **WireGuard backend.** Validate the handshake/SA over the overlay and confirm identical bridging before offering it as a first-class alternative. This does **not** gate on becoming the default — the default stays IPsec regardless; WireGuard is added alongside it (see [Rollout](#rollout)).
+- **Multi-peer per instance.** The schema is singular `peer:` and the current position is **one tunnel per app instance** — a tenant reaching two sites deploys two instances. This needs verification before it is locked in: (a) *does anyone actually need* a single VM terminating many peers, or does per-instance always suffice? The working assumption is per-instance suffices (a new instance is cheap and independently gated/sized/observed), and it avoids a breaking `peer: → peers: []` migration later. (b) *pros/cons* — one hub VM would share the tunnel-drop blast radius and a single throughput envelope across all peers, whereas per-instance isolates them but costs one VM each; hub-and-spoke to many small sites is the only clear case where one VM might win. (c) *how the existing production implementation models this today* — confirm it is single-peer-per-instance and that no deployed tenant relies on multi-peer, so committing to singular is not a regression. If multi-peer is ever needed it would be an additive `peers: []` on a *new* schema version, not a retrofit of this one.
 - **Relationship to ClusterMesh (#7).** Whether to present these apps and ClusterMesh as one coordinated "tenant connectivity" story, and where the boundary sits.
 
 ## Alternatives considered
