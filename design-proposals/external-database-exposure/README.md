@@ -16,7 +16,7 @@ This is the design-proposal artifact required by `cozystack/cozystack#2816`, and
 
 ## Scope and related proposals
 
-- **Depends on:** `design-proposals/unified-tls-pki` — provides the `<release>-tenant-ca` key-free trust anchor that external clients use to verify the endpoint. This proposal does not re-specify it. It is a companion submission under the same epic, on its own branch; the path resolves once both proposals merge. The dependency is **per-engine, not blanket**: an engine is exposable here only once its `ca.crt` is actually delivered under that contract, and the path differs by engine — redis self-publishes a key-free `<release>-ca-cert` through its forked operator, while postgres and mongodb obtain theirs through the extraction controller in `unified-tls-pki`. So SNI exposure for a given engine is gated on that engine's `unified-tls-pki` convergence, not merely on the contract existing.
+- **Depends on:** `design-proposals/unified-tls-pki` — provides the `<release>.tenant-ca` key-free trust anchor that external clients use to verify the endpoint. This proposal does not re-specify it. It is a companion submission under the same epic, on its own branch; the path resolves once both proposals merge. The dependency is **per-engine, not blanket**: an engine is exposable here only once its `ca.crt` is actually delivered under that contract. The engines reach that point by one path: the extraction controller reads each engine's CA source and writes the canonical `<release>.tenant-ca` — copying verbatim from redis and kafka's own key-free CA object, and stripping the key from postgres and mongodb's key-bearing Secret — rather than any engine publishing that canonical name itself. Either way the external client verifies against the one canonical `<release>.tenant-ca`. So SNI exposure for a given engine is gated on that engine's `unified-tls-pki` convergence, not merely on the contract existing.
 - **Related:** `design-proposals/structured-external-exposure` (community pull request #29) — replaces the chart-level `external` boolean with a structured, additive `expose` list riding `ExposureClass` / `ServiceExposure` (`cozystack/cozystack#3081`), and lists Gateway/SNI consolidation as the forward-compatible future path. The two proposals meet at the trigger surface: once `expose` lands, "expose this database via SNI-passthrough" is naturally one `expose` entry (an exposure class or scope backed by the tenant Gateway) rather than a new chart toggle, and the per-release route rendering naturally belongs to that orchestration layer. This proposal defines the Gateway-side mechanics either trigger drives; it does not depend on `expose` landing first.
 - **Umbrella:** `cozystack/cozystack#2811`. This proposal covers WS4 (`cozystack/cozystack#2815`, SNI exposure) and WS5 (`cozystack/cozystack#2816`, end-to-end TLS).
 - **Referenced, not designed here:** WS6 east-west / in-cluster CNI encryption (`cozystack/cozystack#2977`, PR `cozystack/cozystack#2984`). It is complementary defense-in-depth for pod-to-pod traffic and is explicitly out of scope (see Non-goals).
@@ -107,7 +107,7 @@ flowchart TB
     P2["postgres db2<br/>presents CNPG server cert"]
     P3["redis cache<br/>presents operator server cert"]
   end
-  CA["&lt;release&gt;-ca-cert (ca.crt only)<br/>projected via tenantsecrets"]
+  CA["&lt;release&gt;.tenant-ca (ca.crt only)<br/>projected via tenantsecrets"]
   C1 -->|"raw TLS, SNI"| L1
   C2 -->|"raw TLS, SNI"| L1
   C3 -->|"raw TLS, SNI"| L2
@@ -136,7 +136,7 @@ One subtlety the "single certificate" framing hides: an external client doing `s
 
 WS5 adds nothing beyond two hooks that already exist:
 
-1. **Trust-anchor delivery** — the `<release>-tenant-ca` `ca.crt`-only object from `unified-tls-pki`, projected to the tenant. The external client verifies against that `ca.crt`.
+1. **Trust-anchor delivery** — the `<release>.tenant-ca` `ca.crt`-only object from `unified-tls-pki`, projected to the tenant. The external client verifies against that `ca.crt`.
 2. **SAN coverage** — the chart already injects the external hostname into the operator-issued certificate (postgres `serverAltDNSNames` in `db.yaml`, gated on TLS and external). Under this proposal the hook injects **both** name shapes — `<release>.<engine>.<apex>` and `<release>.<apex>` — so the certificate is valid for the subdomain scheme shipping now and the flat scheme arriving with Cilium 1.20 (§6).
 
 Stated plainly, where this does **not** work:
