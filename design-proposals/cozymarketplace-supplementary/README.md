@@ -77,7 +77,7 @@ flowchart TB
     cli -. "tap --secret" .-> ep
     ep -->|"create / list / delete"| ps
     ep -->|create when private| src
-    ep -->|create when inline creds| sec
+    ep -. "reference secretRef (admin pre-creates)" .-> sec
     cache -. watch .-> src
     cache -->|"parse PackageSource + ApplicationDefinition"| ep
     ps --> ag --> hr
@@ -97,7 +97,7 @@ The dashboard reads marketplace state through a small set of endpoints layered i
 | `GET` | `/marketplace/taps` | List connected taps with metadata, derived from `PackageSource` + `ApplicationDefinition`. |
 | `GET` | `/marketplace/taps/{name}/packages` | Packages exposed by one tap. |
 | `GET` | `/marketplace/search?q=<query>` | Search across all taps by name, tag, description. |
-| `POST` | `/marketplace/taps` | Connect a tap: creates the Flux source (with `spec.secretRef` when a Secret is supplied), the `Secret` when inline credentials are given, and the `PackageSource` — the same resources `cozypkg tap` creates. |
+| `POST` | `/marketplace/taps` | Connect a tap: creates the Flux source (with `spec.secretRef` referencing a `Secret` the admin pre-created in `cozy-system`, when private) and the `PackageSource` — the same resources `cozypkg tap` creates. The body carries a `secretRef` (Secret name), not raw credentials (see Security). |
 | `DELETE` | `/marketplace/taps/{name}` | Disconnect a tap; mirrors `cozypkg untap`. Lifecycle of installed `Package` CRs follows `#12` (see below). |
 
 A `TapIndex` cache controller in the same binary watches each tap's Flux source `status.artifact.revision`, pulls the assembled artifact on each revision change, parses the `PackageSource` + `ApplicationDefinition`s it carries, and serves the GET endpoints from memory. Without it, every search would hit OCI per request. Cluster-admin is required for `POST` and `DELETE`, matching both the cluster-scoped `PackageSource` model and `#12`'s "tap requires cluster-admin". `GET` returns catalog metadata only and is open to any authenticated user so tenant-admins can browse; it never returns Secret names or contents (see Security).
@@ -107,7 +107,7 @@ A `TapIndex` cache controller in the same binary watches each tap's Flux source 
 `cozypkg tap` and the `POST /marketplace/taps` endpoint already create the Flux source, so threading credentials is a change to that creation step, not to any CRD:
 
 - `cozypkg tap <oci-ref> --secret <name>` (and a `secretRef` field on the POST body) sets `spec.secretRef` on the `OCIRepository`/`GitRepository` it creates.
-- The Secret lives in the same namespace as that Flux source. Community taps place both the Flux source and its pull Secret in a single fixed, dotless namespace, `cozy-community`; the `community.` prefix stays only on the cluster-scoped `PackageSource` name (`community.<org>.<repo>`, per `#12`), for collision-avoidance. A namespace cannot carry that prefix: `PackageSource` is cluster-scoped and has no namespace of its own, and namespace names are RFC 1123 labels that forbid dots. Both the `POST /marketplace/taps` handler and `cozypkg tap --secret` create the Secret in `cozy-community`, so they agree on one place. Flux source-controller resolves `secretRef` in the source's own namespace, so there is no cross-namespace lookup to special-case.
+- The Secret lives in the same namespace as that Flux source. Community taps place both the Flux source and its pull Secret in `cozy-system`, alongside the existing platform and External-Apps Flux sources (and where `#2472` already puts the platform source's Secret), rather than introducing a new namespace. The `community.` prefix stays only on the cluster-scoped `PackageSource` name (`community.<org>.<repo>`, per `#12`), for collision-avoidance: it is a name convention, not a namespace — `PackageSource` is cluster-scoped, and namespace names are RFC 1123 labels that forbid dots anyway. The namespace a package installs *into* is set per-`PackageSource`/`Package`, independent of where the tap's source and Secret live. Both the `POST /marketplace/taps` handler and `cozypkg tap --secret` create the source in `cozy-system` and reference a Secret there, so they agree on one place, and Flux source-controller resolves `secretRef` in that same namespace with no cross-namespace lookup to special-case.
 - Secret format depends on source kind, matching what Flux source-controller documents and what `#2472` already wired for the platform source: `kubernetes.io/dockerconfigjson` for OCI; Opaque with `username`+`password` or `bearerToken` for Git over HTTPS; Opaque with `identity` (PEM private key) and `known_hosts` for Git over SSH.
 
 This is exactly symmetric with `cozystack/cozystack#2472` (merged): that change made the operator set `spec.secretRef` on the platform source it generates; this makes `cozypkg tap` / the backend do the same for every user-tapped repository. No field is added to `PackageSourceRef`: it is a by-name reference to an already-created source, and the `PackageSource` reconciler only reads it to build the `ArtifactGenerator` — it never creates the Flux source, so a `secretRef` on the ref would have no reconcile path. Because nothing on the CRD changes, no migration is needed.
@@ -165,13 +165,17 @@ Privileged components are surfaced both at validation time (the CI workflow emit
 
 Credentials never live on a CR field: the `secretRef` set at tap time names a `Secret` consumed by Flux source-controller under its existing RBAC; `cozypkg` and the backend never read or log the credential. The `GET` endpoints return catalog metadata only — package names, tags, descriptions, privileged badges — and never a Secret name, its contents, or the private source's credentials, so browsing cannot leak private-tap credentials across the tenant boundary.
 
+The tap API takes a `secretRef` (the name of a `Secret` the admin pre-creates in `cozy-system`), not raw credentials in the request body. Accepting inline credentials over the API is discouraged: it would land secrets in request logs and API audit trails and force the server to persist them itself, whereas referencing a pre-created `Secret` keeps credential handling inside Flux's existing RBAC and the cluster's at-rest Secret encryption.
+
+Metadata visibility is a boundary to state explicitly, because it is easy to over-read "credentials do not leak" as "a private tap is private". They are different claims. The pull credential stays protected, but the *catalog metadata* of a private tap — package names, tags, descriptions — is visible to every authenticated user through the open `GET /marketplace/*` endpoints, because taps are cluster-scoped. A cluster-admin tapping a private repository must therefore treat its package names and descriptions as visible cluster-wide; only the artifact contents behind the pull credential are protected. Where even that metadata is sensitive in a multi-tenant cluster, the tap carries a `visibility: private` marker on its `PackageSource` and the `GET` endpoints restrict those entries to cluster-admin. Recommended default for multi-tenant clusters: private taps are admin-only in the catalog, public taps stay world-readable.
+
 ## Failure and edge cases
 
 `PackageSource` / `ApplicationDefinition` malformed inside the artifact → cache controller logs the parse error, marks the tap as `Degraded`, and returns the last-known-good payload. Operator sees a clear error in the dashboard.
 
 Secret removed while still referenced → Flux surfaces the failed-pull condition on the source, which the marketplace endpoint forwards.
 
-Tap removed while packages from it remain installed → handled per `#12`'s `cozypkg untap`: warn and require confirmation, reusing the reverse-dependency analysis from `cozypkg del`; already-installed `Package` resources are left in place until explicitly removed. The dashboard marks them `OrphanedSource` until the operator re-taps or removes them.
+Tap removed while packages from it remain installed → handled per `#12`'s `cozypkg untap`: warn and require confirmation, reusing the reverse-dependency analysis from `cozypkg del`; already-installed `Package` resources are left in place until explicitly removed. Mechanically, installed `Package` CRs carry no `ownerReference` to the tap's `PackageSource`, so removing the tap never triggers Kubernetes garbage collection of the packages — orphaning is the default by construction, not an active step. A finalizer on the `PackageSource` lets the backend / `cozypkg untap` run the reverse-dependency check and surface the confirmation before the object is actually deleted. The dashboard computes the `OrphanedSource` state by detecting installed `Package`s whose `sourceRef` no longer resolves to a live `PackageSource`, and holds it until the operator re-taps or removes them.
 
 `POST /marketplace/taps` with a `secretRef` pointing at a non-existent Secret → endpoint accepts the request (Flux can recover later when the Secret appears), and the dashboard shows the `Secret not found` condition sourced from Flux.
 
@@ -185,7 +189,7 @@ Independent PRs in cozystack, several landable in parallel. The `--secret` flag 
 
 ## Open questions
 
-Tap-remove lifecycle. `#12` already proposes warn-and-confirm reusing `cozypkg del` reverse-dependency analysis; this proposal adopts that and adds only the dashboard `OrphanedSource` marker. Whether disconnect should ever cascade-delete rather than orphan is left open. Default proposed: keep installed packages, mark orphaned.
+Tap-remove lifecycle. Mechanism is specified (no `ownerReference` from `Package` to `PackageSource` so nothing cascades via garbage collection; a `PackageSource` finalizer gates deletion behind the `cozypkg del` reverse-dependency confirmation; `OrphanedSource` is computed from a dangling `sourceRef`). What remains open is policy, not mechanism: whether disconnect should ever offer an opt-in cascade-delete rather than always orphaning. Default proposed: keep installed packages, mark orphaned.
 
 Endpoint hosting. Marketplace endpoints inside `cozystack-api` versus a new `cozystack-marketplace-controller`. Default proposed: extend `cozystack-api`.
 
