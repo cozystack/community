@@ -3,7 +3,7 @@
 - **Title:** `Distributed tracing for managed applications via OTLP and VictoriaTraces`
 - **Author(s):** `@scooby87`
 - **Date:** `2026-07-16`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
