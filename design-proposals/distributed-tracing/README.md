@@ -64,7 +64,7 @@ Add a `tracingStorages` list to the monitoring values, parallel to `metricsStora
 tracingStorages:
 - name: generic
   retentionPeriod: "14d"           # age-based retention; default 14 days per the requirement
-  retentionDiskSpaceUsage: ""      # optional disk-based cap (e.g. "80%" / bytes); see note below
+  retentionDiskUsagePercent: ""    # optional disk-based cap, percent only (e.g. "80"); see note below
   storage: 10Gi
   storageClassName: ""
   replicaCount: 2                  # component scaling, NOT data replication (see durability note)
@@ -93,7 +93,7 @@ spec:
   vtselect:  { replicaCount: {{ .replicaCount | default 2 }} }
   vtstorage:
     retentionPeriod: {{ .retentionPeriod | quote }}
-    {{- with .retentionDiskSpaceUsage }}
+    {{- with .retentionDiskUsagePercent }}
     retentionMaxDiskSpaceUsagePercent: {{ . | quote }}
     {{- end }}
     replicaCount: {{ .replicaCount | default 2 }}
@@ -116,23 +116,23 @@ The monitoring HelmRelease must gate readiness on the new `VTCluster` exactly as
 
 ### 2. OTLP ingest (staged: direct-to-backend, then a collector gateway)
 
-`vtinsert` accepts OTLP natively, so the ingest path mirrors logs one-for-one: where fluent-bit ships to `vlinsert-generic`, a traced application ships OTLP to `vtinsert-generic`. This proposal stages the ingest so the platform gets value immediately and grows into the collector the client asked for, with **no app-visible endpoint change between stages**.
+`vtinsert` accepts OTLP natively, so the ingest path mirrors logs one-for-one: where fluent-bit ships to `vlinsert-generic`, a traced application ships OTLP to `vtinsert`. This proposal stages the ingest so the platform gets value immediately and grows into the collector the client asked for, behind **one stable app-facing endpoint** — an explicit in-cluster Service on OTLP/gRPC `4317` — so promoting Stage A→B swaps what that Service targets (backend → collector), not the app's configuration.
 
-**Stage A (MVP) — direct to `vtinsert`.** Applications push OTLP straight to the VictoriaTraces insert service. Add an `otel-traces` (or `vtinsert-generic`) **ExternalName redirect** to `packages/system/cozystack-basics/templates/monitoring-external-services.yaml`, alongside the existing `vlinsert-generic`/`vminsert-*` entries, pointing `*.cozy-monitoring.svc` → `*.tenant-root.svc.cluster.local`, gated on the same `_cluster.monitoring-enabled` flag (from `monitoring.rootEnabled`). This is the exact mechanism logs and metrics already use; central-vs-isolated tenants work identically with zero new machinery.
+**Stage A (MVP) — direct to `vtinsert`.** Applications push OTLP/gRPC to the stable Service `otel-traces.cozy-monitoring.svc:4317`, which in Stage A resolves to `vtinsert`'s OTLP/gRPC listener (enabled by setting `-otlpGRPCListenAddr` on the `VTCluster`). Tenant redirection to the central stack reuses the mechanism in `packages/system/cozystack-basics/templates/monitoring-external-services.yaml` (gated on `_cluster.monitoring-enabled` from `monitoring.rootEnabled`) that logs and metrics already use — but as a **port-explicit** Service, not a bare `ExternalName`.
 
-**OTLP service contract** (raised in review — the exact ports/path matter): an `ExternalName` Service only aliases DNS; it does not remap ports or translate the OTLP/HTTP path. `vtinsert` defaults to OTLP/HTTP on port `10481` at path `/insert/opentelemetry/v1/traces`, and OTLP/gRPC only when `-otlpGRPCListenAddr` is set on the component (conventionally `4317`). So Stage A must be precise: either (a) point apps at `vtinsert`'s real OTLP/HTTP endpoint (`…:10481/insert/opentelemetry/v1/traces`) and enable the gRPC listener on the `VTCluster` if gRPC is wanted, redirecting via a `ClusterIP`/`ExternalName` Service that exposes those ports, or (b) front `vtinsert` with the Stage-B collector, which owns the canonical `4317/4318` OTLP listeners. The earlier "stable `…:4317`" shorthand assumes the collector or an explicit port-mapped Service — plain DNS aliasing alone is not enough.
+**OTLP service contract** (raised in review — the exact ports/path matter, and a bare `ExternalName` cannot carry them): an `ExternalName` only aliases DNS; it does not remap ports or translate the OTLP/HTTP path. `vtinsert` defaults to OTLP/HTTP on port `10481` at path `/insert/opentelemetry/v1/traces`, and to OTLP/gRPC only when `-otlpGRPCListenAddr` is set (conventionally `4317`). Because the collector's OTLP/HTTP path (`/v1/traces`) differs from `vtinsert`'s, **OTLP/gRPC is the chosen stable app contract**: gRPC has no path, so the same `…:4317` Service works whether it fronts `vtinsert` (Stage A) or the collector (Stage B). The redirect is therefore an explicit ports-carrying Service (`ClusterIP` with an `externalName`-style upstream, or a small proxy), never plain DNS aliasing. OTLP/HTTP users must standardize on the collector from the start, since its ingest path is not interchangeable with `vtinsert`'s.
 
-**Tenant routing needs headers** (raised in review — this is the load-bearing multi-tenancy point): VictoriaTraces attributes a tenant from the `AccountID`/`ProjectID` request headers (query-string equivalents take priority); with neither set, everything lands in the default tenant `0:0`. Neither an `ExternalName` redirect nor a collector `resource` processor sets those headers. So on a shared central backend the write path must inject `AccountID`/`ProjectID` derived from authenticated workload identity — from the app's OTLP exporter, a trusted per-tenant proxy, or (Stage B) the collector's `otlphttp` exporter `headers:` block — in addition to stamping the `tenant` resource attribute for query-time labelling. Isolated per-tenant stacks (`packages/extra/monitoring`) sidestep this by not sharing a backend.
+**Tenant routing needs headers** (raised in review — this is the load-bearing multi-tenancy point): VictoriaTraces attributes a tenant from the `AccountID`/`ProjectID` request headers (query-string equivalents take priority); with neither set, everything lands in the default tenant `0:0`. Neither an `ExternalName` redirect nor a collector `resource` processor sets those headers. So on a shared central backend the write path must inject `AccountID`/`ProjectID` derived from authenticated workload identity — from the app's OTLP exporter, a trusted per-tenant proxy, or (Stage B) the collector's `headers_setter` extension (see below) — in addition to stamping the `tenant` resource attribute for query-time labelling. Isolated per-tenant stacks (`packages/extra/monitoring`) sidestep this by not sharing a backend.
 
 **Stage B — toggleable OpenTelemetry Collector gateway.** Add an OpenTelemetry Collector (gateway **Deployment** in `cozy-monitoring`, following the `packages/system/monitoring-agents` pattern) in front of `vtinsert` for the capabilities direct ingest can't provide: central sampling, rate-limiting, and per-`tenant` resource attribution. It is the "OpenTelemetry Collector/Agent via an option" the client explicitly requested, and it is opt-in.
 
 - Receivers: `otlp` on gRPC `4317` and HTTP `4318` (the collector owns these canonical ports; it translates to `vtinsert`'s `10481`/`/insert/opentelemetry/v1/traces` on export).
 - Processors: `batch`, a sampler (see the affinity note), and `resource` to stamp the `tenant` attribute.
-- Exporter: `otlphttp` to the `vtinsert` service of the `tracingStorages` backend, with the `headers:` block setting `AccountID`/`ProjectID` from the authenticated tenant identity (not just the resource attribute).
+- Exporter: `otlphttp`/`otlp` to the `vtinsert` service of the `tracingStorages` backend. Per-request `AccountID`/`ProjectID` must come from the `headers_setter` extension (`from_context`, with the OTLP receiver `include_metadata: true` and the `batch` processor preserving metadata) — **static `otlphttp.headers` cannot derive per-tenant IDs** (raised in review) and would route every tenant to one account. A trusted per-tenant proxy is the alternative; tenants must not be able to set their own routing headers.
 
 **Tail-sampling affinity** (raised in review): tail sampling must see *all* spans of a trace on one instance, but a plain Kubernetes Service round-robins spans across collector replicas and would make sampling decisions on incomplete traces. So the sampling tier must run at a single replica, or use the two-tier pattern — a first tier with the `loadbalancingexporter` (`routing_key: traceID`) consistently hashing each trace to a fixed second-tier instance that runs `tail_sampling`. Head sampling (`probabilistic_sampler`) has no such constraint and can scale freely; the platform default and this trade-off are an Open question.
 
-Applications always target a stable in-cluster endpoint (e.g. `…cozy-monitoring.svc:4317` once the collector fronts ingest); flipping from Stage A to Stage B only re-points that ExternalName from `vtinsert` to the collector, so the migration is transparent to every traced app. A gateway **Deployment** (not a DaemonSet) is correct here because OTLP is push-based over the network — apps are the agents; the collector plays the centralized `vtinsert`/vmagent role, not the node-local fluent-bit role.
+Because the app-facing contract is the fixed `otel-traces…:4317` gRPC Service, promoting Stage A→B changes only what that Service targets (`vtinsert` → collector) — a platform-side change, with no app reconfiguration (this holds for gRPC; OTLP/HTTP is not path-interchangeable, so HTTP users adopt the collector from the start). A gateway **Deployment** (not a DaemonSet) is correct here because OTLP is push-based over the network — apps are the agents; the collector plays the centralized `vtinsert`/vmagent role, not the node-local fluent-bit role.
 
 ### 3. Grafana datasource and correlation
 
@@ -170,9 +170,9 @@ How an app emits spans depends on the engine:
 
 ```mermaid
 flowchart LR
-  app["Managed app<br/>(tracing.enabled)"] -- "OTLP 4317/4318<br/>(stable svc endpoint)" --> ext["ExternalName redirect<br/>cozy-monitoring → tenant-root"]
-  ext -- "Stage A: direct" --> vt["VictoriaTraces<br/>VTCluster (vtinsert→vtstorage)"]
-  ext -. "Stage B: via gateway" .-> col["OpenTelemetry Collector<br/>(sampling / rate-limit / tenant)"]
+  app["Managed app<br/>(tracing.enabled)"] -- "OTLP/gRPC :4317<br/>(stable Service)" --> svc["otel-traces Service<br/>cozy-monitoring (port-explicit)"]
+  svc -- "Stage A: → vtinsert gRPC" --> vt["VictoriaTraces<br/>VTCluster (vtinsert→vtstorage)"]
+  svc -. "Stage B: → collector" .-> col["OpenTelemetry Collector<br/>(sampling / rate-limit / AccountID+ProjectID)"]
   col -- OTLP --> vt
   gr["Grafana"] -- Jaeger query --> vt
   gr -. trace_id .-> vl["VictoriaLogs"]
@@ -202,14 +202,14 @@ The change is purely additive and opt-in. Existing clusters see no behavioural c
 
 - `tracingStorages` **absent/unset** → tracing disabled, template renders nothing and succeeds. `tracingStorages: []` **explicitly empty** → loud render failure (mirrors `cozystack/cozystack#3181`), never a silent span black hole. Both paths are asserted in tests.
 - OTLP endpoint unreachable from an app (backend or collector down) → the app's exporter drops/retries per OTLP defaults; the app itself does not crash and serving is unaffected.
-- Storage full — **age vs disk retention are independent** (raised in review). `retentionPeriod` only prunes by age; it does *not* bound disk. Without a disk cap a full PVC blocks ingest *before* old traces are evicted. Set `vtstorage.retentionMaxDiskSpaceUsagePercent` (or `-retention.maxDiskSpaceUsageBytes`) via `retentionDiskSpaceUsage`, and add a PVC/disk-usage capacity alert. Covered by a PVC-exhaustion test.
+- Storage full — **age vs disk retention are independent** (raised in review). `retentionPeriod` only prunes by age; it does *not* bound disk. Without a disk cap a full PVC blocks ingest *before* old traces are evicted. Set `vtstorage.retentionMaxDiskSpaceUsagePercent` via the percent-only `retentionDiskUsagePercent` values field (upstream also offers a mutually-exclusive `-retention.maxDiskSpaceUsageBytes`, deliberately not exposed here to keep the field unambiguous), and add a PVC/disk-usage capacity alert. Covered by a PVC-exhaustion test.
 - `tracing.enabled: false` → no sidecar, no env, no CR: zero overhead.
 - App emits OTLP but no backend deployed → the ExternalName resolves to nothing and the exporter drops/retries harmlessly; the app toggle is documented to require a `tracingStorages` backend.
 - App sets no `AccountID`/`ProjectID` → spans land in the default tenant `0:0` (visible to whoever can read that tenant). The write-boundary injection above must prevent this on a shared backend.
 
 ## Testing
 
-- **Unit/lint**: `helm template` + `helm lint` for the new `vtraces` templates and each app's `tracing` block; assert `VTCluster`, the collector, and the `GrafanaDatasource` render only when configured; assert the **absent-vs-empty** contract (absent `tracingStorages` → renders nothing and succeeds; `tracingStorages: []` → render fails); assert `retentionDiskSpaceUsage` maps to the disk-retention field when set.
+- **Unit/lint**: `helm template` + `helm lint` for the new `vtraces` templates and each app's `tracing` block; assert `VTCluster`, the collector, and the `GrafanaDatasource` render only when configured; assert the **absent-vs-empty** contract (absent `tracingStorages` → renders nothing and succeeds; `tracingStorages: []` → render fails); assert `retentionDiskUsagePercent` maps to `retentionMaxDiskSpaceUsagePercent` when set.
 - **e2e** (Chainsaw, per `docs/agents/e2e-testing.md`): deploy the monitoring stack with a `tracingStorages` entry, deploy one app (start with a native-OTLP engine, e.g. ClickHouse) with `tracing.enabled: true`, generate activity, then assert a trace is queryable via the `vtselect` query API and visible in Grafana; assert a second tenant cannot read the first tenant's spans (read-side isolation); a PVC-exhaustion case asserts ingest degrades safely with a disk cap set.
 - **Manual**: verify trace→logs and (once the collector/spanmetrics land) trace→metrics pivots in Grafana.
 
@@ -218,7 +218,7 @@ The change is purely additive and opt-in. Existing clusters see no behavioural c
 1. **Stage A — backend + direct ingest**: `tracingStorages`/`VTCluster` in `packages/system/monitoring` (+ `packages/extra/monitoring`) with the poller readiness gate, plus the `vtinsert` ExternalName redirect in `packages/system/cozystack-basics`. Apps can push OTLP directly. No collector yet.
 2. **Grafana**: traces datasource + correlation links.
 3. **Per-app toggles**: start with native-OTLP engines (ClickHouse, NATS), then sidecar-based engines (Kafka, RabbitMQ, MariaDB, Redis, Postgres), one PR per app.
-4. **Stage B — collector gateway**: add the toggleable OpenTelemetry Collector Deployment and re-point the ExternalName from `vtinsert` to the collector (transparent to apps). Ships sampling/rate-limiting/tenant-attribution.
+4. **Stage B — collector gateway**: add the toggleable OpenTelemetry Collector Deployment and re-point the `otel-traces:4317` Service from `vtinsert` to the collector (no app change for gRPC clients). Ships sampling/rate-limiting and `AccountID`/`ProjectID` header injection via `headers_setter`.
 5. **Docs**: enablement guide under `docs/observability/`.
 
 ## Open questions
