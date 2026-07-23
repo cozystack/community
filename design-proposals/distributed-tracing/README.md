@@ -2,7 +2,7 @@
 
 - **Title:** `Distributed tracing for managed applications via OTLP and VictoriaTraces`
 - **Author(s):** `@scooby87`
-- **Date:** `2026-07-16` (revised 2026-07-20)
+- **Date:** `2026-07-16` (revised 2026-07-23)
 - **Status:** Review
 
 ## Overview
@@ -65,11 +65,16 @@ tracingStorages:
 - name: generic
   mode: cluster                    # "cluster" -> VTCluster (default), "single" -> VTSingle (edge/dev/small)
   retentionPeriod: "14d"           # age-based retention; default 14 days per the requirement
-  retentionDiskUsageBytes: ""      # optional disk-based cap, byte quantity (e.g. "50GB"); see note below
-  storageSize: 10Gi                # PVC size for vtstorage
+  retentionDiskUsageBytes: ""      # disk-based cap, byte quantity (e.g. "50GB"); when empty, derived from storageSize (~85%) so the default is always disk-bounded (see note)
+  storageSize: 10Gi                # PVC size for vtstorage (named storageSize, not storage — see naming note)
   storageClassName: ""
-  replicaCount: 2                  # component scaling, NOT data replication (see durability note)
+  replicaCount: 2                  # uniform shortcut for all tiers; NOT data replication (see durability note)
+  # insert:  { replicaCount: 2 }   # optional per-tier override (defaults to replicaCount)
+  # select:  { replicaCount: 2 }   # optional per-tier override (defaults to replicaCount)
+  # storage: { replicaCount: 2 }   # optional per-tier override; durability-adjacent, still NOT replication
 ```
+
+The per-entry `replicaCount` is a **uniform shortcut**: it seeds all three cluster tiers so a simple config stays one line. Because the tiers are rarely sized identically in practice — `insert` scales with ingest, `select` with query load, `storage` with retention/throughput, and `storage.replicaCount` is durability-adjacent rather than a query-scaling knob — each tier accepts an optional explicit override (`insert`/`select`/`storage` `replicaCount`), mirroring how `VMCluster` exposes per-component counts; an unset tier falls back to the shortcut. The PVC-size key is named `storageSize` rather than the sibling `storage` (used by `metricsStorages`/`logsStorages`) on purpose: the `VTCluster` CRD already nests a second `storage` object under `spec.storage` (`spec.storage.storage.volumeClaimTemplate`), so reusing `storage` as the values key would read as `spec.storage.storage` stutter — the rename keeps the values surface unambiguous.
 
 Render one backend CR per entry in a new `templates/vtraces/vtraces.yaml`, shaped like `templates/vlogs/vlogs.yaml` (but with the VictoriaTraces prefix-less sub-spec keys). The per-entry `mode` selects the CR kind: `cluster` (default) renders a `VTCluster` — the multi-component variant used below and the same choice `metricsStorages`/`logsStorages` make with `VMCluster`/`VLCluster` in every stack today; `single` renders a single-binary `VTSingle` for edge/dev/small clusters where the cluster footprint is unwarranted (its sub-spec is flatter — no separate insert/select/storage components — so `replicaCount` and the storage/retention fields apply to the one workload). Both carry: `managedMetadata` labels for application ownership, configurable replica counts, `retentionPeriod` from the entry, the storage-PVC claim-template label for the release-scoped post-delete cleanup hook, and the `cozystack/cozystack#3181` guard (see the absent-vs-empty contract below).
 
@@ -91,14 +96,14 @@ spec:
       apps.cozystack.io/application.group: apps.cozystack.io
       apps.cozystack.io/application.kind: Monitoring
       apps.cozystack.io/application.name: {{ $.Release.Name }}
-  insert:  { replicaCount: {{ .replicaCount | default 2 }} }
-  select:  { replicaCount: {{ .replicaCount | default 2 }} }
+  {{- /* per-tier replicaCount falls back to the uniform .replicaCount shortcut (fallback plumbing elided in this sketch) */}}
+  insert:  { replicaCount: {{ .insert.replicaCount  | default .replicaCount | default 2 }} }
+  select:  { replicaCount: {{ .select.replicaCount  | default .replicaCount | default 2 }} }
   storage:
     retentionPeriod: {{ .retentionPeriod | quote }}
-    {{- with .retentionDiskUsageBytes }}
-    retentionMaxDiskSpaceUsageBytes: {{ . | quote }}
-    {{- end }}
-    replicaCount: {{ .replicaCount | default 2 }}
+    {{- /* always disk-bounded: explicit bytes, else ~85% of storageSize so the default cannot silently fill the PVC (exact byte math elided) */}}
+    retentionMaxDiskSpaceUsageBytes: {{ .retentionDiskUsageBytes | default (include "vtraces.defaultDiskCap" .) | quote }}
+    replicaCount: {{ .storage.replicaCount | default .replicaCount | default 2 }}
     storage:
       volumeClaimTemplate:
         metadata:
@@ -199,19 +204,20 @@ The change is purely additive and opt-in. Existing clusters see no behavioural c
 - **Isolation (write and read)**: write-side attribution alone is not isolation, and `vtselect` performs no per-tenant authorization — it trusts the `AccountID`/`ProjectID` read header verbatim, so pinning that header on a per-tenant Grafana datasource is a routing selector, not a security boundary. Read isolation is therefore delivered the same way logs/metrics deliver it today: **either** (a) an isolated per-tenant stack (`packages/extra/monitoring`) whose datasource can only reach its own in-namespace `vtselect`, fenced by NetworkPolicy — the recommended default; **or** (b) an authenticating proxy (vmauth) in front of a shared `vtselect` that derives `AccountID`/`ProjectID` from authenticated identity and strips any client-supplied headers. A per-tenant datasource header pin is safe only in combination with (a) or (b), because the endpoint itself remains reachable and unauthenticated.
 - **Transport**: OTLP endpoints should be TLS-terminated; align with the unified TLS/PKI model (`design-proposals/unified-tls-pki`) rather than minting bespoke certs.
 - **RBAC**: new `VTCluster`/`GrafanaDatasource`/collector resources need the same narrowly-scoped RBAC the metrics/logs equivalents already have. No new secret classes are introduced beyond the OTLP endpoint credentials, if any.
+- **Pod Security Standards**: the new OTLP Collector Deployment and the per-app OTLP sidecars/agents (Kafka, RabbitMQ, MariaDB, Redis, Postgres) run inside `tenant-*` namespaces, which enforce PSS **restricted**. They must ship a compliant pod-security posture out of the box — `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, and `seccompProfile.type: RuntimeDefault` — like every other new workload class in this stack; no privileged or host-namespace access is required for OTLP ingest.
 
 ## Failure and edge cases
 
 - `tracingStorages` **absent/unset** → tracing disabled, template renders nothing and succeeds. `tracingStorages: []` **explicitly empty** → loud render failure (mirrors `cozystack/cozystack#3181`), never a silent span black hole. Both paths are asserted in tests.
 - OTLP endpoint unreachable from an app (backend or collector down) → the app's exporter drops/retries per OTLP defaults; the app itself does not crash and serving is unaffected.
-- Storage full — **age vs disk retention are independent**. `retentionPeriod` only prunes by age; it does *not* bound disk. Without a disk cap a full PVC blocks ingest *before* old traces are evicted. Set `spec.storage.retentionMaxDiskSpaceUsageBytes` (the disk-cap field the `VTCluster` CRD actually exposes — verified in the pinned operator; a percent form is *not* a CR field, only an upstream flag) via the byte-quantity `retentionDiskUsageBytes` values field, and add a PVC/disk-usage capacity alert. Covered by a PVC-exhaustion test.
+- Storage full — **age vs disk retention are independent**. `retentionPeriod` only prunes by age; it does *not* bound disk, so an age-only config lets a full PVC block ingest *before* old traces are evicted. The default is therefore **always disk-bounded**: `spec.storage.retentionMaxDiskSpaceUsageBytes` (the disk-cap field the `VTCluster` CRD actually exposes — verified in the pinned operator; a percent form is *not* a CR field, only an upstream flag) is set from the byte-quantity `retentionDiskUsageBytes` values field when given, and otherwise **derived from `storageSize` (~85%)** so no entry ever ships without a disk bound — matching the "uncrashable default, don't just document the knife" spirit of the `#3181` guard. A PVC/disk-usage capacity alert is added on top, and the behaviour is covered by a PVC-exhaustion test.
 - `tracing.enabled: false` → no sidecar, no env, no CR: zero overhead.
 - App emits OTLP but no backend deployed → the `otel-traces` Service has no backing endpoints, so the exporter's connection fails and it drops/retries harmlessly; the app toggle is documented to require a `tracingStorages` backend.
 - App sets no `AccountID`/`ProjectID` → spans land in the default tenant `0:0` (visible to whoever can read that tenant). The write-boundary injection above must prevent this on a shared backend.
 
 ## Testing
 
-- **Unit/lint**: `helm template` + `helm lint` for the new `vtraces` templates and each app's `tracing` block; assert `VTCluster`, the collector, and the `GrafanaDatasource` render only when configured; assert the **absent-vs-empty** contract (absent `tracingStorages` → renders nothing and succeeds; `tracingStorages: []` → render fails); assert `retentionDiskUsageBytes` maps to `spec.storage.retentionMaxDiskSpaceUsageBytes` when set.
+- **Unit/lint**: `helm template` + `helm lint` for the new `vtraces` templates and each app's `tracing` block; assert `VTCluster`, the collector, and the `GrafanaDatasource` render only when configured; assert the **absent-vs-empty** contract (absent `tracingStorages` → renders nothing and succeeds; `tracingStorages: []` → render fails); assert `retentionDiskUsageBytes` maps to `spec.storage.retentionMaxDiskSpaceUsageBytes` when set, and that when it is unset the field is still rendered, derived from `storageSize` (~85%), so no rendered `VTCluster`/`VTSingle` is ever disk-unbounded.
 - **e2e** (Chainsaw, per `docs/agents/e2e-testing.md`): deploy the monitoring stack with a `tracingStorages` entry, deploy one app (start with a native-OTLP engine, e.g. ClickHouse) with `tracing.enabled: true`, generate activity, then assert a trace is queryable via the `vtselect` query API and visible in Grafana; assert a second tenant cannot read the first tenant's spans (read-side isolation); a PVC-exhaustion case asserts ingest degrades safely with a disk cap set.
 - **Manual**: verify trace→logs and (once the collector/spanmetrics land) trace→metrics pivots in Grafana.
 
