@@ -2,14 +2,16 @@
 
 - **Title:** `Database Horizontal Autoscaler for Cozystack`
 - **Author(s):** `@scooby87`
-- **Date:** `2026-07-08` (addressing review by `@IvanHunters`, Gemini, and CodeRabbit)
+- **Date:** `2026-07-08`; revised `2026-07-24` after the implementation spike, addressing review by `@IvanHunters`, `@lllamnyp`, Gemini, and CodeRabbit
 - **Status:** Draft
 
 ## Overview
 
-Managed databases in Cozystack (`postgres`, `mariadb`, `redis`, `mongodb`, and others) are scaled only manually today: an operator edits the `replicas` value of the application and waits for the underlying operator to converge. This proposal introduces a dedicated operator, `db-autoscaler`, that automatically adjusts the number of **read replicas** of a managed database in response to load, driven by a new HPA-like custom resource `DatabaseHorizontalAutoscaler` (DHA).
+Managed databases in Cozystack (`postgres`, `mariadb`, `redis`, `mongodb`, and others) are scaled only manually today: an operator edits the `replicas` value of the application and waits for the underlying operator to converge. This proposal introduces automatic horizontal scaling of a managed database's **read replicas** in response to load.
 
-The proposal is deliberately scoped to **horizontal scaling of read replicas**, because a stateful database primary cannot be scaled horizontally the way a stateless Deployment can. The autoscaler is topology-aware per engine, respects the synchronous-replica quorum, brakes on replication lag, and applies its decisions by patching the application's `replicas` value (the `Application` `spec`) — the same field a human would edit. Patching that field avoids the engine-CR ownership conflict a stock HPA causes; it does **not** by itself stop a concurrent Flux writer that also declares `replicas` (a non-force writer surfaces an SSA conflict, and a `spec.force: true` writer can seize ownership — see Ownership).
+The first revision of this proposal proposed a bespoke `db-autoscaler` operator that owned the application's `replicas` value and enforced that ownership against competing writers. An implementation spike (see [Findings from the implementation spike](#findings-from-the-implementation-spike)) disproved the enforcement premise that design rested on, and surfaced that the same outcome is reachable far more cheaply by reusing the platform Kubernetes already ships. **This revision therefore builds on the stock `HorizontalPodAutoscaler` (HPA) acting on the engine operator's `scale` subresource, combined with a one-line chart change so the autoscaled field is no longer declared in Git.** The only net-new component is a thin, engine-aware guard that adds the database-specific safety brakes HPA does not have (replication-lag gate, synchronous-quorum floor, recommendation/dry-run).
+
+The proposal is deliberately scoped to **horizontal scaling of read replicas**, because a stateful database primary cannot be scaled horizontally the way a stateless Deployment can.
 
 ## Scope and related proposals
 
@@ -18,190 +20,187 @@ This proposal covers **horizontal** autoscaling (read replicas) only. Two siblin
 - **Vertical autoscaling** — stepping the `resourcesPreset` ladder / in-place pod resize.
 - **Storage autoscaling** — automatic PVC expansion when a volume fills up.
 
-Write-path scaling that requires data rebalancing (Kafka broker addition with partition reassignment, ClickHouse/MongoDB sharding) is out of scope for this proposal — it is an orchestrated procedure, not a counter change.
+Write-path scaling that requires data rebalancing (Kafka broker addition with partition reassignment, ClickHouse/MongoDB sharding) is out of scope — it is an orchestrated procedure, not a counter change.
+
+**Engine scope of the MVP.** The HPA-on-`scale`-subresource mechanism applies to engines whose operator CR exposes a `scale` subresource: PostgreSQL (CloudNativePG `Cluster.spec.instances`) and MariaDB (`MariaDB.spec.replicas`). The MVP ships **PostgreSQL**; MariaDB follows once its cozystack chart supports on-the-fly scale-out (today it does not, see [Failure and edge cases](#failure-and-edge-cases)). **Redis (spotahome RedisFailover) and MongoDB (Percona) expose no `scale` subresource**, so they cannot be driven by a stock HPA; they are deferred to a follow-up that adds a thin actuation shim for them (see [Alternatives considered](#alternatives-considered)).
 
 ## Context
 
-A managed database in Cozystack is an `Application` in the aggregated `apps.cozystack.io` API. That `Application` is a **pure projection of a Flux `HelmRelease`**: `pkg/registry/apps/application/rest.go` converts both ways (`ConvertApplicationToHelmRelease` sets `Values: app.Spec`, and `ConvertHelmReleaseToApplication` does the reverse), with no separate backing store. Flux reconciles the `HelmRelease` values into the engine operator's custom resource (for example a CloudNativePG `Cluster`, where `packages/apps/postgres/templates/db.yaml` maps `instances: {{ .Values.replicas }}`). Every managed database already exposes a horizontal knob in its values — `replicas` (or `kafka.replicas`, etc.) — and Cozystack already runs the observability the autoscaler needs:
+A managed database in Cozystack is an `Application` in the aggregated `apps.cozystack.io` API. That `Application` is a **pure projection of a Flux `HelmRelease`**: `pkg/registry/apps/application/rest.go` converts both ways, with no separate backing store. Flux reconciles the `HelmRelease` values into the engine operator's custom resource — for example a CloudNativePG `Cluster`, where `packages/apps/postgres/templates/db.yaml` maps `instances: {{ .Values.replicas }}`. Cozystack already runs the observability the autoscaler needs:
 
-- A per-database `WorkloadMonitor` (`cozystack.io/v1alpha1`, reconciled by `internal/controller/workloadmonitor_controller.go`) reports `status.availableReplicas`, `status.observedReplicas`, and `status.operational`, and already queries VictoriaMetrics over the vmselect Prometheus API.
-- Managed-app pods are labeled by the lineage webhook (`internal/lineagecontrollerwebhook/webhook.go`) with `apps.cozystack.io/application.{group,kind,name}` and `internal.cozystack.io/managed-by-cozystack: "true"`.
-- VictoriaMetrics (`packages/system/monitoring`) scrapes per-database metrics via `PodMonitor` (for PostgreSQL, `enablePodMonitor: true` on the CNPG `Cluster`).
+- A per-database `WorkloadMonitor` (`cozystack.io/v1alpha1`, reconciled by `internal/controller/workloadmonitor_controller.go`) reports `status.availableReplicas`, `status.observedReplicas`, and `status.operational`.
+- Managed-app pods are labeled by the lineage webhook (`internal/lineagecontrollerwebhook/webhook.go`) with `apps.cozystack.io/application.{group,kind,name}` and by kube-state-metrics' `kube_pod_labels`, so metric queries can be scoped to a single application's read-serving pods.
+- VictoriaMetrics (`packages/system/monitoring`) scrapes per-database metrics; for PostgreSQL, `enablePodMonitor: true` on the CNPG `Cluster` exports `cnpg_*` series, including the replication-lag gauge.
 
 ### The problem
 
 > "My database is saturated with read traffic during business hours and idle at night, but I have to notice it, hand-edit `replicas`, and hope I picked the right number — and undo it later."
 
-There is no automated way to add or remove read replicas under load. A stock `HorizontalPodAutoscaler` does not fit: it only writes a replica count (for CloudNativePG, `Cluster.spec.instances`) and is blind to database topology. It has nothing to encode the synchronous-commit quorum floor, so it can drive the count below `maxSyncReplicas + 1` — where the operator either rejects the change or loses its write quorum — and it has no gate on replication lag, scaling on the load metric alone while standbys are arbitrarily behind. Which instance to add or remove, and in what order, is the engine operator's decision (CloudNativePG removes the highest-ordinal standby and never the primary); an autoscaler for stateful databases must own the count and the safety guardrails while leaving instance lifecycle to the operator.
+There is no automated way to add or remove read replicas under load. A stock HPA is the natural fit for the *decision* — it computes a desired replica count from a metric with stabilization, min/max, and multi-metric semantics — but on its own it is missing two database-specific safety properties: it has no synchronous-commit quorum floor (it can drive the count below `maxSyncReplicas + 1`, where CNPG rejects the change or starves commits), and no replication-lag gate (it would scale on the load metric alone while standbys are arbitrarily behind). This proposal keeps HPA as the decision engine and adds exactly those two brakes — nothing more.
 
-## Goals
+### Findings from the implementation spike
 
-- Automatically scale the number of read replicas for primary-replica engines: PostgreSQL (CNPG), MariaDB, Redis, MongoDB (replica set).
-- Apply all decisions by patching the `Application`'s `replicas` value (`spec`) — the Flux-compatible, tenant-facing write path — never the operator CR directly.
-- Reuse existing telemetry (VictoriaMetrics + `WorkloadMonitor`); introduce no new exporters.
-- Be safe for stateful workloads: respect the replica quorum, brake on replication lag, hand scale-down to the engine operator's graceful instance removal, use long stabilization windows, and honor tenant quotas.
-- Provide HPA-like observability: status conditions, events, and a `dryRun` mode.
+The first design rested on one load-bearing claim: the autoscaler could be the *enforced* single owner of the application's `replicas` value, writing it through the aggregated apps API. Building it disproved that claim, step by step. These findings are what motivate the mechanism change in this revision:
 
-### Non-goals
-
-- Vertical scaling (resources / presets).
-- Autoscaling the write path / the primary.
-- Engines that require data rebalancing (Kafka brokers, ClickHouse/MongoDB shards).
-- Cluster-node autoscaling (that is cluster-autoscaler's job).
+1. **SSA field-level ownership does not hold on the aggregated apps API.** The `Application` spec is an opaque JSON blob and its managed-fields are not round-tripped, so a dedicated field manager cannot claim `.spec.replicas` (`internal/dbautoscaler/reconciler.go` `patchReplicas`). The Open question the first revision flagged — "does the aggregated Patch handler support per-field SSA at all?" — is answered: **no**.
+2. **Admission webhooks cannot fire on the aggregated API.** kube-apiserver proxies aggregated-API requests to the extension server, where admission does not run. Enforcement therefore had to move to the backing Flux `HelmRelease`, a CRD served by kube-apiserver.
+3. **The HelmRelease webhook is neither cheap nor sufficient.** It must intercept HelmRelease UPDATEs to guard `replicas`; it must allowlist the apps-API extension-server ServiceAccount (or every legitimate tenant edit breaks), which means a tenant edit through the apps API *bypasses* the guard; and it must not hard-fail Flux reconciliation during an outage. What remains is *advisory* ownership plus a platform-wide admission hop — not the enforced guarantee the design promised.
+4. **The root cause is self-imposed.** The autoscaler-vs-Flux conflict exists only because our own chart *unconditionally* templates the replica field (`instances: {{ .Values.replicas }}`). Remove that declaration under autoscaling and there is nothing for Flux and the autoscaler to fight over — the entire ownership problem disappears, which is the basis for this revision.
 
 ## Design
 
 ### 1. Replica model (instances vs read replicas)
 
-The `replicas` value is the **total instance count** of the engine, not the read-replica count. For CNPG, `packages/apps/postgres/templates/db.yaml` sets `instances: {{ .Values.replicas }}` — that is `1` primary plus `replicas − 1` standbys, and read traffic is served only by the standbys via the `<release>-ro` endpoint. The autoscaler therefore separates the two counts explicitly through the adapter's `PrimaryCount()` (CNPG returns `1`):
+Unchanged from the first revision, and still relevant because HPA scales the **total** instance count. For CNPG, `instances` is `1` primary plus `replicas − 1` standbys, and read traffic is served only by the standbys via the `<release>-ro` endpoint. The load metric is averaged over the read-serving replicas only:
 
-- read-serving replicas now: `Rcur = currentReplicas − PrimaryCount`
-- `desiredRead = ceil(Rcur × currentMetric / targetMetric)` (metric averaged over read-serving replicas only, i.e. divided by `replicas − 1`, never by the total). `targetMetric` must be strictly positive — enforced by CRD schema (`exclusiveMinimum: 0`) and re-checked in the controller, so a zero or negative target is rejected before the division; `Rcur ≥ 1` always holds because `minReplicas ≥ 2`.
-- `desiredReplicas = desiredRead + PrimaryCount`
+- read-serving replicas now: `Rcur = currentInstances − primaryCount` (CNPG `primaryCount = 1`)
+- `desiredRead = ceil(Rcur × currentMetric / targetMetric)` (metric averaged over standbys, never the total; `targetMetric > 0` enforced)
+- `desiredInstances = desiredRead + primaryCount`
 
-`minReplicas`/`maxReplicas` in the CRD count **total instances** (they map to the chart's `replicas` field). `minReplicas` must be `≥ QuorumFloor` and, to serve any reads at all, `≥ 2`.
+`minReplicas`/`maxReplicas` on the HPA count **total instances** and map to the engine CR's replica field. `minReplicas` must be `≥ maxSyncReplicas + 1` and `≥ 2` to serve any reads. Because a stock HPA divides its target average by the number of pods matching the target's `scale` selector — which includes the primary — the read-serving metric is emitted **pre-averaged over standbys** by the metrics source (§4), so HPA's own averaging is a no-op and the `Rcur = instances − 1` semantics are preserved.
 
 ### 2. Data flow
 
 ```mermaid
 flowchart LR
-    DHA[DatabaseHorizontalAutoscaler CR] -- watch --> OP[db-autoscaler]
-    OP -- HTTP /api/v1/query --> VM[(VictoriaMetrics<br/>vmselect, illustrative)]
-    WM[WorkloadMonitor status] -- operational / availableReplicas --> OP
-    OP -- patch replicas value --> APP[Application spec<br/>apps.cozystack.io]
-    APP -- projection --> HR[HelmRelease values]
-    HR -- Flux --> CR[Engine CR<br/>e.g. CNPG Cluster]
-    CR --> PODS[(replica pods)]
+    HPA[HorizontalPodAutoscaler] -- scale subresource --> CR[Engine CR<br/>e.g. CNPG Cluster .spec.instances]
+    HPA -- external metric --> ADAPTER[metrics adapter]
+    ADAPTER -- HTTP /api/v1/query --> VM[(VictoriaMetrics)]
+    GUARD[db-scaling guard] -- reads lag / quorum --> VM
+    GUARD -- gates min/max on the HPA --> HPA
+    CR -- managed by operator --> PODS[(replica pods)]
+    NOTE[chart no longer templates replicas under autoscaling] -.-> CR
 ```
 
-### 3. Topology adapters
+The engine operator owns instance lifecycle: CNPG adds/removes the highest-ordinal standby gracefully, never the primary, and routes reads through `<release>-ro`. The autoscaler never decides *which* instance to remove.
 
-Engine topology differs, so per-`kind` logic is isolated behind an adapter interface. Only primary-replica engines are scalable; sharded modes return `Scalable=false` with a reason.
+### 3. Chart change: stop declaring `replicas` under autoscaling
 
-```go
-type TopologyAdapter interface {
-    ReplicasPath() string                                         // "replicas" for pg/mariadb/redis/mongo
-    PrimaryCount() int32                                          // CNPG: 1 (non-read-serving instances)
-    QuorumFloor(appValues map[string]any) int32                  // CNPG: quorum.maxSyncReplicas + 1
-    DriverQuery(app types.NamespacedName, k DriverKind) string    // PromQL for read load (per read replica)
-    ReplicationLagQuery(app types.NamespacedName) string          // e.g. cnpg_pg_replication_lag gauge; write-activity gated
-    Scalable(appValues map[string]any) (bool, reason string)      // false for sharded modes
-}
+The decisive change. Each autoscalable app chart wraps its replica field in a conditional so that, when autoscaling is enabled for that application, the field is **omitted** from the rendered engine CR:
+
+```yaml
+# packages/apps/postgres/templates/db.yaml (illustrative)
+spec:
+{{- if not .Values.autoscaling.enabled }}
+  instances: {{ .Values.replicas }}
+{{- end }}
 ```
 
-MVP ships the `postgres` (CNPG) adapter. Follow-ups: `mariadb`, `redis`, `mongodb` (only when `sharding: false`). `clickhouse`, `kafka`, and sharded `mongodb` report `Scalable=false`.
+With the field absent from the HelmRelease values, Flux neither sets nor reverts it, and the HPA is the sole writer of `.spec.instances` via the `scale` subresource. No ownership annotation, no SSA field manager, no admission webhook, and no terminal-freeze conflict handling are needed — they existed only to win a fight this change prevents.
 
-### 4. Reconcile loop
+Migration cost is real and chart-sized, not operator-sized (see [Upgrade and rollback compatibility](#upgrade-and-rollback-compatibility)).
 
-1. Resolve `targetRef` → load the `Application` values and the linked `WorkloadMonitor`.
-2. Ask the adapter `Scalable`? If not → set condition `ScalingActive=False(reason)` and stop.
-3. If `operational=false` **or** a scale is still in flight (`availableReplicas != replicas`) → freeze (single-flight) and requeue.
-4. Query VictoriaMetrics for the driver metric and the replication lag.
-5. Compute `desiredReplicas` per the replica model in §1.
-6. Apply guardrails (see below): clamp to `[min,max]`, quorum floor, lag brake, stabilization windows, step limit, tenant quota.
-7. If `desiredReplicas != currentReplicas` and the decision passes → patch the `Application`'s `replicas` value (server-side apply, see Ownership). Scale-down is handed to the engine operator, which removes the highest-ordinal standby gracefully and stops routing it in `<release>-ro`.
-8. Record convergence in `status.lastConvergedReplicas` **only after observing the autoscaler's own `replicas` write** (matched by its field manager / `managed-by` marker and write generation); if a `spec.force: true` GitOps replacement changed `replicas` in flight, do not record that competing value as converged — keep the freeze and requeue. Then update `status`, set `lastScaleTime`, and emit an Event.
+### 4. Metric source for the HPA
 
-### 5. Guardrails (normative)
+The HPA consumes read-load metrics (`ReadConnections`, `ReadCPUUtilization`) from VictoriaMetrics through a **custom/external metrics adapter**. To preserve multi-tenant isolation, the platform-managed adapter configuration injects a mandatory namespace/label matcher into every query and rejects any query it cannot constrain — never raw tenant-supplied PromQL (the same rule the first revision established). Each series is pre-aggregated over the target's standby pods so the value HPA reads is already per-read-replica.
 
-- `min ≤ desired ≤ max`; at most `behavior.*.step` replicas per decision — **except** that reaching the quorum floor overrides the step limit: `desired` may jump straight to `QuorumFloor` in a single decision, since a safe quorum must never be rate-limited. This is not a freeze; the only freeze in this area is `QuorumExceedsQuota`, when the floor also exceeds the tenant quota.
-- `desired ≥ QuorumFloor(app)`. For CNPG the floor is `maxSyncReplicas + 1`: the chart documents `maxSyncReplicas` as "must be less than total replicas", and dropping to/below it makes CNPG cap/reject the change and can starve synchronous commits (writes stall). The floor also never leaves fewer than `minSyncReplicas` standbys available. Pin this to the CNPG version cozystack ships, since the sync-replica API changed across versions.
-- **Precedence — quota > quorum floor > min/max.** `maxSyncReplicas` is tenant-mutable after the DHA is created, so at runtime `QuorumFloor` (`maxSyncReplicas + 1`) may exceed `minReplicas`/`maxReplicas`, and may even exceed what the tenant quota permits. The resolution order is fixed and unambiguous: (1) the **tenant quota is a hard ceiling and is never exceeded**; (2) subject to that, the **quorum floor wins** over `minReplicas`/`maxReplicas` — `desired` is clamped *up* to the floor (even above `maxReplicas`), never letting `min`/`max` push the cluster below a safe quorum. When these two rules collide irreconcilably — the quorum floor does not fit the quota (raised `maxSyncReplicas` + tight quota) — the operator does **not** patch and freezes with `ScalingLimited=True` reason `QuorumExceedsQuota` (alert), rather than exceeding quota (which would only hit the StuckScaling path) or scaling below a safe quorum.
-- **Lag brake:** replication lag above `maxReplicationLagSeconds` forbids both scale-down and scale-up (`AbleToScale=False`). The signal is the CNPG-exported gauge **`cnpg_pg_replication_lag`** (seconds), already scraped into VictoriaMetrics and used by cozystack's own CNPG dashboards and alerts (`dashboards/db/cloudnativepg.json`, `packages/system/postgres-operator/alerts/`), so no custom query is added. Because that seconds value keeps climbing on a write-idle primary, the brake is **write-activity gated**: it is honoured only while the primary's WAL position is advancing (from CNPG's exported current-vs-`replay_lsn` LSN metrics), so an idle primary does not produce a false freeze during the low-load windows scale-down targets.
-- **Cooldown / stabilization:** separate windows for scale-up and (longer) scale-down; scale-down only when the signal held for the whole window.
-- **Single-flight with convergence deadline:** one change at a time; the next decision only after `operational=true && availableReplicas == replicas`. Because that gate can never clear if a scale-up cannot converge — a new standby rejected by ResourceQuota admission, an unbindable PVC, or an unschedulable pod — a patched change must reach convergence within `behavior.convergenceDeadlineSeconds` (default a small multiple of the scale-up window). On timeout the operator surfaces `AbleToScale=False` with reason `StuckScaling`, alerts, and **rolls `replicas` back to `status.lastConvergedReplicas`**, releasing single-flight so a subsequent scale-down (which may itself relieve the pressure) is not blocked. `status.lastConvergedReplicas` records the last count that reached `availableReplicas == replicas`. Note the tenant-quota pre-check is advisory (a concurrent allocation can consume quota between check and pod creation), so this stuck path is reachable in practice, not just in theory. `lastConvergedReplicas` is initialized from the observed replica count when the DHA first adopts a target (before any scale), and every rollback target is re-validated against the current quorum floor, `maxSyncReplicas`, and tenant quota; if it is unset or no longer safe, the operator freezes without patching rather than rolling back to a stale or unsafe value.
-- **Tenant quota:** the new replica count × preset resources must fit the tenant quota; otherwise `ScalingLimited=True`.
-- **Fail-safe freeze:** if vmselect is unreachable or the metric is missing, do not scale (never scale blind); alert.
-- **dryRun:** decisions are written to status/events but no patch is applied.
+### 5. The thin guard (database-specific brakes)
+
+The only net-new controller. It does **not** compute desired counts or write the engine CR — HPA does both. It watches the target and adjusts the **HPA's `minReplicas`/`maxReplicas`** (and surfaces status/events) to encode what HPA cannot:
+
+- **Quorum floor** — hold `minReplicas ≥ maxSyncReplicas + 1` for CNPG so HPA can never drive the cluster below a safe synchronous quorum. Because `maxSyncReplicas` is tenant-mutable, the guard reconciles the floor into the HPA's `minReplicas` on change; CNPG independently rejects any unsafe count as a backstop.
+- **Replication-lag brake** — when `cnpg_pg_replication_lag` exceeds `maxReplicationLagSeconds` **and the primary is actively writing** (write-activity gated off the exported LSN metrics, so an idle primary does not trip it), the guard pins `maxReplicas = currentInstances` to forbid further scale-up until lag recovers.
+- **Recommendation / dry-run** — a mode where the guard computes and reports the recommendation (status, events, metrics, alerts) without ever unpinning the HPA, so operators can validate behavior before enabling actuation.
+
+Quota is not re-implemented: because HPA scales the engine CR and pod creation passes through the tenant's `ResourceQuota` admission, an over-quota scale-up simply fails to create pods and is reflected in the CR/HPA status — no separate quota pre-check controller is required.
 
 ## User-facing changes
 
-A new namespaced CRD, `DatabaseHorizontalAutoscaler` (group `autoscaling.cozystack.io/v1alpha1`), created by a tenant next to their database application:
+A tenant enables autoscaling on their database and creates a standard HPA next to it. The database-specific brakes are configured on a small guard resource (or, equivalently, annotations on the HPA — final form decided in implementation):
 
 ```yaml
-apiVersion: autoscaling.cozystack.io/v1alpha1
-kind: DatabaseHorizontalAutoscaler
+# 1. turn off the static replica declaration for this app
+apiVersion: apps.cozystack.io/v1alpha1
+kind: Postgres
 metadata: { name: db, namespace: tenant-acme }
 spec:
-  targetRef: { kind: Postgres, name: db }   # apiGroup defaults to apps.cozystack.io
-  minReplicas: 2                            # TOTAL instances (primary + standbys); >= 2 to serve reads
+  autoscaling: { enabled: true }     # chart omits instances; HPA owns it
+---
+# 2. stock HPA on the engine CR's scale subresource
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: db, namespace: tenant-acme }
+spec:
+  scaleTargetRef: { apiVersion: postgresql.cnpg.io/v1, kind: Cluster, name: postgres-db }
+  minReplicas: 2
   maxReplicas: 6
   metrics:
-    - type: ReadConnections                  # | ReadCPUUtilization  (fixed, safe set)
-      target: { averageValue: "150" }        # per read-serving replica
+    - type: External
+      external:
+        metric: { name: cozystack_read_connections, selector: { matchLabels: { app: postgres-db } } }
+        target: { type: AverageValue, averageValue: "150" }
   behavior:
-    scaleUp:   { stabilizationWindowSeconds: 300,  step: 1 }
-    scaleDown: { stabilizationWindowSeconds: 1800, step: 1 }
-    convergenceDeadlineSeconds: 900          # patched scale must converge within this, else StuckScaling + roll back
-  constraints:
-    respectQuorum: true
-    maxReplicationLagSeconds: 30
-    gracefulScaleDown: true                  # operator-native; DHA does not terminate backends
+    scaleUp:   { stabilizationWindowSeconds: 300 }
+    scaleDown: { stabilizationWindowSeconds: 1800 }
+---
+# 3. database-specific brakes (thin guard)
+apiVersion: autoscaling.cozystack.io/v1alpha1
+kind: DatabaseScalingPolicy
+metadata: { name: db, namespace: tenant-acme }
+spec:
+  targetRef: { kind: Postgres, name: db }
+  hpaRef: { name: db }
+  respectQuorum: true
+  maxReplicationLagSeconds: 30
   dryRun: false
-status:
-  currentReplicas: 3
-  desiredReplicas: 4
-  lastConvergedReplicas: 3                    # last count that reached availableReplicas == replicas
-  lastScaleTime: "..."
-  currentMetrics: [ { type: ReadConnections, averageValue: "210" } ]
-  conditions: [ ScalingActive, AbleToScale, ScalingLimited ]   # reasons incl. StuckScaling, QuorumExceedsQuota
 ```
 
-When several `metrics` are set, the desired count is the **maximum** of the per-metric desired counts (HPA semantics). The dashboard can surface the DHA status and scaling events like it does for other application sub-resources. When no DHA references an application, nothing changes.
+When no HPA references an autoscalable app, and `autoscaling.enabled` is false, nothing changes — the chart templates `replicas` exactly as today.
 
 ## Upgrade and rollback compatibility
 
-- **Opt-in and off by default.** The operator ships as an optional platform package, enabled via `bundles.enabledPackages`. Existing clusters, manifests, and APIs are unaffected until a tenant creates a DHA.
-- **Ownership (enforced, not advisory).** While a DHA is active, the autoscaler is the **single explicit owner** of the application's `replicas` value. Enforcement: the operator writes `replicas` via **server-side apply with a dedicated field manager (`db-autoscaler`)** and stamps a marker annotation `autoscaling.cozystack.io/managed-by: <dha-name>` on the `Application`. A competing declarative writer (Flux from a tenant GitOps repo, a human edit) that also claims `replicas` produces an SSA field-manager conflict, which the operator surfaces as a `ScalingLimited`/conflict condition rather than silently fighting. `RetryOnConflict` handles only API-level write races on a single writer — it is **not** the ownership mechanism. **This SSA guarantee holds only against writers that do not force-apply:** a tenant GitOps Flux `Kustomization` with `spec.force: true` (a common setting) takes over the `replicas` managed-fields entry, so the autoscaler's next (non-force) apply is the one that hits the conflict — i.e. the autoscaler loses ownership rather than the competitor. Because SSA alone cannot win against a force-applier, a **validating admission webhook** that rejects conflicting `replicas` writes for DHA-managed applications is **recommended** to close this case deterministically (tracked in Open questions), not merely optional. **Caveat — field-level SSA is not yet confirmed for this API:** `Application` is served by a hand-written `rest.Patcher` (`pkg/registry/apps/application/rest.go`), not a CRD, and its existing conflict test (`rest_conflict_test.go`) covers only `RetryOnConflict` on the backing `HelmRelease` resourceVersion — not per-field managed-fields SSA. If the aggregated Patch handler does not track `.spec.replicas` at field granularity, this ownership model and the `lastConvergedReplicas` rollback silently degrade to advisory. A spike against a real API server (see Testing) must confirm field-level SSA before MVP; **if it does not hold, the admission webhook is mandatory, not merely recommended.**
-- **Rollback.** Deleting the DHA stops all autoscaling immediately (and clears the marker), leaving the application at its current `replicas`. Disabling the package removes the operator; no data migration is involved and the change is fully reversible.
+- **Opt-in and off by default.** The chart conditional is inert unless `autoscaling.enabled` is set; existing clusters and manifests are unaffected. The guard and metrics adapter ship as optional platform packages.
+- **Enabling autoscaling on an existing database (the one real migration).** Flipping `autoscaling.enabled` removes `instances`/`replicas` from the rendered CR. Helm's three-way merge deletes a previously-set field on omission, and CNPG defaults to **1 instance** when `.spec.instances` is unset — so a naive flip would collapse a running cluster to a single instance before the HPA raises it. The rollout must therefore either (a) have the HPA (or the guard) set `.spec.instances` to the current count *before* the field is dropped from the chart, or (b) template a floor via the `scale` subresource so the count never dips below `minReplicas`. This migration path must be exercised on a dev cluster before MVP.
+- **Cold start.** Until the HPA takes its first sample it holds at `minReplicas`; a brief window at the floor is expected.
+- **Dependent objects.** `WorkloadMonitor` and dashboards that read `.Values.replicas` must switch to the observed instance count (`status.instances` / metrics), since the values field is no longer authoritative under autoscaling.
+- **Rollback.** Set `autoscaling.enabled: false` (and delete the HPA): the chart resumes templating `replicas` and Flux reconciles it back. Fully reversible; no data migration.
 
 ## Security
 
-- **RBAC.** The operator needs: read DHA and read/patch `applications.apps.cozystack.io`; read `workloadmonitors.cozystack.io`; read `pods`; read `resourcequotas` (core) for the tenant-quota guardrail; and read-only HTTP to vmselect. The `resourcesPreset → resources` mapping is a static table compiled into the operator from the published cozy-lib preset ladder, so no cluster read of preset definitions is required. The operator has **no** write access to Pods, Services, or Endpoints, **no** exec, and **no** direct access to engine operator CRs or Flux `HelmRelease` objects — only the aggregated apps API.
-- **Multi-tenancy.** DHA is namespaced and lives in the tenant namespace. Tenant access is granted through the platform's RBAC-aggregation mechanism: the DHA package **ships its own self-contained ClusterRoles** labelled `rbac.cozystack.io/aggregate-to-tenant[-view|-admin|-super-admin]: "true"` (per `packages/system/cozystack-basics/templates/clusterroles.yaml`) — it does **not** edit the shared `cozystack-basics` file, whose write tiers grant apps via a hard-coded per-kind allowlist rather than a wildcard. This gives the tenant ServiceAccount full access, human `view` read-only, and `admin`/`super-admin` write on `databasehorizontalautoscalers.autoscaling.cozystack.io`. A tenant can only autoscale its own applications, and scale-up is validated against the tenant quota.
-- **Single active reconciler (HA).** Exactly one instance may act at a time — per-target reconcile state (the `managed-by` marker, single-flight, and the convergence rollback to `lastConvergedReplicas`) assumes a single active writer, never active/active. For availability the operator runs **≥2 replicas with controller-runtime leader-election** (active/standby: the leader reconciles, standbys take over on leader loss), plus pod anti-affinity and a PodDisruptionBudget. `replicas: 1` is a minimum-function default that provides **no** HA (no failover); real HA requires the multi-replica leader-election setup above, which is also what prevents two *active* reconcilers from racing on the annotation write and the rollback decision.
-- **Bounded inputs.** All tenant-supplied DHA fields are enumerable and schema-validated: `minReplicas`/`maxReplicas` (integers), a fixed `metrics[].type` enum (`ReadConnections`, `ReadCPUUtilization`), numeric targets, and windows. Arbitrary tenant-supplied PromQL is **not** accepted (see Alternatives), so there is no path for a tenant query to read another tenant's series from shared vmselect. No new secrets are stored or transmitted.
+- **RBAC (much reduced vs the first revision).** The guard needs: read its own `DatabaseScalingPolicy`; read/update the referenced `HorizontalPodAutoscaler` (`min/maxReplicas`); read `workloadmonitors`; read-only HTTP to vmselect. It needs **no** write access to `Application`/`HelmRelease`, **no** admission webhook, **no** SSA field manager, and **no** engine-CR writes (HPA does that through the `scale` subresource under the tenant's existing RBAC). The metrics adapter is a standard read-only VictoriaMetrics client.
+- **Multi-tenancy.** `DatabaseScalingPolicy` and the HPA are namespaced and live in the tenant namespace; the platform ships self-contained aggregated ClusterRoles (`rbac.cozystack.io/aggregate-to-tenant[-view|-admin]`). The metrics adapter injects a mandatory namespace matcher, so no tenant query can read another tenant's series.
+- **Blast radius.** Because there is no cluster-wide admission webhook, enabling this feature adds no admission hop to unrelated Flux reconciliation — a key regression from the first design is gone.
 
 ## Failure and edge cases
 
-- vmselect unreachable or metric missing → the autoscaler freezes (no scaling) and surfaces `AbleToScale=False`; alert fires.
-- Replication lag above the configured threshold **and the primary is actively writing** → no scale-up and no scale-down until lag recovers. An idle primary does not trip the brake (write-activity gating).
-- Scale still in flight (`availableReplicas != replicas`) → single-flight; the next decision waits for convergence, preventing thrashing.
-- Scale-up patched but never converges (quota-rejected standby, unbindable PVC, unschedulable pod) → after `convergenceDeadlineSeconds` the operator surfaces `AbleToScale=False(StuckScaling)`, alerts, and rolls `replicas` back to `status.lastConvergedReplicas`, so the autoscaler is not frozen and a relieving scale-down can proceed.
-- Target is a sharded engine (e.g. ClickHouse, or MongoDB with `sharding: true`) → `ScalingActive=False` with a clear reason; no action.
-- Desired count would drop to/below the quorum floor (`maxSyncReplicas + 1`) → clamped to the floor; `ScalingLimited=True`.
-- Tenant quota exceeded on scale-up → clamped; `ScalingLimited=True`.
-- Quorum floor exceeds the tenant quota (raised `maxSyncReplicas` + tight quota) → no patch; freeze with `ScalingLimited=True(QuorumExceedsQuota)` and alert — quota is never exceeded and quorum is never violated.
-- A competing writer claims `replicas` → SSA conflict surfaced as a condition; the autoscaler does not enter a write war.
+- vmselect unreachable or metric missing → HPA has no metric and holds the current count (`ScalingActive=False` on the HPA); the guard alerts. No blind scaling.
+- Replication lag above threshold **with an actively-writing primary** → guard pins `maxReplicas = current`, forbidding scale-up until lag recovers. An idle primary does not trip the brake (write-activity gating).
+- Desired count would drop to/below the quorum floor → guard holds `minReplicas ≥ maxSyncReplicas + 1`; CNPG rejects an unsafe count as a backstop.
+- Tenant quota exceeded on scale-up → pods fail `ResourceQuota` admission; the CR/HPA surface the unmet count; no separate freeze path needed.
+- MariaDB target whose chart lacks scale-out support (`replication.replica.bootstrapFrom` unset) → the operator rejects on-the-fly scale-out (`MariaDBScaleOutError`); MariaDB stays out of the enabled set until the chart is fixed.
+- Redis / MongoDB target → no `scale` subresource; rejected by the guard with a clear reason (deferred to the shim follow-up).
+- Sharded engine (ClickHouse, sharded MongoDB) → out of scope; not autoscalable.
 
 ## Testing
 
-- **Unit:** reconcile decisions and each `TopologyAdapter` (including the `PrimaryCount`/`replicas − 1` math and `QuorumFloor = maxSyncReplicas + 1`) with mocked VictoriaMetrics and a mocked Application client (`go test ./internal/controller/...`).
-- **Codegen:** `make generate` produces the CRD and deepcopy without errors.
-- **envtest (apiserver-backed):** the ownership path is exercised against a real API server, since server-side-apply managed-fields conflict semantics do not exist with a mocked client. A competing writer claims `replicas` both without force and with `force: true`, and the test asserts the `autoscaling.cozystack.io/managed-by` marker, the surfaced conflict condition, and the absence of scaling thrash. This is the only layer that actually verifies the ownership guarantee — the mocked unit tests above cannot. The spike also confirms whether the aggregated `apps.cozystack.io` Patch handler tracks `.spec.replicas` managed-fields **at all** (see the Ownership caveat); if it does not, the ownership guarantee falls back to the admission webhook.
-- **Manual (dev cluster, CNPG postgres):** create a DHA with `dryRun: true` → decisions appear in `status`/Events, replicas unchanged. Then disable `dryRun` under read load → the `Application`'s `replicas` grows, CNPG adds a standby, reads route to `<release>-ro`, and Flux does not revert; on load decrease and after the window, scale-down removes a standby gracefully and never drops to/below `maxSyncReplicas + 1`.
-- **Negative:** vmselect down → freeze; lag above threshold with active writes → no scaling; idle primary with high lag-seconds → no false freeze; DHA targeting a sharded ClickHouse → `ScalingActive=False`; concurrent GitOps write to `replicas` → SSA conflict condition, no thrash (covered by the envtest above).
+- **Unit:** the replica-model math and each engine's quorum/lag logic in the guard, with mocked VictoriaMetrics.
+- **Chart:** `helm template` with `autoscaling.enabled: true` omits the replica field; with it false, renders `replicas` exactly as today (regression guard).
+- **Migration (dev cluster, CNPG):** flip `autoscaling.enabled` on a running multi-instance cluster and assert it does **not** collapse to 1 instance (the pre-set-before-omit path), then drive load and confirm HPA scales `.spec.instances`, reads route to `<release>-ro`, and Flux does not revert. This replaces the first revision's force-writer ownership envtest, which is no longer meaningful because there is no ownership to enforce.
+- **Guard integration:** lag above threshold with active writes pins `maxReplicas`; quorum floor tracks `maxSyncReplicas` changes; `dryRun` reports without pinning.
+- **Negative:** vmselect down → no scaling; idle primary with high lag-seconds → no false brake; MariaDB without scale-out → rejected; Redis → rejected.
 
 ## Rollout
 
-1. **PoC** — CNPG PostgreSQL on a dev cluster: DHA + `replicas` patch driven by `ReadConnections`; confirm Flux does not revert and reads route to `<release>-ro`.
-2. **MVP** — the operator plus the `postgres` adapter, full guardrails (quorum, lag, cooldown, quota), `dryRun`, dashboard surface and events. Shipped as an optional `paas`-bundle package that declares a hard `PackageSource.dependsOn`-class dependency on the monitoring stack (VictoriaMetrics/vmselect + `WorkloadMonitor`) — the decision loop cannot function without it, the same cold-install ordering the platform already applies to cert-manager-dependent charts. The operator Deployment runs **≥2 replicas with controller-runtime leader-election** (active/standby, plus pod anti-affinity and a PodDisruptionBudget) so exactly one instance is active at a time — no active/active race on the `managed-by` annotation, single-flight, or the `lastConvergedReplicas` rollback, while still surviving a node/pod failure.
-3. **Adapter expansion** — `mariadb` → `redis` → `mongodb` (replica set).
-4. **Observability & policy** — Grafana dashboard of scaling decisions, alerts for "limit reached / freeze".
+1. **PoC** — CNPG on a dev cluster: chart conditional + a stock HPA on `.spec.instances` driven by `ReadConnections`; confirm Flux does not revert and reads route to `<release>-ro`.
+2. **MVP** — PostgreSQL: the chart change, the metrics adapter (namespace-scoped), the thin guard (quorum floor + lag brake + dry-run), dashboard surface and alerts. Optional packages with a hard dependency on the monitoring stack.
+3. **MariaDB** — once the cozystack mariadb chart supports on-the-fly scale-out.
+4. **Redis / MongoDB** — a follow-up proposal for a thin actuation shim, since neither exposes a `scale` subresource.
 
 ## Open questions
 
-- Adapter order after MVP: `mariadb` → `redis` → `mongodb`?
-- Default driver metric: read connections, read QPS, or replica CPU (to be calibrated on real workloads)?
-- Is scale-down enabled by default, or scale-up only (down conservative/manual)?
-- Ownership enforcement: **does the aggregated `apps.cozystack.io` Patch handler support per-field managed-fields SSA at all** (spike required — see Testing)? If not, the SSA field-manager + marker is insufficient and the validating admission webhook that hard-rejects conflicting `replicas` writes for DHA-managed applications becomes mandatory (it is also the only thing that beats a `spec.force: true` writer).
+- Final form of the database-specific brakes: a small `DatabaseScalingPolicy` CRD, or annotations on the HPA? The former is clearer; the latter avoids any new API surface (see Alternative 1).
+- Which metrics adapter — prometheus-adapter, a KEDA `ScaledObject` external trigger, or a small purpose-built adapter — best fits VictoriaMetrics with mandatory namespace scoping?
+- Migration mechanic for enabling autoscaling on a live cluster: set `.spec.instances` before omitting the chart field, or floor it via the `scale` subresource?
+- Default driver metric (read connections vs read QPS vs replica CPU), to be calibrated on real workloads.
 
 ## Alternatives considered
 
-- **A controller inside `cozystack-controller`** instead of a standalone operator. It would reuse the existing binary, RBAC, and VictoriaMetrics helper, at the cost of coupling the autoscaler's lifecycle to the platform controller. Rejected in favor of a standalone operator for isolation and an independent release cadence; the logic can be moved later if desired.
-- **Patching the engine CR / `HelmRelease` directly.** A direct patch to the operator CR is reverted by Flux. Patching `HelmRelease` values directly is possible but bypasses the supported surface. Note that the `Application` is a pure projection of the `HelmRelease` (rest.go converts both ways, `Values: app.Spec`), so patching the `Application`'s `replicas` **is** writing the same `HelmRelease` values — there is no background regeneration that would clobber it. The reasons to prefer the apps API are validation, label/lineage management, and it being the supported tenant surface, not clobber-avoidance.
-- **Stock HPA + KEDA.** Rejected as the primary mechanism: it only writes a replica count and is topology-unaware — no synchronous-commit quorum floor, no replication-lag gate, and it cannot express which instance to remove (that is the engine operator's job). A KEDA/PromQL-style trigger could be reused *as a metric source inside* the operator only if the operator injects a mandatory tenant/namespace label matcher into every query and rejects any query it cannot constrain — never as raw tenant-supplied PromQL against shared vmselect.
-- **Scaling the write path via sharding.** Out of scope: it requires data rebalancing (Cruise Control for Kafka, resharding for ClickHouse/MongoDB), which is an orchestrated procedure rather than a replica-count change.
+- **A bespoke `db-autoscaler` operator owning `replicas` (the first revision of this proposal).** Rejected after the implementation spike. It required re-drawing HPA's API surface field-for-field (`metrics[].target.averageValue`, `behavior.*.stabilizationWindowSeconds`, the `ScalingActive`/`AbleToScale`/`ScalingLimited` conditions) and re-implementing HPA's decision loop; and its ownership guarantee proved unbuildable on the aggregated apps API ([Findings](#findings-from-the-implementation-spike)) — SSA does not hold, admission cannot fire there, and the fallback HelmRelease webhook is advisory, bypassable by tenant edits, and a platform-wide admission hop. The present design keeps HPA's hardened decision loop and confines net-new code to the two brakes HPA genuinely lacks.
+- **HPA writing the `Application`'s `replicas` value (apps API) instead of the engine CR.** This is what the first revision did; it is the source of the whole ownership problem, because the apps values are declared in Git and reverted by Flux. Writing the engine CR's `scale` subresource while the chart omits the field (this design) avoids the conflict at its root.
+- **Not creating any new API at all.** The brakes could be expressed as annotations on a stock HPA rather than a `DatabaseScalingPolicy` CRD, eliminating the new API group entirely. Kept as an open question; the CRD is proposed only for clarity, not necessity.
+- **A thin actuation shim for engines without a `scale` subresource (Redis, MongoDB).** For these, HPA cannot act directly. A minimal shim that watches a stock HPA's recommendation and propagates it behind the same brakes is the honest path — deferred to a follow-up, since the MVP targets engines that already have a `scale` subresource.
+- **Stock HPA + KEDA with tenant-supplied PromQL.** Rejected for the metric-source layer: raw tenant PromQL against shared vmselect breaks tenant isolation. A KEDA/prometheus-adapter trigger is acceptable **only** with a platform-injected, mandatory namespace matcher — the constraint carried over from the first revision.
+- **Scaling the write path via sharding.** Out of scope: it requires data rebalancing, an orchestrated procedure rather than a replica-count change.
 
 ---
 
