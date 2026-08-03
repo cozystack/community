@@ -25,7 +25,7 @@ In scope: a traces backend (per-tenant and, as an opt-in, shared-central), an OT
 - **Collection agents:** `packages/system/monitoring-agents` (fluent-bit, vmagent) — the *deployment* pattern the collector borrows, but note the traffic model differs (see [§2](#2-multitenancy-and-network-model-the-core-decision)).
 - **Network policy:** `packages/apps/tenant/templates/networkpolicy.yaml` — the Cilium tenant-isolation policies this design must live within.
 - **Prior art in-repo:** Harbor exposes an internal, app-local trace config (`packages/system/harbor/charts/harbor/values.yaml`, provider `jaeger`/`otel`); it is not a platform backend. This proposal supersedes ad-hoc per-app trace endpoints with a shared destination.
-- **Driver:** requested by a client (hidora) who needs request-level visibility across managed DBaaS and messaging services.
+- **Driver:** requested by adopters of Cozystack who need request-level visibility across managed DBaaS and messaging services.
 
 ## Context
 
