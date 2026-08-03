@@ -19,6 +19,7 @@ This proposal touches the `ApplicationDefinition` shape and the tenant contract,
 - **[Fold `extra` into `apps`](https://github.com/cozystack/community/pull/39)** makes tenant modules regular applications and moves their distinguishing traits into declarative capabilities on `ApplicationDefinition`. It sets the precedent this proposal follows, per-kind behavior expressed as data on the definition rather than as a directory or a code branch, and it resolves one of the [open questions](#open-questions) below: once `monitoring`, `ingress`, `etcd` and `seaweedfs` are applications, they carry their own `reservation` block and are charged like any other application, instead of being special-cased from the Tenant's boolean flags.
 - **`proposal/application-definition-versioning`** (branch on this repository, by `@kvaps`, not yet a PR) splits `ApplicationDefinition` into per-version `ApplicationSchema` objects and converts tenant-supplied values into a single **storage version** before persisting them into the HelmRelease. The two compose cleanly: reservation is evaluated against the storage form, so an application declares its reservation **once**, against the storage version, and served versions inherit it through the existing conversion. If that proposal lands first, `spec.reservation` moves to the storage-version `ApplicationSchema` with no change in semantics.
 - **[Public IPs as a first-class resource](https://github.com/cozystack/community/pull/35)** would make a public address a `PublicIPClaim` rather than an implicit consequence of `external: true`. The `objects:` block in [§2](#2-specreservation-on-applicationdefinition) is the interim form: when addresses become claimable objects, `services.loadbalancers` counting should follow the claims instead of the boolean.
+- **[`kubernetes-nodes-split`](../kubernetes-nodes-split/README.md)** (Accepted) is the one whose ordering matters most here. Phase 1 has landed on `main`: `KubernetesNodes` is already a registered application kind with its own `ApplicationDefinition` (`packages/system/kubernetes-nodes-rd/cozyrds/kubernetes-nodes.yaml`), carrying `minReplicas`, `maxReplicas`, `instanceType`, `resources` and `diskSize` at the top level of its values. Phase 2 ([cozystack/cozystack#3315](https://github.com/cozystack/cozystack/pull/3315), open, breaking) removes `spec.nodeGroups` from the `Kubernetes` CR and, with it, the implicit `md0` default. This proposal is markedly simpler on the far side of that change: worker-pool reservation becomes a flat block on `KubernetesNodes`, and the one awkward case in [§2](#2-specreservation-on-applicationdefinition) disappears entirely. Landing #3315 before phase 4 of the [rollout](#rollout) is preferable but not required.
 - **[Database Horizontal Autoscaler](../database-horizontal-autoscaling/README.md)** lists "honor tenant quotas" as a goal and applies its decisions by patching the `Application`'s `replicas` value. This proposal defines what honoring the quota means on that path: an autoscaler scale-up is an `Update` through the same admission gate as a human edit and is rejected when the pool has no room. That is a behavioral requirement for DHA, not an optional integration.
 - Any new application kind, such as the one in [`compute-plane`](../compute-plane/README.md), needs a `reservation` block to participate in quotas. By design that is a data change in the package.
 - **Deferred to separate work:** the root cause of `ResourceQuota.status.used` going stale (a kube-controller-manager behavior, see [The problem](#the-problem)), drift alerting, and a remediation runbook for already-affected namespaces. This proposal removes that counter from the tenant-facing contract; it does not fix it.
@@ -181,13 +182,17 @@ type ApplicationDefinitionReservation struct {
 type ReservationItem struct {
     // ForEach iterates a list- or map-valued values path; every other path in
     // this item is then resolved relative to each element (map values are
-    // iterated, keys are ignored). Cozystack uses both shapes: vm-instance's
-    // disks is a list, kubernetes' nodeGroups is a map[string]NodeGroup.
+    // iterated, keys are ignored). Its only in-tree consumer is the parent
+    // kubernetes chart's nodeGroups map, which is transitional: once
+    // cozystack/cozystack#3315 lands, pools are KubernetesNodes resources and
+    // nothing in tree needs iteration. Kept because a kind with repeated sized
+    // sub-objects is a shape worth supporting, but droppable if it stays unused.
     // +optional
     ForEach string `json:"forEach,omitempty"`
 
-    // Count is a fixed multiplier (default 1). CountFrom reads it from an
-    // integer-valued values path. At most one may be set.
+    // Count is a fixed multiplier (default 1) applied to both the compute and
+    // the storage of this item. CountFrom reads it from an integer-valued
+    // values path. At most one may be set.
     // +optional
     Count *int32 `json:"count,omitempty"`
     // +optional
@@ -264,6 +269,20 @@ spec:
 ```
 
 ```yaml
+# packages/system/kubernetes-nodes-rd/cozyrds/kubernetes-nodes.yaml
+# A worker pool is already its own kind on main (kubernetes-nodes-split
+# phase 1), so its reservation is flat: no iteration, no chart-computed
+# default. count multiplies both the compute and the storage of the item.
+spec:
+  reservation:
+    items:
+      - countFrom: maxReplicas
+        instanceTypeFrom: instanceType
+        resourcesFrom: resources
+        storageFrom: diskSize
+```
+
+```yaml
 # packages/system/kubernetes-rd/cozyrds/kubernetes.yaml
 spec:
   reservation:
@@ -276,17 +295,26 @@ spec:
         resourcesFrom: controlPlane.scheduler.resources
       - presetFrom: controlPlane.konnectivity.server.resourcesPreset
         resourcesFrom: controlPlane.konnectivity.server.resources
+      # Transitional: worker pools still owned by the parent chart until
+      # cozystack/cozystack#3315 removes spec.nodeGroups. Drops out then.
       - forEach: nodeGroups
         countFrom: maxReplicas
         instanceTypeFrom: instanceType
         resourcesFrom: resources
+        storageFrom: diskSize
 ```
 
 A kind without a `reservation` block reserves nothing, which keeps the change additive and lets the rollout proceed package by package.
 
-**Where a values path is not enough.** The evaluator reads values, but a chart may synthesize workloads that the values do not mention. The known case is `kubernetes`: with `nodeGroups: {}` the chart still emits a default `md0` group, so a literal read charges nothing for a cluster that can autoscale to ten workers. A declarative path expression cannot see that.
+**Where a values path is not enough, and why that is temporary.** The evaluator reads values, so a workload a chart synthesizes without mentioning it in the values is invisible to it. Exactly one such case exists in tree, and it is on its way out.
 
-Rather than add a general escape hatch, which would put arbitrary chart logic back into the reservation contract, the resolution is narrow: for paths whose default is computed by a named chart helper, the evaluator resolves the helper's output instead of the raw values, so for `kubernetes` that is `kubernetes.nodeGroups` rather than `.nodeGroups`. This keeps exactly one such indirection per affected kind, makes it explicit in the definition, and pins it with a unit test asserting that the reservation of the default values matches what the chart actually renders. The alternative, and the cleaner long-term fix, is for charts to stop defaulting in templates and materialize such defaults into the values instead; that is a broader change than this proposal.
+On `main` today, `kubernetes.nodeGroups` (`packages/apps/kubernetes/templates/_helpers.tpl`) emits a default `md0` pool with `maxReplicas: 10` whenever `.Values.nodeGroups` is empty. [cozystack/cozystack#2936](https://github.com/cozystack/cozystack/pull/2936) made that default *removable*, so it now applies only when no pool is declared and migration 47 pins it explicitly on existing clusters, but it is still emitted for a cluster that declares none. A literal read of `nodeGroups` therefore charges nothing for a cluster that can autoscale to ten workers, which is an under-charge and so a quota hole.
+
+Two ways to close it. The narrow one is to resolve the named chart helper rather than the raw path for this single kind, which works but puts a slice of chart logic into the reservation contract. The better one is to let [`kubernetes-nodes-split`](#scope-and-related-proposals) close it: [#3315](https://github.com/cozystack/cozystack/pull/3315) removes `spec.nodeGroups` and the implicit `md0` with it, and worker pools become `KubernetesNodes` resources whose sizing sits at the top level of their own values, with nothing implicit left to resolve.
+
+This proposal therefore does **not** introduce a general escape hatch. It keeps the evaluator a pure function of stored values, treats the `md0` default as a transitional exception covered by the per-kind unit test, and prefers ordering phase 4 of the [rollout](#rollout) after #3315 so the exception is never written. If #3315 slips, the narrow helper resolution is the fallback, scoped to one kind and one path.
+
+The general principle is worth stating for future kinds: a chart that defaults a *sized* field in a template rather than in its values makes itself unquotable. Materializing such defaults into the values is the pattern to follow.
 
 ### 3. Resolving instance types and presets
 
@@ -379,7 +407,7 @@ The inflation factor therefore changes role rather than disappearing. It moves f
 
 - `tenant.spec.resourceQuotas` keeps its shape and its meaning. It becomes exact: `memory: 16Gi` means 16Gi of guest memory, and a tenant can use all of it.
 - Non-Tenant kinds gain admission errors they did not have. Previously an over-quota application was accepted and failed later as a rejected pod, surfacing as a `CrashLoopBackOff` or an unschedulable workload. Now the request is refused at the moment it is made, naming the pool and the size. This is a diagnostic improvement, but it is a new rejection surface for clients and tooling.
-- **Autoscaled node groups reserve at `maxReplicas`.** A `kubernetes` application with `maxReplicas: 10` reserves ten workers even while running zero. This is the conservative choice for capacity, and it is a visible change for tenants who set wide autoscaling bounds. See [Open questions](#open-questions).
+- **Autoscaled worker pools reserve at `maxReplicas`.** A `KubernetesNodes` pool with `maxReplicas: 10` reserves ten workers even while running zero. This is the conservative choice for capacity, and it is a visible change for tenants who set wide autoscaling bounds. See [Open questions](#open-questions).
 - **Halted VMs still reserve.** A `runStrategy: Halted` VM consumes its quota, because reservation is not usage. This is intentional and central to the model, and it differs from today, where a stopped VM frees its quota.
 - Tenant modules enabled by flag (`monitoring`, `ingress`, `etcd`, `seaweedfs`) reserve their components' sizes.
 - Each pool reports `reserved` and `budget`, exposed for the dashboard and for billing.
@@ -391,7 +419,7 @@ The semantic change is opt-in, behind a flag on both `cozystack-api` and `cozyst
 
 The upgrade has one consequence that no migration can handle automatically. Operators who inflated a tenant's quota to work around the overhead, which is the documented workaround for the failure in [The problem](#the-problem), will find that inflation is now usable reservation, so those tenants gain real capacity. A migration cannot tell which part of a declared quota was headroom and which was the intended contract. This is therefore documented rather than automated, and the `reserved`/`budget` reporting is introduced in the same release so the gap is visible before the flag is flipped.
 
-In the other direction, reserving autoscaled node groups at `maxReplicas` can make a write that used to succeed fail. Clusters with wide autoscaling bounds should check pool headroom before enabling the flag.
+In the other direction, reserving autoscaled worker pools at `maxReplicas` can make a write that used to succeed fail. Clusters with wide autoscaling bounds should check pool headroom before enabling the flag.
 
 Rollback is turning the flag off, for every step except the last: retiring `tenant-quota-allocated` is irreversible in the sense that the objects are deleted, and it is deliberately sequenced after the flag has been on across a release.
 
@@ -409,7 +437,8 @@ Rollback is turning the flag off, for every step except the last: retiring `tena
 - `instanceType` names a `VirtualMachineClusterInstancetype` that does not exist → rejected at admission with the resolver's error, instead of later by the chart's `lookup` failure in `templates/vm.yaml`.
 - Both `instanceType` and `resources` set → the evaluator charges `resources`, matching the precedence the `kubernetes` chart documents on `nodeGroups[].resources`. Note that `packages/apps/vm-instance` does not currently omit the instancetype in that case the way the `kubernetes` chart does, so the rendered `VirtualMachine` carries both and KubeVirt cannot reconcile them; tightening that chart is out of scope here but worth a separate fix, and the reservation charges the same number either way.
 - Explicit `resources` with no `instanceType` → charged from `resources`, matching `virtual-machine.domainResources` in `packages/apps/vm-instance/templates/_helpers.tpl`.
-- **`nodeGroups: {}` on a `kubernetes` application** → the chart still emits a default `md0` group (`minReplicas: 0`, `maxReplicas` defaulted), so a literal read of `nodeGroups` charges nothing while the cluster can autoscale to ten workers. The evaluator must resolve the same default the chart does, via `kubernetes.nodeGroups`, rather than reading the raw values. This is the one place where a values-path evaluator is not sufficient on its own, and it is an under-charge, so it must be covered by the per-kind unit test.
+- **`nodeGroups: {}` on a `kubernetes` application, while the parent chart still owns pools** → the chart emits a default `md0` group with `maxReplicas: 10`, so a literal read charges nothing for a cluster that can autoscale to ten workers. Covered by the per-kind unit test and resolved for good by [#3315](https://github.com/cozystack/cozystack/pull/3315); see [§2](#2-specreservation-on-applicationdefinition).
+- **A `KubernetesNodes` pool whose name collides with a `nodeGroup` still owned by the parent** → the render already fails on ownership conflict, as its own schema documents. Reservation would have charged the pool twice, once per owner, so failing early is the correct outcome and no special case is needed.
 - Concurrent creates in different member namespaces of one pool → both may pass, overshooting by at most one application. The controller reports the overshoot; nothing is evicted.
 - Parent lowers its quota below existing carve-outs → `Overcommitted` reports it, as today. No retroactive enforcement.
 - `vm-disk` resized upward → the `Update` path charges the delta; a downward resize releases it.
@@ -433,7 +462,7 @@ Rollback is turning the flag off, for every step except the last: retiring `tena
 | Phase | Contents | Flag |
 |---|---|---|
 | 1 | `pkg/reservation` (resolver, evaluator, aggregator, preset table, parity test), no consumer | n/a |
-| 2 | `spec.reservation` on `ApplicationDefinition`; blocks for the IaaS kinds (`vm-instance`, `vm-disk`, `kubernetes`), which carry the whole overhead problem | n/a |
+| 2 | `spec.reservation` on `ApplicationDefinition`; blocks for the IaaS kinds (`vm-instance`, `vm-disk`, `kubernetes`, `kubernetes-nodes`), which carry the whole overhead problem | n/a |
 | 3 | Usage oracle switchable; gate generalized to kinds that have a block; `reserved`/`budget` reporting | off by default |
 | 4 | Remaining kinds, package by package, until the completeness test covers all of them | on by default |
 | 5 | Guard requalified (loose factor), `EnforcedHard` / `tenant-quota-allocated` removed, `--tenant-quota-buffer-percent` deprecated, flag removed | removed |
@@ -442,12 +471,12 @@ Phases 1 to 3 form a self-contained, testable increment and are what implementat
 
 ## Open questions
 
-- **`maxReplicas` or `minReplicas` for autoscaled node groups?** Reserving the maximum is safe for capacity but charges idle tenants for headroom they may never use, and it can reject writes that succeed today. Reserving the minimum matches billing intuition but lets a pool be oversubscribed by autoscaling, which pushes the failure back to pod admission, exactly what this proposal removes. A third option is to reserve the minimum and have the autoscaler's own `Update` be the gate, accepting that a scale-up can fail.
+- **`maxReplicas` or `minReplicas` for an autoscaled `KubernetesNodes` pool?** Reserving the maximum is safe for capacity but charges idle tenants for headroom they may never use, and it can reject writes that succeed today. Reserving the minimum matches billing intuition but lets a pool be oversubscribed by autoscaling, which pushes the failure back to pod admission, exactly what this proposal removes. A third option is to reserve the minimum and let the write that raises the count be the gate; that works for a human edit and for the [DHA](#scope-and-related-proposals), which both go through `Update`, but not for the cluster-autoscaler, which scales the live MachineDeployment without touching the CR. That asymmetry is the strongest argument for reserving the maximum.
 - **Should tenant module flags reserve?** This proposal says yes, since those components consume real capacity and the tenant asked for them. It does change the effective consumption of existing tenants at flag-flip time. [PR #39](https://github.com/cozystack/community/pull/39) makes this question disappear by turning the modules into applications with their own reservation blocks; if #39 lands first, the special case is never written.
 - **Where should the preset table live?** In Go with a parity test, as proposed, or exported as a ConfigMap by the platform chart so there is literally one copy. The ConfigMap adds a read dependency to the admission path; the Go table adds a test-enforced duplicate.
 - **Is a deliberately loose guard quota acceptable?** The alternative is to drop it and wire the `LimitRange` and `AutoResourceLimitsGate` independently of `resourceQuotas`, which is cleaner but changes virt-launcher QoS and needs its own migration.
 - **Should `storage` be charged from the declared `vm-disk` size or from the resulting PVC request?** They can differ when a chart rounds or adds a WAL volume.
-- **How far should chart-computed defaults be accommodated?** The `md0` case in [§2](#2-specreservation-on-applicationdefinition) is handled by resolving one named helper per affected kind. Is that acceptable, or should charts be required to materialize such defaults into values so the reservation contract stays a pure function of the stored values? The latter is cleaner and larger, and it would also help [`application-definition-versioning`](#scope-and-related-proposals), whose conversion is likewise a function of values.
+- **Should charts be required to materialize sized defaults into their values?** This proposal keeps the evaluator a pure function of stored values and relies on [#3315](https://github.com/cozystack/cozystack/pull/3315) to retire the one in-tree exception. Making that a rule for all future kinds would prevent the class of hole rather than the instance, and it would equally help [`application-definition-versioning`](#scope-and-related-proposals), whose conversion is likewise a function of values.
 
 ## Alternatives considered
 
