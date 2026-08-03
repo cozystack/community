@@ -2,18 +2,18 @@
 
 Welcome to the central hub for the Cozystack community!
 
-This repository serves as the home for everything related to how we collaborate, grow, and support each other as users,
-contributors, and maintainers of the Cozystack platform.
+This repository serves as the home for everything related to how we collaborate, grow, and support each other as users, contributors, and maintainers of the Cozystack platform.
 
 ## Purpose
 
-This repo contains (or will contain soon):
+This repo contains:
 
--   Community resources and helpful links
--   Contribution guidance and how to get involved
--   Governance documents and decision-making processes
--   Feature proposals and discussions
--  ️ Meeting notes and community calls                                     
+-   [Design proposals](./design-proposals/README.md) — cross-cutting and architectural changes
+-   [The community meeting](./community_meeting.md) — when it happens, how to join, how to add a topic
+-   [The meeting archive](./meetings/README.md) — every past meeting, its topics and its recording
+-   Community resources and helpful links (below)
+
+Governance documents live in the [cozystack/cozystack](https://github.com/cozystack/cozystack) repository: [GOVERNANCE.md](https://github.com/cozystack/cozystack/blob/main/GOVERNANCE.md), [CONTRIBUTOR_LADDER.md](https://github.com/cozystack/cozystack/blob/main/CONTRIBUTOR_LADDER.md) and [MAINTAINERS.md](https://github.com/cozystack/cozystack/blob/main/MAINTAINERS.md).
 
 We aim to make contributing to Cozystack open, transparent, and rewarding.
 
@@ -38,21 +38,33 @@ Cozystack work is split across two repositories. This repo is for **how we decid
 -   [Cloud Native Computer Foundation (CNCF)](https://www.cncf.io/) — the foundation providing open governance and infrastructure support.
 -   [Aenix](https://aenix.io) – the original creators of Cozystack and its current lead maintainers under CNCF governance.
 
+## Meetings and recordings
+
+The community meeting runs every second Thursday at 18:00 CET and is open to everyone. See [community_meeting.md](./community_meeting.md) for the joining link, the agenda format and how to put a topic on it, and [meetings/README.md](./meetings/README.md) for the archive of past meetings.
+
+Recorded video lives on YouTube:
+
+| Playlist | What it is |
+|---|---|
+| [Cozystack Community meetings](https://www.youtube.com/playlist?list=PLEIgpkcPkMHaXqndo8iMMLS64p4sBkHPg) | Every recorded community meeting since April 2024 |
+| [CozySummit Virtual 2026](https://www.youtube.com/playlist?list=PLj6h78yzYM2OaFRU_tk-9zT62p3aSvu8W) | The 2026 online summit, hosted on the CNCF channel |
+| [CozySummit'25 Virtual](https://www.youtube.com/playlist?list=PLEIgpkcPkMHZhS0thzOsjKsRf-omGlpbD) | The 2025 online summit |
+| [CNCF webinars](https://www.youtube.com/playlist?list=PLEIgpkcPkMHZQ68oqHkfydnANW6qVgQSQ) | Cozystack webinars run with the CNCF |
+
 ## Get Involved
 
 Whether you're reporting an issue, proposing a feature, joining a working group, or just curious — you're welcome here!
 
 -   Check out the [CONTRIBUTING.md](https://github.com/cozystack/cozystack/blob/main/CONTRIBUTING.md)
-    file to learn more about how to participate.
+file to learn more about how to participate.
 -   You can also review our [GOVERNANCE.md](https://github.com/cozystack/cozystack/blob/main/GOVERNANCE.md)
-    to understand how decisions are made and how maintainers operate.
+to understand how decisions are made and how maintainers operate.
 -   We follow the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/master/code-of-conduct.md)
-    to ensure a respectful and inclusive environment for all community members.
+to ensure a respectful and inclusive environment for all community members.
 -   If you're using Cozystack, feel free to [add yourself to the ADOPTERS.md](https://github.com/cozystack/cozystack/blob/main/ADOPTERS.md)
-    — we'd love to hear from you!
+— we'd love to hear from you!
 -   Thinking about a big feature or architectural change? Start with our [design proposal guidelines](./design-proposals/README.md) to ensure a structured and collaborative discussion.
 
 ## Inspiration
 
-This repository draws best practices and structural inspiration from the [KubeVirt community repository](https://github.com/kubevirt/community),
-which sets a great example of open collaboration in cloud-native infrastructure.
+This repository draws best practices and structural inspiration from the [KubeVirt community repository](https://github.com/kubevirt/community), which sets a great example of open collaboration in cloud-native infrastructure.
