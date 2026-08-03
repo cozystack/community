@@ -3,7 +3,7 @@
 - **Title:** `Tenant quotas as reservation limits`
 - **Author(s):** `@mattia-eleuteri`
 - **Date:** `2026-08-03`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
