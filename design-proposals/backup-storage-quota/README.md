@@ -166,59 +166,133 @@ mechanisms, both worth having:
    bucket for a namespace after purging storage by hand, for drivers with no
    enumeration API.
 
-### 3. Where the numbers live
+### 3. Where the numbers live: `corev1.ResourceQuota`
 
-Backup quota does **not** extend `corev1.ResourceQuota`. Two reasons:
-
-- `ResourceQuota.status` is owned by kube-controller-manager's quota
-  controller, which recomputes it from its own evaluators. Co-writing a
-  dimension it does not know about is at best undefined and at worst a flapping
-  write war between two controllers. (See "Open questions" — if it turns out
-  upstream reliably preserves foreign dimensions, mirroring becomes attractive
-  and this decision should be revisited.)
-- The `used` figure here is not a simple function of live objects. Modelling
-  `retained` inside a `ResourceQuota` status has nowhere to go.
-
-Instead, a namespaced CR:
+Backup quota uses two new extended dimensions on the tenant's existing
+`ResourceQuota`, rather than a new CRD:
 
 ```yaml
-apiVersion: backups.cozystack.io/v1alpha1
-kind: BackupQuota
+apiVersion: v1
+kind: ResourceQuota
 metadata:
-  name: default
+  name: tenant-quota
   namespace: tenant-acme
 spec:
   hard:
-    size: 500Gi      # total stored bytes; omit for unlimited
-    count: 200       # number of Backup objects; omit for unlimited
+    requests.cpu: "20"
+    services.loadbalancers: "5"
+    backups.cozystack.io/size: 500Gi     # total stored bytes
+    backups.cozystack.io/count: "200"    # number of Backup objects
 status:
+  hard:
+    ...                                  # kube-controller-manager mirrors spec
+    backups.cozystack.io/size: 500Gi
   used:
-    size: 412Gi
-    count: 137
-  attributed:
-    size: 380Gi
-  retained:
-    size: 32Gi       # deleted CRs whose artifacts the driver still holds
-  conditions:
-    - type: SizeExceeded
-      status: "False"
-    - type: UsageStale        # reconciliation is behind; gate fails closed
-      status: "False"
-  observedGeneration: 3
-  lastReconcileTime: "2026-08-04T09:12:00Z"
+    requests.cpu: "12"
+    backups.cozystack.io/size: 412Gi     # written by the backup quota controller
+    backups.cozystack.io/count: "137"
 ```
 
-Absent `spec.hard` dimension means unlimited, matching `ResourceQuota`
-semantics. Multiple `BackupQuota` objects in a namespace sum per dimension, so
-a platform baseline and a per-tenant grant can coexist.
+Tenants read backup consumption from `kubectl describe resourcequota`, next to
+every other limit, and no new API surface is introduced.
 
-The tenant chart gains a values passthrough alongside `resourceQuotas`:
+The obvious objection is that `ResourceQuota.status` already has two writers —
+kube-controller-manager's quota controller and the ResourceQuota admission
+plugin — and neither knows what `backups.cozystack.io/size` is. Adding a third
+writer sounds like a write war. It is not, and the reason is worth recording
+because the whole design rests on it. Reading upstream at `v1.35`:
+
+**kube-controller-manager preserves foreign dimensions.**
+`pkg/controller/resourcequota/resource_quota_controller.go`, `syncResourceQuota`:
+
+```go
+used := v1.ResourceList{}
+if resourceQuota.Status.Used != nil {
+    used = quota.Add(v1.ResourceList{}, resourceQuota.Status.Used)  // seed from existing
+}
+hardLimits := quota.Add(v1.ResourceList{}, resourceQuota.Spec.Hard)
+
+newUsage, err := quota.CalculateUsage(..., hardLimits, rq.registry, ...)
+for key, value := range newUsage {
+    used[key] = value                                               // overwrite only computed keys
+}
+
+hardResources := quota.ResourceNames(hardLimits)
+used = quota.Mask(used, hardResources)                              // keep only keys present in spec.hard
+```
+
+The sync seeds `used` from what is already published, overwrites only the keys
+its own evaluators computed, and masks the result to the key set of
+`spec.hard`. A dimension that is in `spec.hard` and in `status.used` but has no
+evaluator is therefore carried through untouched. `CalculateUsage`
+(`k8s.io/apiserver/pkg/quota/v1/resources.go`) intersects `hard` with the
+resources its evaluators match, so an unrecognised name is skipped silently —
+it is not an error, and the sync completes normally.
+
+As a bonus, the same function sets `Status.Hard = spec.Hard` wholesale, so
+kube-controller-manager publishes the backup *limit* for us. Only `status.used`
+needs writing.
+
+**The admission plugin is additive.**
+`k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go`:
+
+```go
+requestedUsage := quota.Mask(deltaUsage, hardResources)
+newUsage := quota.Add(resourceQuota.Status.Used, requestedUsage)
+...
+outQuotas[index].Status.Used = newUsage
+```
+
+It adds a delta to the existing `Status.Used` rather than recomputing it, so
+foreign keys survive every admission-time write.
+
+**An unpublished backup dimension cannot block unrelated admission.** The
+plugin refuses a request when a quota has no usage figure for a dimension it
+cares about — but "cares about" is `restrictedResources :=
+evaluator.MatchingResources(hardResources)`, computed from the *incoming
+object's* evaluator. `hasUsageStats` then skips every resource outside that
+set. A Pod create is evaluated by the Pod evaluator, which never matches
+`backups.cozystack.io/size`, so a missing or lagging backup figure can never
+403 a Pod.
+
+**Consequence: enforcement and visibility are independently switchable.**
+`backups.cozystack.io/size` in `spec.hard` is completely inert to
+kube-apiserver — no evaluator claims it, so nothing native enforces it. It is a
+declared limit that only our webhook acts on. An operator can therefore set the
+dimension and get accurate usage reporting with *no* enforcement simply by not
+enabling the webhook. That is what makes the phased rollout below real rather
+than aspirational.
+
+**Consequence: reporting requires a declared limit.** Because `Mask` drops keys
+absent from `spec.hard`, usage cannot be published for a dimension that has no
+limit. "Unlimited but measured" is not expressible; an operator who wants
+visibility without a meaningful cap must set a deliberately high one.
+
+#### Where the `retained` breakdown goes
+
+`status.used` carries the total that enforcement acts on —
+`attributed + retained`. The breakdown does not fit in a `ResourceList` and does
+not belong there: it is diagnostic, not a limit. It is exposed as controller
+metrics (`cozystack_backup_quota_attributed_bytes`,
+`..._retained_bytes`, labelled by namespace) and mirrored into an annotation on
+the `ResourceQuota` for `kubectl`-level debugging. An operator asking "why is
+this tenant at their cap when they have no backups?" gets the answer from
+either.
+
+The tenant chart expresses the limits through the existing `resourceQuotas`
+values path, so no new values schema is needed:
 
 ```yaml
-backupQuota:
-  size: 500Gi
-  count: 200
+resourceQuotas:
+  backups.cozystack.io/size: 500Gi
+  backups.cozystack.io/count: 200
 ```
+
+Note that `cozy-lib.resources.flatten` currently prefixes unrecognised keys
+into `limits.`/`requests.` sections; these two names must be added to its
+`$rawQuotaKeys` passthrough list, the same fix pattern as
+[cozystack#1636](https://github.com/cozystack/cozystack/issues/1636) applied to
+`services.loadbalancers`.
 
 ### 4. Enforcement
 
@@ -231,11 +305,11 @@ sequenceDiagram
     participant API as kube-apiserver
     participant W as backup-quota webhook
     participant S as Strategy controller
-    participant Q as BackupQuota controller
+    participant Q as Backup quota controller
 
     T->>API: create BackupJob
     API->>W: AdmissionReview
-    W->>W: read BackupQuota.status.used + spec.hard
+    W->>W: read ResourceQuota status.used + status.hard
     alt used >= hard
         W-->>API: Denied (quota exceeded)
         API-->>T: 403
@@ -245,7 +319,7 @@ sequenceDiagram
         S->>S: run driver
         S->>API: create Backup (status.artifact.sizeBytes)
         API->>Q: watch event
-        Q->>API: patch BackupQuota.status.used
+        Q->>API: patch ResourceQuota status.used
     end
 ```
 
@@ -271,9 +345,11 @@ estimate. Deferred as a follow-up so that the ledger lands first.
 
 ## User-facing changes
 
-- New CRD `BackupQuota` (namespaced), readable by tenants — a tenant can finally
-  answer "how much am I using".
-- New tenant chart values `backupQuota.size` / `backupQuota.count`.
+- Two new dimensions visible in `kubectl describe resourcequota` — a tenant can
+  finally answer "how much backup storage am I using". No new CRD, no new place
+  to look.
+- New `resourceQuotas` keys in the tenant chart:
+  `backups.cozystack.io/size` and `backups.cozystack.io/count`.
 - `BackupJob` CREATE can now be rejected with a quota message naming the
   dimension and the figures.
 - A denied scheduled run surfaces on `Plan` status and as an event; the
@@ -283,9 +359,11 @@ estimate. Deferred as a follow-up so that the ledger lands first.
 
 ## Upgrade and rollback compatibility
 
-Additive. No `BackupQuota` object means no enforcement, so existing clusters
-behave exactly as before until an operator opts in — the same posture as
-`resourceQuotas` today.
+Additive. A `ResourceQuota` without the backup dimensions behaves exactly as
+before, so existing clusters are untouched until an operator adds the keys —
+the same posture as every other entry in `resourceQuotas` today. The dimensions
+are inert to kube-apiserver, so even a cluster that sets them without running
+the webhook loses nothing but gains reporting.
 
 The webhook is the one risky component: registering it adds a dependency to
 `BackupJob` CREATE that did not exist. Rollback is removing the
@@ -307,9 +385,14 @@ reconciliation path (design §2) covers that driver.
   choice and operators should be able to set it.
 - **No new tenant-supplied input reaches a privileged path.** The webhook reads
   cluster state; it does not parse the `BackupJob` payload.
-- **`BackupQuota` must be tenant-readable and tenant-writable-never.** A tenant
-  able to edit `spec.hard` has no quota. RBAC must grant `get`/`list`/`watch`
-  in the tenant role and `update` only to the platform.
+- **The controller needs `resourcequotas/status` update** in tenant namespaces.
+  That is a privileged subresource shared with kube-controller-manager; the
+  grant should be namespace-scoped to tenant namespaces, not cluster-wide on
+  all of them, and the controller must never write `spec`.
+- **Tenants must not be able to edit `spec.hard`.** This is already true —
+  `ResourceQuota` spec is platform-owned in Cozystack — and is precisely why
+  reusing it is safer than a new CRD whose RBAC would have to be got right from
+  scratch.
 - Restores are not gated, deliberately: a tenant over quota must still be able
   to recover.
 
@@ -318,7 +401,7 @@ reconciliation path (design §2) covers that driver.
 - **Driver never sets `sizeBytes`** → those backups contribute 0 to the size
   dimension. Silent under-counting, which is why `ReportsSize` is declared
   rather than inferred: a strategy that does not report size should be visible
-  as such in `BackupQuota.status`, not quietly free.
+  as such in the published figure, not quietly free.
 - **Ledger is stale** (controller down, reconciliation behind) → `UsageStale`
   condition; the webhook denies while stale rather than admitting on an
   unknown figure. Fails closed, consistent with `failurePolicy: Fail`.
@@ -329,9 +412,18 @@ reconciliation path (design §2) covers that driver.
 - **Driver retention prunes an archive** → `retained` (or `attributed`)
   decreases on the next driver-reported reconciliation; until then the tenant
   is over-charged. Bounded by the reconciliation interval.
-- **`BackupQuota` deleted while over quota** → enforcement stops; treated as an
-  operator action, same as deleting a `ResourceQuota`.
-- **Two `BackupQuota` objects** → dimensions sum.
+- **Backup dimensions removed from `spec.hard` while over quota** →
+  `Mask` drops them from `status.used` on the next sync and enforcement stops.
+  Treated as a deliberate operator action, same as removing any other limit.
+- **Two `ResourceQuota` objects both carrying the dimensions** → each is
+  evaluated independently and the most restrictive wins, matching native
+  `ResourceQuota` semantics. The controller publishes the same `used` figure to
+  each.
+- **kube-controller-manager syncs from a stale cache** → it seeds `used` from
+  the copy it holds, so a just-written backup figure can be briefly rolled back
+  to its previous value. Self-healing: the backup quota controller watches
+  `ResourceQuota` and re-asserts. Worth stating because it means the controller
+  must reconcile continuously, not write once per `Backup` event.
 - **Namespace has jobs in flight when a quota is first applied** → they
   complete; the gate applies from the next CREATE.
 
@@ -341,10 +433,19 @@ reconciliation path (design §2) covers that driver.
   transition on CR deletion for a non-owning strategy, release for an owning
   one, multi-object summation, absent-dimension-means-unlimited.
 - **Unit** — webhook decision table: under, at, and over each dimension;
-  stale ledger; missing `BackupQuota`.
+  stale ledger; dimension absent from `spec.hard`.
 - **Integration (envtest)** — create `Backup` objects, assert published
   `status.used`; delete them, assert the figure does *not* drop for a
   non-owning strategy.
+- **Integration, against a real kube-controller-manager** — the assumption §3
+  rests on: write `backups.cozystack.io/size` into `status.used`, force a quota
+  resync, assert the value survives; then create a Pod in the same namespace and
+  assert the admission plugin's write preserves it too. This test is what turns
+  "we read the upstream source" into a standing guarantee, and it must fail
+  loudly if a future Kubernetes bump changes the behaviour.
+- **Integration** — a lagging backup dimension does not block unrelated
+  admission: leave `status.used` without the backup keys and assert a Pod
+  create still succeeds.
 - **E2E** — a tenant with a 1 GiB cap: take backups until denied; delete every
   `Backup` CR; assert the next `BackupJob` is still denied. This is the test
   that proves the feature is not bypassable, and it should exist before the
@@ -353,9 +454,10 @@ reconciliation path (design §2) covers that driver.
 
 ## Rollout
 
-1. **`BackupQuota` CRD + accounting controller, no enforcement.** Publishes
-   `status.used` only. Operators get visibility and can size limits against
-   real data before anything is refused.
+1. **Accounting controller, no enforcement.** Publishes `status.used` for the
+   two dimensions. Because they are inert to kube-apiserver, an operator can
+   set a deliberately high limit purely to turn on measurement, size the real
+   limit against observed data, and only then move to step 3.
 2. **Strategy capability declarations** (`OwnsArtifact`, `ReportsSize`) across
    the shipped drivers, plus driver-reported reconciliation for those that can
    enumerate archives.
@@ -367,11 +469,13 @@ argues for shipping it on its own even if the rest stalls in review.
 
 ## Open questions
 
-- **Does kube-controller-manager's quota controller preserve foreign dimensions
-  in `ResourceQuota.status.used`?** If it reliably does, mirroring
-  `backups.cozystack.io/size` into the tenant `ResourceQuota` would put backup
-  usage where users already look, and §3's separate-CR decision should be
-  revisited. This needs an experiment, not an opinion.
+- **How stable is the upstream behaviour §3 depends on?** Foreign-dimension
+  preservation is a consequence of how `syncResourceQuota` seeds and masks
+  `used`, not a documented API guarantee. It has held for many releases and the
+  code reads as deliberate ("preserve the past usage observation"), but a
+  refactor upstream could silently drop foreign keys. An e2e test that writes a
+  synthetic dimension and asserts it survives a controller resync is cheap
+  insurance and should gate the release, not just the merge.
 - **Should `count` use the native `count/backups.backups.cozystack.io`
   dimension after all?** It is free and correct for counting, but it fires on
   `Backup` CREATE (the controller), not `BackupJob` CREATE (the tenant) — the
@@ -385,6 +489,16 @@ argues for shipping it on its own even if the rest stalls in review.
   breakdown to be actionable when an operator has to purge by hand?
 
 ## Alternatives considered
+
+**A dedicated `BackupQuota` CRD instead of `ResourceQuota` dimensions.** The
+first draft of this proposal took that route, on the assumption that
+`ResourceQuota.status` could not be safely co-written. Reading upstream showed
+the assumption was wrong (§3), and once foreign dimensions are known to survive,
+the CRD only costs: a second place to look for a limit, a second RBAC surface
+to get right, a second thing for the dashboard to render, and no reuse of the
+`resourceQuotas` values path tenants already use. It would buy a natural home
+for the `attributed`/`retained` breakdown — which metrics and an annotation
+cover adequately, since that breakdown is diagnostic rather than enforced.
 
 **Sum live `Backup` CRs and accept the bypass.** Far simpler: no ownership
 model, no retained bucket, roughly a hundred lines. Rejected because `kubectl
