@@ -18,6 +18,29 @@ straightforward, while *accounting* is the hard problem, because the set of
 `Backup` objects in a namespace is not a faithful record of the bytes a tenant
 occupies.
 
+## Scope and related proposals
+
+[design-proposal: tenant quotas as reservation limits](https://github.com/cozystack/community/pull/48)
+moves tenant quota accounting for `apps.cozystack.io` resources *away* from
+`ResourceQuota.status.used` and onto declared reservations, on the grounds that
+the declared size is what a tenant buys and `status.used` drifts. This proposal
+adds a consumer of `status.used`, so the two need to be read together.
+
+They are complementary rather than opposed, because the two resources differ in
+exactly the property that decides which mechanism applies:
+
+- A VM's memory is **declared before it exists**, so a reservation is both
+  available and the more honest number.
+- A backup's size is **only known after it exists** (`status.artifact.sizeBytes`
+  is written by the driver on completion). There is nothing to declare, so
+  measurement is the only option.
+
+If #48 is accepted, the resulting split is: reservation-based accounting for
+resources whose size is declared, measured accounting for those whose size is
+discovered. That is a coherent rule, but it should be an explicit one rather
+than an accident of two proposals landing independently — reviewers of either
+should say whether they accept it.
+
 ## Context
 
 The backup API (`api/backups/v1alpha1`) is driven by four objects:
