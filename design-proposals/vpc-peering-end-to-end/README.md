@@ -380,13 +380,13 @@ The control case walks the whole peering datapath and is a useful artifact in it
  6. ls_out_acl_eval: ... ((ip4.src == 10.1.0.32/27 && ip4.dst == 10.0.0.0/27) || ...), priority 2001
 egress(dp="vpc-2cfb24", outport="vpc-2cfb24-vpc-52d844")      # interconnect
 egress(dp="vpc-52d844", outport="vpc-52d844-subnet-8ffd7d15")
-egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01-....ovn")   # delivered
+egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01....ovn")   # delivered
 ```
 
 **Transit cannot be expressed at all.** `allowSubnets` renders pair rules anchored on **the subnet's own CIDR**: `(src == <own> && dst == <allowed>) || (src == <allowed> && dst == <own>)`. A transit VM receives packets whose source *and* destination are both foreign to its subnet, so no pair rule can ever match it. Measured: after declaring `8.8.8.8/32` in `allowSubnets` on **both** the spoke and the hub subnets, the packet clears the spoke, crosses the interconnect, and is then dropped on the hub switch while being delivered to the firewall:
 
 ```
-egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01-....ovn")
+egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01....ovn")
  6. ls_out_acl_eval (northd.c:7456): ... priority 2000
     log(name="subnet-8ffd7d15", verdict=drop, severity=warning);
     LOG: ... nw_src=10.1.0.34, nw_dst=8.8.8.8
@@ -398,8 +398,8 @@ The hub subnet's rules anchor on `10.0.0.0/27`; the pair `(10.1.0.32/27, 8.8.8.8
 
 ```
 egress(dp="subnet-8ffd7d15", inport="subnet-8ffd7d15-vpc-52d844",
-       outport="vm-instance-fw01-key-hdr....ovn")
-    /* output to "vm-instance-fw01-key-hdr....ovn", type "" */
+       outport="vm-instance-fw01....ovn")
+    /* output to "vm-instance-fw01....ovn", type "" */
 ```
 
 So the complete recipe for firewall-mediated egress inside a VPC is: the destination declared in the *source* subnet's `allowSubnets`; `private: false` on the subnet hosting the firewall; `staticRoutes` for the destination via the interconnect on the spoke and via the firewall's VPC address on the hub; `<provider>.kubernetes.io/port_security: "false"` on the firewall's VPC port so kube-ovn does not drop the packets it forwards with a foreign source; and the firewall's own policy and NAT.
@@ -490,7 +490,7 @@ Phase 1 is independently valuable and should not wait for consensus on the rest.
 2. **Who owns interconnect allocation?** A controller with real IPAM is cleanest; a chart-level hash with a conflict check in `cozystack-api` is cheaper. The proposal assumes the latter is enough because the range is large and peerings are few, but the collision table argues the boundary is closer than it looks.
 3. **Is the KubeVirt default-gateway behaviour a bug or intended?** If intended, Phase 3 needs a different delivery path for guest routes, and I do not currently have a good one that satisfies "native, subnet-scoped, survives rebuild".
 4. **Should the upstream kube-ovn docs be amended?** The "only interconnection of two VPCs is supported" line reads as a cardinality limit, but the controller creates one router port per declared peer with no cap (§6). A docs PR saying "pairwise and non-transitive" would prevent others from concluding, as I first did, that a VPC may have only one peer.
-5. **How should transit through a tenant-owned appliance be expressed (§7)?** Given that `VpcEgressGateway` already solves platform-managed egress, is interposing a tenant appliance a use case Cozystack wants to support at all, or should tenants be told to use the egress gateway and keep their firewall for north-south at the pod-network edge (`tenant-site-connectivity`)? If it is wanted, a kube-ovn transit allowance preserves isolation but is work in another project, while marking a gateway subnet in the `VirtualPrivateCloud` API and rendering `private: false` for it is available immediately at the cost of isolation on that one subnet. I lean toward the latter as an explicit, documented interim, because operators already do exactly that by out-of-band patch and an API that says so is strictly better than one that hides it.
+5. **Which form should the transit allowance take?** Not *whether* — the appendix settles that, and §7 shows the platform is one concept short of a topology tenants already run. A kube-ovn per-subnet transit allowance preserves isolation but is work in another project; marking a gateway subnet in the `VirtualPrivateCloud` API and rendering `private: false` for it is available immediately at the cost of isolation on that one subnet. I lean toward the latter as an explicit, documented interim, because operators already do exactly that by out-of-band patch and an API that says so is strictly better than one that hides it.
 6. **Does an egress gateway's traffic pass a private subnet's ACL, and by which rule?** I could not determine this from the documentation and did not test it. The answer decides whether the transit allowance in §7 already half-exists.
 7. **Should the `kubeovn-webhook` propagate provider-scoped annotations (§7.2)?** It is a small change with a large payoff — the documented virtual-router workflow would start working inside VPCs — but it widens what a namespace annotation can reach, so it deserves a security read rather than my assertion.
 
@@ -503,3 +503,52 @@ Phase 1 is independently valuable and should not wait for consensus on the rest.
 **Interconnect addressing.** *Keep the pure hash* — rejected on the collision table; determinism was the goal but conflict-freedom is the requirement. *Let the tenant specify the link CIDR* — rejected: it is platform plumbing, and exposing it invites overlap with tenant subnets.
 
 **Peer identity.** *Keep recomputing the remote VPC id from the hardcoded release prefix* — rejected: it couples every peering in every cluster to a string in an unrelated `ApplicationDefinition`, and it fails silently rather than loudly (§3).
+
+---
+
+## Appendix: the topology tenants are already reproducing
+
+This proposal exists because a tenant handed us an Azure architecture and asked for it on Cozystack. It is worth showing, because it is not an exotic request — it is the standard hub-and-spoke-with-a-firewall shape, and it establishes that the gaps above are not theoretical.
+
+```mermaid
+flowchart TB
+  subgraph spokes["spoke VNets, one per workload domain"]
+    B["vnet-build<br/>snet-build-01"]
+    M["vnet-monitor<br/>snet-mon-01"]
+    C1["vnet-customer01<br/>snet-cust01-mgmt<br/>snet-cust01-servers"]
+    C2["vnet-customer02<br/>snet-cust02-mgmt<br/>snet-cust02-servers"]
+  end
+  subgraph hub["vnet-firewall (the hub)"]
+    FWI["snet-fw-internal"]
+    FW["FW01 / FW02<br/>firewall pair"]
+    FWE["snet-fw-internet"]
+  end
+  GW["GW_INTERNET<br/>public IP"]
+  NET(("INTERNET"))
+  B -.peering.-> FWI
+  M -.peering.-> FWI
+  C1 -.peering.-> FWI
+  C2 -.peering.-> FWI
+  FWI --> FW --> FWE --> GW --> NET
+```
+
+Every spoke peers with the hub, no spoke peers with another spoke, and all north-south traffic transits the firewall pair. Mapping it onto Cozystack, with what each brick needs:
+
+| Azure construct | Cozystack equivalent | State |
+| --- | --- | --- |
+| Spoke VNets and their subnets | `VirtualPrivateCloud` + `spec.subnets` | works |
+| Hub VNet holding the firewalls | another `VirtualPrivateCloud` | works |
+| Peering, spoke ↔ hub, many spokes, non-transitive | `spec.peers` on both sides | works **after** the `/30` fix (§1) |
+| Subnets of one VNet talking to each other | nothing | **missing** (§4) |
+| Spoke reaching the firewall across the peering | derived `allowSubnets` | **missing** (§4) |
+| Workload knowing the route to the hub | provider-scoped routes annotation | **missing** (§5) |
+| Firewall forwarding traffic that is not addressed to it | transit allowance | **missing** (§7) |
+| `GW_INTERNET` + its public IP | the firewall VM's pod NIC + a `Service type: LoadBalancer` | works today, see below |
+
+Two observations that matter for prioritisation.
+
+**The internet edge is not the missing brick.** In a Cozystack deployment the firewall VM is dual-homed, and its pod NIC already provides both directions: egress through the cluster's existing masquerade, and a stable public identity if the platform's proxy preserves the LB address on egress (on the deployment measured here, the egress map contains `<pod-ip> : <lb-ip>`, so the firewall's outbound traffic leaves as its own public address). So `GW_INTERNET` maps onto machinery that exists. Everything genuinely missing in the table above is inside the VPC, which is why this proposal asks for transit and not for a gateway object.
+
+**But that edge is also what forces dual-homing,** and dual-homing is the root cause of §5: because the default route lives on the pod NIC, a VPC workload needs an explicit route for every VPC destination, and delivering those routes collides with KubeVirt's DHCP (§5.1). Moving the edge *inside* the VPC — an external segment the VPC router attaches to, with `OvnEip`/`OvnSnatRule`/`OvnDnatRule` doing NAT on the router itself and no per-VPC runtime component — would make the Azure drawing literally reproducible, `snet-fw-internet` included, and would let a VPC workload be single-homed with its default route pointing at the VPC. That dissolves §5 rather than working around it, which is why we consider it the strategic direction rather than an optional extra.
+
+The prerequisite for that is smaller than it first appears and is worth stating so it is not mistaken for a datacenter project: kube-ovn needs a `ProviderNetwork` naming the node interface, a `Vlan`, and a `Subnet` bound to that VLAN carrying routable addresses, plus a node label for the NAT chassis and `enableExternal: true` on the VPC. On a platform that already trunks per-tenant VLANs to its nodes to back MetalLB pools — a common shape — the physical layer is already in place, and what remains is declaring it to kube-ovn and carving the external subnet's range out of the overlapping MetalLB pool so the two do not both answer for the same addresses. Sequencing that work belongs with [#35](https://github.com/cozystack/community/pull/35), not here; this appendix records the direction so the transit allowance in §7 is understood as the near-term unblock rather than the end state.
