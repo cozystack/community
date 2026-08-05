@@ -18,7 +18,7 @@ The proposal fixes the routing bug, makes isolation derive from the declared pee
 - **[`tenant-site-connectivity`](../tenant-site-connectivity/README.md) (Accepted)** — complementary and a different niche. That proposal connects a tenant to **external** sites through gateway VMs; this one interconnects **two VPCs inside the same cluster**. It also states the constraint this proposal inherits: managed apps live on the default pod network and cannot be moved onto a VPC, and VMs are dual-homed. That dual-homing is exactly what makes layer 3 below hard.
 - **[#35 PublicIP / PublicIPClaim](https://github.com/cozystack/community/pull/35)** — related to the deferred egress item below. Routing tenant internet egress through a tenant-owned firewall VM needs a stable egress identity; that work belongs there, not here.
 - **Deferred, deliberately out of scope here:**
-  - **Internet egress through a tenant firewall VM in a peered hub.** Measured as structurally blocked today (see [Failure and edge cases](#failure-and-edge-cases)); it additionally requires relaxing the private-subnet model, which is a separate design decision.
+  - **Internet egress through a tenant firewall VM in a peered hub.** Not deferred as unknown: §7 specifies the exact working recipe, measured with `ovn-trace`, and isolates the two things missing upstream (a way to express *transit*, and the [virtual router](https://cozystack.io/docs/v1.6/networking/virtual-router/) UX extended into VPCs). What this proposal does **not** do is commit to an implementation for either, since both are decisions about the isolation model.
   - **More than two VPCs in one peering topology.** kube-ovn documents two-VPC interconnection only; this proposal makes that limit explicit and enforced rather than silently exceeded.
   - **Cross-cluster VPC interconnect.** Different problem (OVN-IC), different proposal.
 
@@ -273,6 +273,8 @@ subnet-b7bc75ca.tenant-acme.ovn.kubernetes.io/routes: |
 
 Proposed: `vm-instance` (or `cozystack-api`, which already knows the VPC an instance is attached to) generates this annotation from the VPC topology — the VPC's own subnets plus the peered VPCs' subnets, the same set computed in §4, with the subnet's gateway as next hop. The tenant declares a peering; their VMs get precisely the routes that peering implies, and nothing more.
 
+A second delivery vehicle exists and is arguably better because it already has a documented UX: extending Cozystack's `kubeovn-webhook` to propagate **provider-scoped** annotations from the namespace, which is what makes the [virtual router](https://cozystack.io/docs/v1.6/networking/virtual-router/) feature work on the default pod network today (§7.2). The two are complementary rather than exclusive: platform-generated per-VM annotations express what the peering implies, and the namespace form lets a tenant add routes of their own on top without touching each VM.
+
 #### 5.1 The blocker this exposes, and what it needs from KubeVirt
 
 Delivering those routes also makes the guest install a **default route via the VPC subnet gateway**, with a better metric than the pod NIC's:
@@ -338,6 +340,66 @@ Reasons: `Established`, `AwaitingRemoteDeclaration`, `RemoteVPCNotFound`, `CIDRO
 
 The last one matters because kube-ovn's documentation states that **only two-VPC interconnection is supported**, while `spec.peers` is an unbounded array. Either the schema caps it at one entry, or the support level is documented and the status reports `PeerLimitExceeded` beyond it. Silently rendering a topology kube-ovn does not support is the worst of the three options.
 
+### 7. `private: true` forbids egress and transit, and the isolation model cannot express either
+
+The two questions every operator asks next are "can I route my VPC's internet traffic through my own firewall VM" and "can I put that firewall in a peered hub". Both are reachable today, but only by turning isolation off on one subnet, and the reason is worth specifying because it is a gap in the model rather than a missing route.
+
+Everything below was obtained with `ovn-trace`, which evaluates the logical pipeline without sending a packet.
+
+**Egress is dropped before routing is consulted.** A VM sending to any destination outside its subnet's `allowSubnets` is dropped in the *egress* pipeline of its own switch, on the way to its own router patch port:
+
+```
+$ ovn-trace --ct new subnet-b7bc75ca 'inport == "<vm-lsp>" && ip4.src == 10.1.0.34
+    && ip4.dst == 8.8.8.8 && tcp && ...'
+egress(dp="subnet-b7bc75ca", outport="subnet-b7bc75ca-vpc-2cfb24")
+ 6. ls_out_acl_eval (northd.c:7427): reg8[30..31] == 2 && reg0[9] == 1 && (ip), priority 2000
+    log(name="subnet-b7bc75ca", verdict=drop, severity=warning);
+```
+
+This is the detail that misleads: the `to-lport` ACL applies to the packet *leaving toward the router*, so a `staticRoutes` entry for the destination is never even evaluated. Operators reasonably conclude their route is wrong.
+
+The control case walks the whole peering datapath and is a useful artifact in its own right — to an allowed destination the same trace goes all the way to the peer VM's port:
+
+```
+ 6. ls_out_acl_eval: ... ((ip4.src == 10.1.0.32/27 && ip4.dst == 10.0.0.0/27) || ...), priority 2001
+egress(dp="vpc-2cfb24", outport="vpc-2cfb24-vpc-52d844")      # interconnect
+egress(dp="vpc-52d844", outport="vpc-52d844-subnet-8ffd7d15")
+egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01-....ovn")   # delivered
+```
+
+**Transit cannot be expressed at all.** `allowSubnets` renders pair rules anchored on **the subnet's own CIDR**: `(src == <own> && dst == <allowed>) || (src == <allowed> && dst == <own>)`. A transit VM receives packets whose source *and* destination are both foreign to its subnet, so no pair rule can ever match it. Measured: after declaring `8.8.8.8/32` in `allowSubnets` on **both** the spoke and the hub subnets, the packet clears the spoke, crosses the interconnect, and is then dropped on the hub switch while being delivered to the firewall:
+
+```
+egress(dp="subnet-8ffd7d15", outport="vm-instance-fw01-....ovn")
+ 6. ls_out_acl_eval (northd.c:7456): ... priority 2000
+    log(name="subnet-8ffd7d15", verdict=drop, severity=warning);
+    LOG: ... nw_src=10.1.0.34, nw_dst=8.8.8.8
+```
+
+The hub subnet's rules anchor on `10.0.0.0/27`; the pair `(10.1.0.32/27, 8.8.8.8/32)` is not something it can say.
+
+**With `private: false` on the firewall's subnet, it works.** Same trace, one field changed, and the packet is delivered:
+
+```
+egress(dp="subnet-8ffd7d15", inport="subnet-8ffd7d15-vpc-52d844",
+       outport="vm-instance-fw01-key-hdr....ovn")
+    /* output to "vm-instance-fw01-key-hdr....ovn", type "" */
+```
+
+So the complete recipe for firewall-mediated egress inside a VPC is: the destination declared in the *source* subnet's `allowSubnets`; `private: false` on the subnet hosting the firewall; `staticRoutes` for the destination via the interconnect on the spoke and via the firewall's VPC address on the hub; `<provider>.kubernetes.io/port_security: "false"` on the firewall's VPC port so kube-ovn does not drop the packets it forwards with a foreign source; and the firewall's own policy and NAT.
+
+Two things are missing upstream, and they are what this section asks for:
+
+1. **A way to express transit** so that hosting a gateway VM does not require disabling isolation wholesale on its subnet. Either a per-subnet `transit`/`gateway` allowance in kube-ovn that permits forwarding for declared CIDR pairs, or, minimally, a documented and explicit way for the `VirtualPrivateCloud` API to mark one subnet as the gateway subnet and render `private: false` for it deliberately rather than by out-of-band patch.
+2. **The [virtual router](https://cozystack.io/docs/v1.6/networking/virtual-router/) UX extended into VPCs.** That feature is implemented by Cozystack's own admission webhook in `packages/system/kubeovn-webhook/images/kubeovn-webhook/admission.go`, which copies exactly two annotations from the namespace onto pods:
+
+   ```go
+   AnnotationRoutes       = "ovn.kubernetes.io/routes"
+   AnnotationPortSecurity = "ovn.kubernetes.io/port_security"
+   ```
+
+   Both are the **unprefixed** forms, so they only ever apply to the default pod-network provider. kube-ovn already defines the provider-scoped equivalents (`RoutesAnnotationTemplate`, `PortSecurityAnnotationTemplate` in `pkg/util/const.go`). Teaching the webhook to propagate provider-scoped keys would make the documented virtual-router workflow work **inside a VPC**, with the same namespace-level UX, and it is also the cleanest delivery vehicle for the guest routes in §5.
+
 ## User-facing changes
 
 - `spec.peers` and `spec.routes` keep their shape. A tenant that already declares a peer needs **no manifest change**; it starts working.
@@ -371,13 +433,15 @@ The last one matters because kube-ovn's documentation states that **only two-VPC
 - **Peer VPC is deleted while peered** → the surviving side reports `RemoteVPCNotFound`, keeps its subnets working, and drops the peer port and the derived ACL entries and guest routes.
 - **A subnet is added to a peered VPC** → the peer's derived `allowSubnets` and its VMs' route annotations must both pick it up; this is the main reconcile-fanout case and needs a watch on peered VPCs, not just on self.
 - **A VM is rebuilt** → guest routes come from a generated annotation on the pod template, so they are reapplied by construction. This is the property that manual guest routes and cloud-init do not have.
-- **Internet-bound traffic pointed at the VPC gateway** → blackholed today, and this is worth stating precisely because operators will try it: neither VPC router has a default route and `enableExternal` is `false`, so the packet dies at the router. Even with a default route added, return traffic from the internet is dropped by the private-subnet ACL, since its source is not in `allowSubnets`. Firewall-mediated egress therefore requires a decision about the isolation model and is deferred, not merely unimplemented.
+- **Internet-bound traffic pointed at the VPC gateway** → dropped by the source subnet's own ACL **before routing is consulted**, see §7. Adding a static route does not help until the destination is declared.
+- **A VM in a peered VPC used as a transit gateway** → dropped when the packet is delivered to it, because `allowSubnets` cannot express transit between two foreign CIDRs, see §7.
 
 ## Testing
 
 - **Unit, chart rendering:** `helm template` asserts `localConnectIP` matches `^169\.254\.\d+\.\d+/30$` on both sides of a pair, that the two sides differ by exactly one in the last octet, and that both land in the same /30. This single assertion would have caught the shipped bug.
 - **Unit, derivation:** given a VPC with two subnets peered to a VPC with two subnets, assert the rendered `allowSubnets` on each of the four `Subnet` objects is exactly the expected set, and that a non-peered third VPC's CIDR is absent.
 - **Integration, OVN state:** after applying a peered pair, assert `ovn-nbctl lrp-list` contains `vpc-<a>-vpc-<b>` on both routers, `lr-route-list` contains one `dst-ip` route per remote subnet, and `acl-list` on each switch contains the bidirectional pair rule. Assert `kube-ovn-controller` logs contain no `CIDRInvalid` for the two VPCs.
+- **Integration, pipeline assertions with `ovn-trace`.** Worth calling out as a cheap and underused tool for this feature: `ovn-trace --ct new` evaluates the whole logical pipeline with no traffic, no VM, and no flakiness, and it names the exact ACL that decided. A positive trace (peer VM's port reached) and a negative one (non-peered CIDR dropped, with the drop's priority asserted) cover the dataplane intent at a fraction of the cost of an e2e, and every measurement in §7 was produced this way. Recommended as the primary regression gate, with the e2e below kept as the end-to-end sanity check.
 - **e2e, dataplane:** one VM per VPC; assert ICMP and TCP both ways between the peered subnets; assert a **sibling** subnet in the same VPC is reachable; assert a third, non-peered VPC's subnet is **not** reachable and that the drop counter on its switch increments. The negative assertion is as important as the positive one, because a too-wide `allowSubnets` would otherwise pass.
 - **e2e, guest:** assert the guest's routing table contains the derived routes after a cold restart, **and** that the guest's default route is unchanged and its external connectivity still works. The second half is the gate from §5.1 and must fail loudly if KubeVirt still advertises a gateway.
 - **Manual, upgrade:** a cluster with an out-of-band `allowSubnets` patch upgrades to the derived value without connectivity loss.
@@ -397,6 +461,8 @@ Phase 1 is independently valuable and should not wait for consensus on the rest.
 2. **Who owns interconnect allocation?** A controller with real IPAM is cleanest; a chart-level hash with a conflict check in `cozystack-api` is cheaper. The proposal assumes the latter is enough because the range is large and peerings are few, but the collision table argues the boundary is closer than it looks.
 3. **Is the KubeVirt default-gateway behaviour a bug or intended?** If intended, Phase 3 needs a different delivery path for guest routes, and I do not currently have a good one that satisfies "native, subnet-scoped, survives rebuild".
 4. **Should the peer array be capped at one entry in the schema**, or accepted with a status error? Capping is honest about kube-ovn's support level but is a breaking schema change for anyone who declared two.
+5. **How should transit be expressed (§7)?** A per-subnet `transit` allowance in kube-ovn preserves isolation but is upstream work in another project; letting the `VirtualPrivateCloud` API mark a gateway subnet and render `private: false` for it is available immediately but trades isolation on that one subnet. I lean toward asking kube-ovn for the former and shipping the latter as the explicit, documented interim, because operators are already doing it by out-of-band patch today and an API that says so is strictly better than one that hides it.
+6. **Should the `kubeovn-webhook` propagate provider-scoped annotations (§7.2)?** It is a small change with a large payoff — the documented virtual-router workflow would start working inside VPCs — but it widens what a namespace annotation can reach, so it deserves a security read rather than my assertion.
 
 ## Alternatives considered
 
