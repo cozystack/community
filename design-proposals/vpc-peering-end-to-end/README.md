@@ -424,6 +424,15 @@ Two things are missing upstream, and they are what this section asks for:
 - Guest route injection (§5) adds routes only on the tenant's own VMs, through an annotation the platform generates. It is not a new privilege: a tenant can already add routes inside its own guest.
 - No new secrets, no new RBAC verbs for tenants.
 
+**On the `private: false` trade-off in §7,** since it is the one place this proposal describes turning a protection off. It is worth being precise about what does and does not change, because the intuition that it exposes a public-facing VM is the wrong axis:
+
+- It does **not** create public or pod-network exposure. VPC subnets are unreachable from the node and pod networks by *routing*, independently of ACLs — verified: a node resolves `10.0.0.2` to its physical default gateway and gets no reply. A gateway VM's public exposure lives entirely on its **other** interface, the pod NIC behind a `Service`, and is governed by that Service's ports, not by the VPC subnet's ACL.
+- It **does** move the trust boundary. Within the VPC and its peers the platform stops filtering by CIDR pair for that subnet, and `port_security: "false"` — which forwarding requires — lets that VM emit packets with any source address. Filtering moves from the platform ACL into the gateway's own configuration, with no platform-level backstop underneath.
+- The blast radius stays bounded by the **peers'** privacy: their pair rules still anchor on their own CIDR, so a compromised gateway spoofing an arbitrary source is dropped by the peer subnet's own ACL. It can only reach a peer using a source that peer already allows.
+- Therefore the deployment shape matters more than the flag: the gateway VM should be **alone in a dedicated transit subnet**, and no workload should ever share a non-private subnet. Under that shape, isolation is disabled only on a subnet whose sole occupant is the component whose job is to be a routing bridge.
+
+This is the security argument for asking kube-ovn for a transit allowance rather than settling for `private: false`: the goal is to keep CIDR filtering *and* permit forwarding, and today those are mutually exclusive.
+
 ## Failure and edge cases
 
 - **One side declares, the other does not** → no peer port is created; `Established=False/AwaitingRemoteDeclaration` on the declaring side. Today: `Ready=True` and silence.
