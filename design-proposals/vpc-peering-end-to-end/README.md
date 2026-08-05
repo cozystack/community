@@ -19,7 +19,7 @@ The proposal fixes the routing bug, makes isolation derive from the declared pee
 - **[#35 PublicIP / PublicIPClaim](https://github.com/cozystack/community/pull/35)** — related to the deferred egress item below. Routing tenant internet egress through a tenant-owned firewall VM needs a stable egress identity; that work belongs there, not here.
 - **Deferred, deliberately out of scope here:**
   - **Internet egress through a tenant firewall VM in a peered hub.** Not deferred as unknown: §7 specifies the exact working recipe, measured with `ovn-trace`, and isolates the two things missing upstream (a way to express *transit*, and the [virtual router](https://cozystack.io/docs/v1.6/networking/virtual-router/) UX extended into VPCs). What this proposal does **not** do is commit to an implementation for either, since both are decisions about the isolation model.
-  - **More than two VPCs in one peering topology.** kube-ovn documents two-VPC interconnection only; this proposal makes that limit explicit and enforced rather than silently exceeded.
+  - **Transitive peering.** Peering is pairwise and non-transitive by design (§6); building a mesh means declaring each pair. Making it transitive is out of scope and, for isolation reasons, probably undesirable.
   - **Cross-cluster VPC interconnect.** Different problem (OVN-IC), different proposal.
 
 ## Context
@@ -126,7 +126,7 @@ Each of these is a separate layer failing, each one looks like the previous one 
 
 ### Non-goals
 
-- Peering more than two VPCs in one topology (kube-ovn limitation; this proposal enforces the limit rather than lifting it).
+- Making peering transitive. A VPC may hold many pairwise peerings (§6), but `A↔B` plus `B↔C` will not yield `A↔C`, and this proposal does not change that.
 - Internet egress through a peered firewall VM (deferred; needs the isolation-model decision and #35).
 - Changing how managed apps are networked; they stay on the default pod network.
 - Cross-cluster interconnect.
@@ -317,7 +317,7 @@ $ ovn-sbctl lflow-list subnet-b7bc75ca | grep dhcp
 
 Two side notes for whoever touches this area: OVN itself does accept `classless_static_route` (option 121) in its NB `DHCP_Options` — the dead end is the path, not the option; and kube-ovn's `dhcpV4Options` parser splits the string on commas, so an option 121 value is truncated at its first comma and cannot be expressed at all. That parser bug is real but out of scope here, since OVN is not in the DHCP path for VMs.
 
-### 6. Status, consent, and the two-VPC limit
+### 6. Status, consent, and what "two VPCs" actually means
 
 Peering requires a declaration on **both** sides, which is a sound cross-tenant consent model and should be kept. What is missing is any signal about it: a VPC with a one-sided declaration reports `Ready=True` and does nothing. Every failure in this document is currently invisible on the CR.
 
@@ -336,9 +336,25 @@ status:
           message: 'tenant-acme/spoke01 does not declare a peer back to tenant-acme/hub'
 ```
 
-Reasons: `Established`, `AwaitingRemoteDeclaration`, `RemoteVPCNotFound`, `CIDROverlap`, `LinkAllocationConflict`, `PeerLimitExceeded`.
+Reasons: `Established`, `AwaitingRemoteDeclaration`, `RemoteVPCNotFound`, `CIDROverlap`, `LinkAllocationConflict`.
 
-The last one matters because kube-ovn's documentation states that **only two-VPC interconnection is supported**, while `spec.peers` is an unbounded array. Either the schema caps it at one entry, or the support level is documented and the status reports `PeerLimitExceeded` beyond it. Silently rendering a topology kube-ovn does not support is the worst of the three options.
+**On the "only two VPCs" line in the kube-ovn docs**, which is easy to misread as "a VPC may have at most one peer": the implementation says otherwise. `pkg/controller/vpc.go` iterates the list and creates one router port per entry, then reconciles removals against `status.VpcPeerings`:
+
+```go
+var newPeers []string
+for _, peering := range vpc.Spec.VpcPeerings {
+	if err = util.CheckCidrs(peering.LocalConnectIP); err != nil { ... }
+	newPeers = append(newPeers, peering.RemoteVpc)
+	if err := c.OVNNbClient.CreatePeerRouterPort(vpc.Name, peering.RemoteVpc, peering.LocalConnectIP); err != nil { ... }
+}
+```
+
+There is no cap. A VPC can hold many peerings, each pairwise, each with its own router port and its own interconnect link — the same model as Azure VNet peering. What the docs sentence means is that a peering joins **two** VPCs and is **non-transitive**: `A↔B` plus `B↔C` does not give `A↔C`, because each side installs routes only for the CIDRs it declared. That is worth stating in the upstream docs in those words, because "only interconnection of two VPCs is supported" reads as a cardinality limit and is not one.
+
+Two consequences for this proposal:
+
+- **Non-overlap is a set-wide property, not a pairwise one.** All of a VPC's peers' subnet CIDRs must be mutually non-overlapping, not merely non-overlapping with the local VPC, because they all land in the same route table. Admission must check the whole set, and `CIDROverlap` must name which two peers collide.
+- **`allowSubnets` derivation (§4) must open only to *directly* peered VPCs.** Non-transitivity is the correct security posture here and the ACL derivation must not accidentally implement a transitive mesh.
 
 ### 7. `private: true` forbids egress and transit, and the isolation model cannot express either
 
@@ -442,7 +458,7 @@ This is the security argument for asking kube-ovn for a transit allowance rather
 - **One side declares, the other does not** → no peer port is created; `Established=False/AwaitingRemoteDeclaration` on the declaring side. Today: `Ready=True` and silence.
 - **Peered VPCs have overlapping subnet CIDRs** → rejected at admission with `CIDROverlap`; kube-ovn requires non-overlapping CIDRs and currently nothing checks it.
 - **Hashed interconnect block already in use** → allocator picks the next free block; `LinkAllocationConflict` only if the range is exhausted.
-- **More than one peer declared** → `PeerLimitExceeded`, no partial topology rendered.
+- **Several peers declared on one VPC** → supported; one interconnect and one router port per peer. The failure to guard is not cardinality but **overlap across the peer set** (§6) and interconnect allocation conflicts (§2).
 - **Peer VPC is deleted while peered** → the surviving side reports `RemoteVPCNotFound`, keeps its subnets working, and drops the peer port and the derived ACL entries and guest routes.
 - **A subnet is added to a peered VPC** → the peer's derived `allowSubnets` and its VMs' route annotations must both pick it up; this is the main reconcile-fanout case and needs a watch on peered VPCs, not just on self.
 - **A VM is rebuilt** → guest routes come from a generated annotation on the pod template, so they are reapplied by construction. This is the property that manual guest routes and cloud-init do not have.
@@ -473,7 +489,7 @@ Phase 1 is independently valuable and should not wait for consensus on the rest.
 1. **Should a VPC be internally open by default?** This proposal says yes, on the grounds that every public cloud behaves that way and that the current behaviour surprises everyone. The alternative is an explicit per-VPC field, which is more configurable and, in my view, configurability nobody wants.
 2. **Who owns interconnect allocation?** A controller with real IPAM is cleanest; a chart-level hash with a conflict check in `cozystack-api` is cheaper. The proposal assumes the latter is enough because the range is large and peerings are few, but the collision table argues the boundary is closer than it looks.
 3. **Is the KubeVirt default-gateway behaviour a bug or intended?** If intended, Phase 3 needs a different delivery path for guest routes, and I do not currently have a good one that satisfies "native, subnet-scoped, survives rebuild".
-4. **Should the peer array be capped at one entry in the schema**, or accepted with a status error? Capping is honest about kube-ovn's support level but is a breaking schema change for anyone who declared two.
+4. **Should the upstream kube-ovn docs be amended?** The "only interconnection of two VPCs is supported" line reads as a cardinality limit, but the controller creates one router port per declared peer with no cap (§6). A docs PR saying "pairwise and non-transitive" would prevent others from concluding, as I first did, that a VPC may have only one peer.
 5. **How should transit through a tenant-owned appliance be expressed (§7)?** Given that `VpcEgressGateway` already solves platform-managed egress, is interposing a tenant appliance a use case Cozystack wants to support at all, or should tenants be told to use the egress gateway and keep their firewall for north-south at the pod-network edge (`tenant-site-connectivity`)? If it is wanted, a kube-ovn transit allowance preserves isolation but is work in another project, while marking a gateway subnet in the `VirtualPrivateCloud` API and rendering `private: false` for it is available immediately at the cost of isolation on that one subnet. I lean toward the latter as an explicit, documented interim, because operators already do exactly that by out-of-band patch and an API that says so is strictly better than one that hides it.
 6. **Does an egress gateway's traffic pass a private subnet's ACL, and by which rule?** I could not determine this from the documentation and did not test it. The answer decides whether the transit allowance in §7 already half-exists.
 7. **Should the `kubeovn-webhook` propagate provider-scoped annotations (§7.2)?** It is a small change with a large payoff — the documented virtual-router workflow would start working inside VPCs — but it widens what a namespace annotation can reach, so it deserves a security read rather than my assertion.
