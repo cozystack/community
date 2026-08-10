@@ -3,7 +3,8 @@
 - **Title:** `Database Horizontal Autoscaler for Cozystack`
 - **Author(s):** `@scooby87`
 - **Date:** `2026-07-08`; revised `2026-07-24` (mechanism), `2026-07-29` and `2026-07-31` (addressing @lllamnyp and @IvanHunters review on PR #44), with earlier review by @IvanHunters, Gemini, and CodeRabbit
-- **Status:** Draft
+- **Status:** Draft — mechanism reopened by the `2026-08-10` PoC finding below
+- **PoC:** `2026-08-10` — live validation surfaced a blocking constraint in CNPG; see [PoC finding](#poc-finding-2026-08-10--blocking-the-cnpg-scale-subresource-exposes-no-selector)
 
 ## Overview
 
@@ -11,9 +12,28 @@ This proposal adds automatic horizontal scaling of a managed database's **read r
 
 The proposal is deliberately scoped to **horizontal scaling of read replicas**: a stateful primary cannot be scaled horizontally the way a stateless Deployment can. The MVP targets **PostgreSQL (CloudNativePG)**; see [Scope](#scope-and-related-proposals) for the engine ladder.
 
+> **Note (2026-08-10):** a live PoC validated the metric side of this design but found that a stock HPA cannot drive the CNPG `Cluster` scale subresource (it exposes no selector), which reopens the actuation mechanism. See [PoC finding](#poc-finding-2026-08-10--blocking-the-cnpg-scale-subresource-exposes-no-selector) below; the sections after it describe the mechanism as it stood before that finding.
+
 ### Why this changed
 
-This design converged over three revisions, each removing machinery the previous one thought it needed. Rev1 proposed a bespoke `db-autoscaler` operator that *owned* the application's `replicas` value and enforced that ownership; an implementation spike proved the enforcement premise unbuildable on the aggregated apps API, and showed the whole conflict was self-imposed — it exists only because the chart unconditionally templates the replica field (full findings in the [Appendix](#appendix-findings-from-the-implementation-spike)). Rev2/rev3 therefore moved to a stock HPA on the engine's `scale` subresource with the chart omitting the field, keeping only a thin controller and CRD to render the HPA and drive a synthesized metric. Review then showed even that is unnecessary: the metric can be *queried* into existence rather than emitted per-pod, and once the query exists, KEDA renders and manages everything declaratively — so the controller and CRD are gone too. The guiding principle throughout: reuse the platform Kubernetes ships, do not reimplement it.
+This design converged over three revisions, each removing machinery the previous one thought it needed. Rev1 proposed a bespoke `db-autoscaler` operator that *owned* the application's `replicas` value and enforced that ownership; an implementation spike proved the enforcement premise unbuildable on the aggregated apps API, and showed the whole conflict was self-imposed — it exists only because the chart unconditionally templates the replica field (full findings in the [Appendix](#appendix-findings-from-the-implementation-spike)). Rev2/rev3 therefore moved to a stock HPA on the engine's `scale` subresource with the chart omitting the field, keeping only a thin controller and CRD to render the HPA and drive a synthesized metric. Review then showed even that is unnecessary: the metric can be *queried* into existence rather than emitted per-pod, and once the query exists, KEDA renders and manages everything declaratively — so the controller and CRD are gone too. The guiding principle throughout: reuse the platform Kubernetes ships, do not reimplement it. The PoC below shows that last step reused one thing Kubernetes cannot actually provide here.
+
+## PoC finding (2026-08-10) — blocking: the CNPG scale subresource exposes no selector
+
+A live PoC on a dev cluster (cozystack v45, CloudNativePG 1.27.3, Kubernetes 1.34.3) validated the metric side of this design but uncovered a constraint the mechanism above does not survive as written.
+
+**What the PoC confirmed.** The single-value metric works on real data: for a live CNPG cluster the query `Σ(active read connections over the standby pods) + target` returned `151` at `target = 150` (one active connection on the replica), so `desired = ceil(151/150) = 2 = 1 primary + 1 read replica` — the §1 arithmetic holds. The required series and labels exist in VictoriaMetrics (`cnpg_backends_total{state="active"}`, and `kube_pod_labels` carrying `label_cnpg_io_cluster` and `label_cnpg_io_instance_role`). The KEDA package installs, its `external.metrics.k8s.io` APIService becomes Available, and KEDA renders the `ScaledObject` into a managed HPA.
+
+**The blocker.** That HPA never scales: it reports `ScalingActive=False, reason=InvalidSelector` — *"the HPA target's scale is missing a selector"*. The CNPG `Cluster` `/scale` subresource returns only `status: {replicas: N}` — no `status.selector` — and the CRD declares no `labelSelectorPath`. The Kubernetes HPA controller requires `scale.status.selector` unconditionally, before any metric-type branching, so this fails for **every** target type (confirmed with both `AverageValue` and `Value`). It is not a calibration detail and not fixable by a version bump: upstream CNPG issue [#7923](https://github.com/cloudnative-pg/cloudnative-pg/issues/7923), which requested exactly this selector for HPA/KEDA, is **closed as not planned**, and the CNPG 1.30 docs explicitly recommend against HPA for a `Cluster`.
+
+**Consequence.** The load-bearing mechanism of this revision — a stock HPA (via KEDA) driving the CNPG `Cluster` scale subresource — cannot be built on stock CNPG; an actuation bridge is required after all. Crucially, what returns is **not** the machinery that got rev1 rejected: the ownership/enforcement layer (SSA, marker annotation, HelmRelease webhook, terminal-freeze) existed only because the chart declared `replicas`, and §3 (the chart omitting the field under autoscaling) removes it regardless of mechanism. What returns is only the small write-the-count actuator.
+
+**Two options to resolve (decision needed).**
+
+- **Option A — KEDA + a thin mirror shim.** Keep KEDA's hardened decision loop by pointing its HPA at a proxy object that *does* expose a selector (a small owned CRD, or a placeholder workload), and add a tiny controller that mirrors the proxy's computed count into `Cluster.spec.instances`. Preserves the stock decision loop, but adds a shim, a proxy object, and the platform-wide KEDA dependency for a value KEDA cannot deliver end-to-end on its own.
+- **Option B — a lean actuation controller, no KEDA.** A small controller reads the read-load metric from VictoriaMetrics and writes `Cluster.spec.instances` directly, applying the `min`/`max`/quorum-floor bounds and stabilization. This is close to rev1 **minus the ownership machinery** (which §3 already eliminates) and minus the aggregated-API enforcement — a much smaller component than the rejected operator, with no KEDA platform dependency, at the cost of a modest amount of stabilization logic KEDA would otherwise provide.
+
+Both keep §1 (the validated metric encoding) and §3 (chart omits the field). The choice is where the desired-count computation lives — stock KEDA behind a proxy, or a lean purpose-built loop — and whether to take on KEDA as a platform dependency. This reopens the mechanism decision made in the previous revision; the sections below describe the pre-finding mechanism and stand until that decision is made.
 
 ## Scope and related proposals
 
