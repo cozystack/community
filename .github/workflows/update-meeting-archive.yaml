@@ -1,0 +1,71 @@
+name: Update meeting archive
+
+on:
+  workflow_dispatch:
+  # Meetings are fortnightly; a weekly run keeps the archive current whether or not
+  # the recording is published on the day of the meeting.
+  schedule:
+    - cron: '0 6 * * 5'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-meeting-archive
+  cancel-in-progress: false
+
+jobs:
+  update-meeting-archive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 'main'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Look for new recordings
+        id: update
+        run: |
+          {
+            echo 'summary<<SUMMARY'
+            python3 hack/update-meeting-archive.py
+            echo SUMMARY
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add meetings/README.md
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git branch -D update-meeting-archive || true
+          git checkout -b update-meeting-archive
+          git commit --signoff -m "docs(meetings): add newly published meeting recordings"
+          git push --force --set-upstream origin update-meeting-archive
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open a pull request unless one is already open
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUMMARY: ${{ steps.update.outputs.summary }}
+        run: |
+          if [[ "$(gh pr view update-meeting-archive --json state --jq .state 2>/dev/null)" == "OPEN" ]]; then
+            echo "a pull request is already open, the new commit is on its branch"
+            exit 0
+          fi
+          gh pr create \
+            --title "docs(meetings): add newly published meeting recordings" \
+            --body "$(printf '%s\n\n%s\n' "$SUMMARY" "The Topics column is left empty on purpose — fill it in from the meeting notes before merging. Dates are derived from the publication date of the recording, snapped to the meeting's Thursday.")" \
+            --head update-meeting-archive \
+            --base main
