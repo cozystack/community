@@ -36,6 +36,10 @@ The capability is generic and intended to live in Cozystack core as a reusable p
 - **`design-proposals/kubernetes-nodes-split`** / **`kubernetes-nodes-hybrid-clusters`** (PR #8/#9): the substrate is the existing managed-`kubernetes` app (Kamaji + CAPI/KubeVirt); node-provisioning changes apply transparently.
 - **Deferred:** billing/metering of cluster resource and API consumption; secret delivery of managed-service connection strings into sandbox workloads; the per-instance/label granularity of the visibility control (Design §6). (Cross-tenant *sharing* of a cluster is **not** deferred — it is rejected by design; see Non-goals.)
 
+## Decisions
+
+- [0001. ComputePlane ships as an operator-owned module, not as preset fields on `kind: Kubernetes`](../../decisions/0001-computeplane-ships-as-an-operator-owned-module.md) — why the preset-field revision (#27) was set aside.
+
 ## Context
 
 Today Cozystack already has every primitive needed *except* the glue that ties them into "deploy this catalog app onto a hardened, operator-controlled `kind: Kubernetes` the tenant does not administer":

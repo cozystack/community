@@ -20,6 +20,18 @@ A reader who stops here should know what you're asking for and roughly why. -->
 Link them by repo path or URL. If this proposal must land before or after
 another, say so. Omit the section if there are no related proposals. -->
 
+## Decisions
+
+<!-- Leave this empty in the initial PR; fill it in as implementation
+proceeds. Link each decision record that came out of building this,
+newest first:
+
+- [0001. ComputePlane ships as an operator-owned module](../../decisions/0001-computeplane-ships-as-an-operator-owned-module.md)
+
+Where implementation changed the design, the record is what explains why
+— this section is how a reader of the proposal finds that out.
+See ../../decisions/README.md. -->
+
 ## Context
 
 <!-- Background a reader needs to evaluate the proposal.
