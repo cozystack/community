@@ -58,7 +58,9 @@ Proposals are reviewed in GitHub PRs. Once a proposal receives consensus from co
 
 We understand that real-world implementation may diverge from initial designs. This is normal and expected.
 
-While it's helpful to update the proposal if the divergence is significant, the **codebase and user documentation are the final source of truth**.
+Update the proposal when the divergence is significant. When the divergence came from a decision worth remembering — an approach that failed, a constraint you discovered, an alternative you picked instead — also write a [decision record](../decisions/README.md) and link it from the proposal's `Decisions` section. Editing the proposal alone loses the reasoning: the revised text reads as though it always said the current thing, and *why* the design changed course survives only in the pull-request diff.
+
+The **codebase and user documentation remain the final source of truth** for what the system does. The decision records are the source of truth for why it does it that way.
 
 ## Inspiration
 
