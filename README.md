@@ -9,6 +9,7 @@ This repository serves as the home for everything related to how we collaborate,
 This repo contains:
 
 -   [Design proposals](./design-proposals/README.md) — cross-cutting and architectural changes
+-   [Decision records](./decisions/README.md) — what we decided and why, once a question is settled
 -   [The community meeting](./community_meeting.md) — when it happens, how to join, how to add a topic
 -   [The meeting archive](./meetings/README.md) — every past meeting, its topics and its recording
 -   Community resources and helpful links (below)
@@ -26,6 +27,7 @@ Cozystack work is split across two repositories. This repo is for **how we decid
 | A **bug** or a **concrete, scoped feature** | [cozystack/cozystack issues](https://github.com/cozystack/cozystack/issues/new/choose) |
 | A **usage question** or an early idea | [cozystack/cozystack Discussions](https://github.com/cozystack/cozystack/discussions) |
 | A **cross-cutting / architectural change** — affects multiple components or APIs, or needs a decision before code | A [design proposal](./design-proposals/README.md) (a PR) **here** |
+| A **decision already made** whose reasoning would otherwise survive only in a pull-request thread | A [decision record](./decisions/README.md) (a PR) **here** |
 | **Governance, process, or community** matters | An issue **here** |
 
 ## Community Resources
