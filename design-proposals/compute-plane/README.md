@@ -38,7 +38,7 @@ The capability is generic and intended to live in Cozystack core as a reusable p
 
 ## Decisions
 
-- [0001. ComputePlane ships as an operator-owned module, not as preset fields on `kind: Kubernetes`](../../decisions/0001-computeplane-ships-as-an-operator-owned-module.md) — why the preset-field revision (#27) was set aside.
+- [0001. ComputePlane ships as an operator-owned module, not as preset fields on `kind: Kubernetes`](./decisions/0001-computeplane-ships-as-an-operator-owned-module.md) — why the preset-field revision (#27) was set aside.
 
 ## Context
 

@@ -1,14 +1,28 @@
-<!-- Copy this file to decisions/NNNN-short-slug.md, taking the next free number. -->
+<!-- Copy this file to design-proposals/<proposal>/decisions/NNNN-short-slug.md,
+     taking the next free number for that proposal. Numbering is per proposal,
+     so two proposals both having an 0001 is expected. -->
 # NNNN. State the decision here, as a fact
 
 - **Number:** `NNNN`
 - **Date:** `YYYY-MM-DD`
 - **Status:** Accepted | Superseded by `NNNN` | Reverted
 - **Deciders:** `@your-github-handle, @codecider`
-- **Proposal:** `design-proposals/<name>/README.md` — or `none`
+- **Proposal:** [`../README.md`](../README.md)
+- **Decided in:** `cozystack/community#NNNN` — the pull request or issue where it was argued
 - **Implemented in:** `cozystack/cozystack#NNNN` — or `not yet`
 
 <!-- Date is when the decision was made, not when it was written up.
+
+     Deciders are the people who made the call — typically the author of the
+     change and the maintainer who approved it. Someone whose objection forced
+     the decision belongs in Context, credited by name, not in Deciders.
+
+     Proposal is required. A decision with no proposal to amend is a proposal;
+     write that instead.
+
+     Decided in is required, and it is the field that makes this record
+     checkable. Point it at the thread where the argument actually happened.
+
      Title the decision, not the topic: "storageClass is immutable after
      creation", not "storageClass immutability". -->
 
@@ -31,6 +45,14 @@
 <!-- One short bullet per alternative: what it was, and the concrete reason
      it lost. This is the section that keeps the question from being
      reopened every six months, so spend your words here.
+
+     Source each one — link the comment, review or pull request it came
+     from. An alternative written from memory is where inaccuracy gets in,
+     and a claim nobody can trace back cannot be checked for accuracy.
+
+     Prefer the argument that survives a refactor. If an option lost
+     because of how something is packaged today, and it would also lose on
+     a structural fact about the API, give the structural reason.
 
      If an alternative lost on a judgement call rather than a hard fact,
      say so — it tells a future reader how firm this decision really is. -->
@@ -56,4 +78,7 @@
 Format follows Michael Nygard's architecture decision records
 (https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 and MADR (https://adr.github.io/madr/).
+
+Once merged, the header block above is maintained (Status, Superseded by,
+Implemented in must track reality) and the prose below it is frozen.
 -->
