@@ -23,14 +23,14 @@ another, say so. Omit the section if there are no related proposals. -->
 ## Decisions
 
 <!-- Leave this empty in the initial PR; fill it in as implementation
-proceeds. Link each decision record that came out of building this,
-newest first:
+proceeds. Records live in this proposal's own directory, numbered from
+0001. Link each one here, newest first:
 
-- [0001. ComputePlane ships as an operator-owned module](../../decisions/0001-computeplane-ships-as-an-operator-owned-module.md)
+- [0001. Short statement of what was decided](./decisions/0001-short-slug.md) — one clause on what it settled.
 
 Where implementation changed the design, the record is what explains why
 — this section is how a reader of the proposal finds that out.
-See ../../decisions/README.md. -->
+See ../README.md#decision-records. -->
 
 ## Context
 
