@@ -101,7 +101,7 @@ There is no CI in this repository — `.github/` contains issue templates only �
 1. This proposal, the process text, and the template land together.
 2. [0001 under compute-plane](../compute-plane/decisions/0001-computeplane-ships-as-an-operator-owned-module.md) ships as a backfilled worked example, and [0001 under this proposal](./decisions/0001-decision-records-live-with-their-proposals.md) as one written by its own author from an argument they were present for.
 3. A second record from a different subsystem — the database-horizontal-autoscaling rev1 rejection — is requested on [#53](https://github.com/cozystack/community/pull/53) from the contributor who owns that argument, rather than backfilled here by someone who does not.
-4. The improvised in-proposal narratives are extracted as their proposals are next revised, starting with compute-plane's `Revision (this PR):` field in [#57](https://github.com/cozystack/community/pull/57).
+4. The improvised in-proposal narratives are extracted as their proposals are next revised. Compute-plane's `Revision (this PR):` field is retired here, since this change already touches that proposal; the database-autoscaler's `Why this changed` section and spike appendix go with the record requested on [#53](https://github.com/cozystack/community/pull/53).
 
 ## Open questions
 

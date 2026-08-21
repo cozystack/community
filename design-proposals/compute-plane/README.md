@@ -5,7 +5,7 @@
 - **Author(s):** `@kvaps`
 - **Date:** `2026-06-23`
 - **Status:** Accepted
-- **Revision (this PR):** Supersedes the preset-field revision (#27). ComputePlane is delivered as a Cozystack-owned **Tenant module** (`packages/extra/computeplane`) that, under the hood, deploys the ordinary `apps/kubernetes` chart with operator-fixed values, sourced through the existing PackageSource "source-only chart" mechanism (the same one NATS and SeaweedFS use — only the wrapped chart comes from `apps/` instead of `system/`). Like every Cozystack managed service, the module registers its **own `apps.cozystack.io` kind** (`ComputePlane`, via an `ApplicationDefinition` with `dashboard.module: true`) — its own API endpoint and input schema, served by `cozystack-api` and converted to a HelmRelease. So this is **not** the literal "no new kind" surface #27 aimed for; the honest positioning is: no new **CRD**, no new **controller / reconcile path**, and **no fields added to `kind: Kubernetes`** — the `ComputePlane` kind is a thin operator-owned wrapper over the unchanged `apps/kubernetes`. The tenant gets the *same* `kind: Kubernetes` cluster but owns none of its settings — only the knobs the operator exposes. The isolation mechanism (remote Flux apply onto Kamaji+KubeVirt, untrusted code behind a per-VM kernel boundary) is unchanged from the merged first revision; this revision is about the **delivery surface**.
+- **Supersedes:** the preset-field revision (#27) — the delivery surface and why the preset fields were set aside are recorded in [decision 0001](./decisions/0001-computeplane-ships-as-an-operator-owned-module.md).
 
 ## Overview
 
