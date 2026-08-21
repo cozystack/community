@@ -104,11 +104,8 @@ spec:
     name: web-01                   # name of the VMInstance to create
     instanceType: u1.large         # optional; defaults derived from the source VM's CPU/memory
     instanceProfile: ubuntu        # optional
-  networkMap:                      # optional; default: pod network
-  - source: "VM Network"
-    destination: default
-  storageMap:                      # optional; default: the cluster default StorageClass
-  - source: datastore1
+  storageMap:                      # optional; unmapped datastores get the cluster default
+  - source: datastore1             #   StorageClass, validated for Immediate binding (§5)
     storageClass: replicated
 status:
   phase: Succeeded                 # Pending | Validating | Transferring | Creating | Succeeded | Failed
@@ -138,7 +135,7 @@ flowchart TB
   subgraph tenant["tenant-&lt;name&gt; namespace"]
     SRC["VMImportSource<br/>(type, url, credentials)"]
     SEC["projected Secret + Forklift Provider<br/>(owned by Source)"]
-    TASK["VMImportTask<br/>(sourceRef, vms, maps)"]
+    TASK["VMImportTask<br/>(sourceRef, vms, storageMap)"]
     PLAN["Plan + Migration, maps<br/>(owned by Task)"]
     PVC["transferred PVC<br/>(CDI importer, restricted-clean)"]
     DV["DataVolume vm-disk-*<br/>adopts the PV — no copy"]
@@ -189,7 +186,9 @@ With that, conversion runs inside the tenant namespace under `baseline`, and the
 
 ### 5. Fulfillment: one Plan per source VM, copy-free handoff, outputs created directly
 
-For each Task the controller renders the Forklift objects itself — `NetworkMap` and `StorageMap` from the Task's maps (both always present, fixing the branch's render-a-Plan-the-API-server-rejects gap), one `Plan` and `Migration` per source VM, raw-copy mode, target namespace fixed to the Task's namespace — and mirrors `Migration.status` into per-VM `progress` on the Task. The annotation protocol the branch invented (`vm-import.cozystack.io/*` stamped on Plans by a chart, read back by a controller) disappears: it existed only because Helm cannot talk to a controller any other way, and both ends of the conversation are now the same program.
+For each Task the controller renders the Forklift objects itself — both maps always present, fixing the branch's render-a-Plan-the-API-server-rejects gap — one `Plan` and `Migration` per source VM, raw-copy mode, target namespace fixed to the Task's namespace — and mirrors `Migration.status` into per-VM `progress` on the Task.
+
+The `StorageMap` comes from the Task's `storageMap`, completed by inventory: the controller enumerates the datastores of the named VMs and maps any datastore the tenant did not name to the cluster default StorageClass, then validates that every resulting class binds `Immediate` (§Failure). The mapped class also lands in `spec.storageClass` of the output `VMDisk`, so the object says where the data actually is. The `NetworkMap` has no tenant-facing field at all in v1, deliberately: it shapes the interfaces of the Forklift-created KubeVirt VM, which this design discards unstarted — the final network configuration belongs to the `VMInstance` the controller creates, and a `VMInstance` today attaches to the pod network only. The controller therefore auto-generates the map (every source network → `pod`) purely to satisfy Plan validation. When the deferred network-placement design lands (LAN/VPC/public IP), a `networkMap` field joins the Task spec additively, with destinations that actually exist — an empty choice in a form is worse than no field. The annotation protocol the branch invented (`vm-import.cozystack.io/*` stamped on Plans by a chart, read back by a controller) disappears: it existed only because Helm cannot talk to a controller any other way, and both ends of the conversation are now the same program.
 
 When a Migration succeeds, the controller discards the Forklift-created KubeVirt `VirtualMachine` (never started) and hands each produced volume into a `VMDisk` **without a copy**. The sequence is the one upstream CDI tests end-to-end in `tests/static-volume_test.go:84-155`, and it was verified live on 2026-08-20: the DataVolume reported `Succeeded`, **no importer pod was ever created**, the PVC stayed bound to the same PV throughout, and the data survived byte-identically (MBR signature and checksum checked from the adopted block device).
 
@@ -259,6 +258,8 @@ Operators see one new platform key (`vddk-image` in the `cozystack` ConfigMap / 
 - Controller restarts mid-transfer → Sources, Tasks, Plans and Migrations are the durable state; reconciliation resumes from status, and the handoff is idempotent (claim adoption of an already-bound PV is a no-op).
 - Guest without virtio drivers → transfer succeeds, disk intact, guest may not boot; per-VM status carries the warning; remedy is drivers in the source guest or conversion in Phase 2.
 - `storageMap` naming a `WaitForFirstConsumer`-only class → **the import deadlocks** upstream (nothing consumes the PVC during population); the controller validates binding mode up front and fails the Task naming the class, rather than hanging. `replicated` (Immediate) qualifies; the default `local` does not.
+- `storageMap` omitted (or a datastore unmapped) → the controller resolves the VMs' datastores from inventory and maps them to the cluster default StorageClass, subject to the same binding-mode validation. On a stock Cozystack install the default class is `local`, which is `WaitForFirstConsumer`, so an empty `storageMap` fails at `Validating` with a message naming the class, its binding mode, and the remedy; in practice tenants name an `Immediate` class (`replicated`) explicitly, and the dashboard form offers the standard `storageclass` picker.
+- Guest with static network configuration inside the OS → imports as-is (raw copy never modifies the guest); the VM boots on the pod network with a new address while the guest may still hold its old LAN settings. The remedy in v1 is in-guest reconfiguration; the deferred network-placement design is the structural answer. Documented, because it is the first thing a real migration hits.
 - VDDK image configured → a `vddk-validator` Job appears in the tenant namespace and pulls a ~2 GB image; documented, counted in quota expectations.
 - CDI upgraded and stops applying `SetRestrictedSecurityContext` to the importer pod → the tenant path silently loses its PSS guarantee; asserted in e2e rather than trusted (§Testing), because CDI is a floating dependency in this repo.
 - Uninstalling the Forklift packages → the pre-delete hook removes the `ForkliftController` operand first; without it the operand's finalizer deadlocks CRD deletion (observed live).
