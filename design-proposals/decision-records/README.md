@@ -26,7 +26,7 @@ The operative rules — when a record is required, the template, the numbering, 
 Proposal drift is not hypothetical here; it is the normal case, and it is already happening in a way that loses reasoning:
 
 - [#42](https://github.com/cozystack/community/pull/42) and [#44](https://github.com/cozystack/community/pull/44) rewrote the database-horizontal-autoscaling proposal after an implementation spike disproved its load-bearing premise — that the autoscaler could be the enforced single owner of the application's `replicas` value.
-- [#53](https://github.com/cozystack/community/pull/53) then reopened that proposal's actuation mechanism on a live CloudNativePG finding: the `Cluster` `/scale` subresource exposes no `status.selector`, and upstream [cloudnative-pg#7923](https://github.com/cloudnative-pg/cloudnative-pg/issues/7923) is closed as not planned.
+- [#53](https://github.com/cozystack/community/pull/53) revised that proposal again after a live PoC exposed a CloudNativePG version floor: CNPG 1.27's `Cluster` `/scale` subresource lacked `status.selector`, but [cloudnative-pg#8996](https://github.com/cloudnative-pg/cloudnative-pg/pull/8996) added it in CNPG 1.28.4, 1.29.2 and 1.30.0, so the resolution was a version bump rather than a design change.
 - [#40](https://github.com/cozystack/community/pull/40), [#41](https://github.com/cozystack/community/pull/41) and [#36](https://github.com/cozystack/community/pull/36) are the same shape: an implementation finding rewriting an accepted proposal, with the *why* left in the pull-request body.
 - The compute-plane proposal carried a `Revision (this PR):` paragraph in its metadata block because that rationale had nowhere else to live. "This PR" stops resolving the moment the next revision lands.
 
