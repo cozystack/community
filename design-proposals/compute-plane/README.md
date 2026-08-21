@@ -47,7 +47,7 @@ Today Cozystack already has every primitive needed *except* the glue that ties t
 - **ApplicationDefinition** (`api/v1alpha1/applicationdefinitions_types.go`) maps a user-facing `kind` → a `HelmRelease` via `cozystack-api` (`pkg/registry/apps/application/rest.go`, `ConvertApplicationToHelmRelease()`). `spec.dashboard` already drives UI presentation (incl. `module: true`); the visibility control (Design §6) extends that path.
 - **Network isolation** (`packages/apps/tenant/templates/networkpolicy.yaml`): the `<tenant>-egress` `CiliumClusterwideNetworkPolicy` selects every pod in the tenant namespace — including the KubeVirt `virt-launcher` node pods — and denies egress to the kube-apiserver by default. This is the enforcement point the `sandbox` posture and the scoped data-plane egress (Design §5) build on.
 
-What does **not** exist yet: the `extra/computeplane` module chart and its `computeplane-application` PackageSource, a `placement` field on `ApplicationDefinition`, the scoped ComputePlane→tenant-service egress policy, and the `cozystack-api` visibility/mutation control. The substrate is present; the assembly is new.
+What has since shipped (cozystack/cozystack#3280, merged 2026-07-29): the `extra/computeplane` module chart and its `computeplane-application` PackageSource, including the `computeplane-rd` resource-definition component and the tenant-chart toggle. What still does **not** exist: a `placement` field on `ApplicationDefinition`, the scoped ComputePlane→tenant-service egress policy, and the `cozystack-api` visibility/mutation control.
 
 ### The problem
 
