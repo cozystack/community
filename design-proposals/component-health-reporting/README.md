@@ -19,6 +19,12 @@ Scope is deliberately narrow: report **facts** ("linstor: pvc-x Inconsistent on 
 - Backups reporting overlaps with any future backup-policy proposal; this proposal only *reports* backup freshness, it does not manage backup schedules.
 - Per-tenant scoping aligns with the tenant model used elsewhere (Kamaji tenant control planes, per-namespace resources).
 
+## Decisions
+
+<!-- Filled in as implementation proceeds; records live under this
+proposal's decisions/ directory, numbered from 0001, linked newest first.
+Empty while the proposal is still intent. -->
+
 ## Context
 
 Today, to assess cluster health an operator combines:
