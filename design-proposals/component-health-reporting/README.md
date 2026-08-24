@@ -58,6 +58,19 @@ A real incident that motivated this proposal (paraphrased operator experience on
 
 None of these were visible in one place. Every diagnosis was a manual walk across component boundaries. An operator staring at a single health page would have seen "kube-ovn: degraded on cp3 (ovs-ovn not ready)", "etcd: cp1 fsync p99 6s", "backups: keycloak-db stale" immediately.
 
+The dashboard-503 chain alone spanned five components; today an operator has to reconstruct it by hand, one layer at a time:
+
+```mermaid
+flowchart TD
+  d["cp1 slow disk"] --> e["etcd member falls behind"]
+  e --> n["cp1 NotReady"]
+  n --> p["postgres-operator pod stranded on cp1"]
+  p --> f["CNPG failover never happens"]
+  f --> ep["keycloak-db-rw endpoint empty"]
+  ep --> kc["Keycloak down"]
+  kc --> dash["dashboard OIDC 503"]
+```
+
 ## Goals
 
 - A single namespace-scoped CRD `Health` (`health.cozystack.io`) reporting per-component health, refreshed by a controller.
@@ -141,11 +154,52 @@ status:
 - **`spec` is controller/policy-owned, not tenant-writable**, and the CRD uses the `status` subresource so only the controller writes `status`. `spec.sla` thresholds are set by the platform (or the backup-policy owner), not by tenants, so a tenant cannot silence its own alerts by widening an SLA.
 - **`overall` rollup contract (deterministic).** `overall` is computed with fixed precedence `Down > Degraded > Unknown > Healthy` (worst wins) across `status.nodes` and `status.conditions`. A component with no observable source, or whose `observedAt` has passed `freshUntil`, rolls up to `Unknown`, never `Healthy`. Multi-target components (e.g. several backup targets, several nodes) take the worst target's state. Consumers key off `overall` but MUST treat an object past its `freshUntil` as `Unknown` regardless of the stored value.
 
+The value moves between four states; loss of a fresh observation always wins over a stale positive:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Healthy
+  Healthy --> Degraded: a node/condition turns non-ready
+  Degraded --> Down: quorum or availability lost
+  Down --> Degraded: partial recovery
+  Degraded --> Healthy: all conditions clear
+  Healthy --> Unknown: source unreachable or past freshUntil
+  Degraded --> Unknown: source unreachable or past freshUntil
+  Down --> Unknown: source unreachable or past freshUntil
+  Unknown --> Healthy: fresh observation, all clear
+  Unknown --> Degraded: fresh observation, issues remain
+```
+
 ### Controller
 
 A dedicated `health-controller` Deployment (separate from `cozystack-api`), with its own reconcile loop:
 
 - Polls each component's native source on a bounded interval, with caching, a per-adapter timeout, cancellation, capped retries with backoff, and a concurrency limit so one slow adapter cannot starve the others. An adapter that exceeds its timeout yields `Unknown` for its object and does not hold up the rest of the reconcile. **Health is never collected at request-time** — the dashboard and `kubectl` read the materialized CRD, so a slow component (e.g. a stalled LINSTOR controller) never blocks the health view. This is deliberate: request-time fan-out to several components is the failure mode that produced the cascading timeouts in the motivating incident.
+
+The write path (controller-side, on a timer) and the read path (consumer-side, against the stored object) are fully decoupled:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant T as reconcile ticker
+  participant C as health-controller
+  participant A as component adapter
+  participant S as native source
+  participant K as Health CRD
+  participant D as dashboard / kubectl / alerts
+  T->>C: tick (per interval)
+  C->>A: poll (timeout + cancel)
+  A->>S: read native state
+  alt source responds in time
+    S-->>A: facts
+    A-->>C: conditions + nodes
+    C->>K: write status, set observedAt and freshUntil
+  else timeout or source down
+    C->>K: write overall=Unknown, keep stale observedAt
+  end
+  D->>K: get / watch (no collection triggered)
+  K-->>D: current Health (Unknown once past freshUntil)
+```
 - Per-component **adapters** encapsulate "where does this component keep its truth":
   - **etcd (management)** — Prometheus metrics (`etcd_*`); it is a Talos static pod outside the k8s API.
   - **Cilium** — `CiliumNode` CRD, agent readiness, health API, `cilium_*` metrics.
