@@ -86,12 +86,13 @@ kind: Health
 metadata:
   name: etcd            # component name
   namespace: cozy-system  # scope: cozy-system = infra; tenant-* = that tenant
-spec:
+spec:                   # controller/policy-owned, NOT tenant-writable (see Security)
   component: etcd
   sla: {}               # optional per-component thresholds (e.g. backup maxAge)
-status:
-  overall: Degraded     # Healthy | Degraded | Down | Unknown
+status:                 # status subresource; only the controller writes it
+  overall: Degraded     # Healthy | Degraded | Down | Unknown (deterministic rollup)
   observedAt: "2026-08-21T18:16:00Z"
+  freshUntil: "2026-08-21T18:17:00Z"  # past this, consumers MUST read overall as Unknown
   nodes:
     cp1: Degraded
     cp2: Healthy
@@ -99,24 +100,52 @@ status:
   conditions:
     - type: FsyncLatency
       status: "False"
-      node: cp1
       reason: SlowDisk
       message: "wal fsync p99 6.2s (>1s)"
+      resourceRef:                    # structured, so consumers never parse message
+        kind: Node
+        name: cp1
       lastTransitionTime: "2026-08-21T18:10:00Z"
     - type: QuorumHealthy
       status: "True"
       message: "3/3 voting members"
 ```
 
-- **Namespace = scope.** `cozy-system/etcd` is the Talos management etcd; `tenant-foo/etcd` is that tenant's Kamaji-managed etcd. `kubectl get health.cozystack.io -A` shows everything; `-n tenant-foo` shows one tenant. RBAC per namespace comes for free (a tenant sees only its own).
-- **`status.nodes`** gives the per-node rollup; **`status.conditions`** carry specific problems, each optionally pinned to a node.
-- `overall` is a simple rollup the dashboard and alerts key off.
+Backup freshness is reported with typed fields, not encoded in `message` or inferred from `lastTransitionTime`:
+
+```yaml
+apiVersion: health.cozystack.io/v1alpha1
+kind: Health
+metadata:
+  name: backups
+  namespace: tenant-foo
+status:
+  overall: Degraded       # worst target wins (see rollup contract below)
+  observedAt: "2026-08-21T18:16:00Z"
+  freshUntil: "2026-08-21T18:17:00Z"
+  conditions:
+    - type: BackupFresh
+      status: "False"
+      reason: Stale
+      resourceRef:
+        kind: Cluster       # CNPG cluster
+        name: keycloak-db
+      lastSuccessfulAt: "2026-08-18T18:16:00Z"
+      maxAge: "24h"         # from spec.sla
+      observedAge: "72h"
+      lastTransitionTime: "2026-08-19T18:16:00Z"
+```
+
+- **Namespace = scope.** `cozy-system/etcd` is the Talos management etcd; `tenant-foo/etcd` is that tenant's Kamaji-managed etcd. `kubectl get health.cozystack.io -A` shows everything; `-n tenant-foo` shows one tenant. A namespaced CRD scopes only object *names*: read isolation is not automatic and requires explicit namespace-only `Role`/`RoleBinding`s per tenant, never a cluster-wide `ClusterRole` (see Security).
+- **`status.nodes`** gives the per-node rollup; **`status.conditions`** carry specific problems. Each condition pins the affected object with a structured `resourceRef` (kind/name, optionally namespace) so consumers identify it without parsing `message`; backup conditions additionally carry typed freshness fields (`lastSuccessfulAt`, `maxAge`, `observedAge`) rather than overloading `lastTransitionTime`.
+- **`spec` is controller/policy-owned, not tenant-writable**, and the CRD uses the `status` subresource so only the controller writes `status`. `spec.sla` thresholds are set by the platform (or the backup-policy owner), not by tenants, so a tenant cannot silence its own alerts by widening an SLA.
+- **`overall` rollup contract (deterministic).** `overall` is computed with fixed precedence `Down > Degraded > Unknown > Healthy` (worst wins) across `status.nodes` and `status.conditions`. A component with no observable source, or whose `observedAt` has passed `freshUntil`, rolls up to `Unknown`, never `Healthy`. Multi-target components (e.g. several backup targets, several nodes) take the worst target's state. Consumers key off `overall` but MUST treat an object past its `freshUntil` as `Unknown` regardless of the stored value.
 
 ### Controller
 
 A dedicated `health-controller` Deployment (separate from `cozystack-api`), with its own reconcile loop:
 
-- Polls each component's native source on an interval, with caching and retry. **Health is never collected in request-time** — the dashboard and `kubectl` read the materialized CRD, so a slow component (e.g. a stalled LINSTOR controller) never blocks the health view. This is deliberate: request-time fan-out to three components is exactly the failure mode that produced cascading timeouts in the motivating incident.
+- Polls each component's native source on a bounded interval, with caching, a per-adapter timeout, cancellation, capped retries with backoff, and a concurrency limit so one slow adapter cannot starve the others. An adapter that exceeds its timeout yields `Unknown` for its object and does not hold up the rest of the reconcile. **Health is never collected at request-time** — the dashboard and `kubectl` read the materialized CRD, so a slow component (e.g. a stalled LINSTOR controller) never blocks the health view. This is deliberate: request-time fan-out to several components is the failure mode that produced the cascading timeouts in the motivating incident.
 - Per-component **adapters** encapsulate "where does this component keep its truth":
   - **etcd (management)** — Prometheus metrics (`etcd_*`); it is a Talos static pod outside the k8s API.
   - **Cilium** — `CiliumNode` CRD, agent readiness, health API, `cilium_*` metrics.
@@ -124,7 +153,7 @@ A dedicated `health-controller` Deployment (separate from `cozystack-api`), with
   - **LINSTOR** — controller REST API and/or Piraeus `LinstorCluster`/`LinstorSatellite` conditions (`resource --faulty`).
   - **Kamaji tenant control plane** — Kamaji CR + pods in the tenant namespace.
   - **Backups** — CNPG `Backup`/`ScheduledBackup` status, etcd snapshot age, velero-style backups; compared against SLA to flag `Stale`/`Failed`.
-  - **Platform** — HelmRelease graph: report the first not-ready node in the `dependsOn` chain (the root), not the whole cascade.
+  - **Platform** — HelmRelease graph: report each not-ready release as a fact, along with its `dependsOn` edges, so the reader can see where a cascade originates. Naming a single "root of cascade" is root-cause inference (a heuristic: it misattributes when branches fail independently, and "first" is undefined for multiple roots), so it is deferred to the Phase 4 hint layer rather than emitted as a fact here.
 - Adapters are versioned with the components they read (component CRD/output shapes drift between versions). A broken adapter degrades one `Health` object to `Unknown`; it never takes down `cozystack-api` or the dashboard (isolated blast radius, independent release cadence).
 
 ### Isolation rationale
@@ -180,17 +209,18 @@ backups    Degraded                    1        40d
 
 - Purely additive: a new CRD and a new controller Deployment. No existing CRD, manifest, or API changes.
 - No migration. Existing clusters gain the `Health` objects once the controller runs.
-- Rollback: remove the controller and CRD; nothing else depends on them. Read-only, so removal cannot corrupt state.
+- Rollback follows dependency order: the dashboard "Cluster health" page, the KSM alert rules, and the optional plugin consume the CRD, so disable those consumers (or make them tolerate the CRD's absence) first, then remove the controller and CRD. Everything is read-only, so removal cannot corrupt managed state — only the health view disappears.
 
 ## Security
 
 - Controller is **read-only** against component sources and only writes its own `Health` CRD. It never mutates managed resources.
-- RBAC: needs read access across component CRDs/metrics and write on `health.cozystack.io`. Namespace-scoped `Health` means tenants can be granted read on only their own namespace — no infra health leaks to tenants.
-- No new tenant-supplied inputs, no new secrets. Adapters that call component REST APIs (e.g. LINSTOR) reuse existing in-cluster credentials.
+- RBAC: the controller needs read across component CRDs/metrics and write on `health.cozystack.io` (via the `status` subresource). Tenant read isolation is **not** implied by the namespaced CRD — it requires explicit namespace-only `Role`/`RoleBinding`s granting `get`/`list`/`watch` on the tenant namespace only, never a cluster-wide `ClusterRole` (which would expose `cozy-system` and other tenants). The rollout must include a test that a tenant credential cannot list `cozy-system` or other tenants' `Health`.
+- `spec` (including `sla` thresholds) is controller/policy-owned and not tenant-writable, enforced by RBAC (and optionally a validating/admission policy pinning `spec`). There are no tenant-supplied inputs and no new secrets. Adapters that call component REST APIs (e.g. LINSTOR) reuse existing in-cluster credentials.
 
 ## Failure and edge cases
 
 - **Source unavailable** (slow/stalled LINSTOR, metrics gap): the component's `Health` goes `Unknown` with `observedAt` stale, not a false `Healthy`. The dashboard shows "stale/unknown", never silent green.
+- **Controller stopped or `status` write failing**: a previously `Healthy` object must not stay `Healthy` indefinitely with an old `observedAt`. Every object carries a `freshUntil` deadline (a small multiple of its reconcile interval); once it passes, every consumer (dashboard, plugin, KSM alerts) treats `overall` as `Unknown`, and a watchdog alert fires when objects go stale cluster-wide (the controller itself is down).
 - **Adapter breaks on a new component version**: degrades that one object to `Unknown`; other components and the core API are unaffected.
 - **Management etcd**: reachable only via metrics/Talos, not the k8s API — the adapter must not assume a pod exists.
 - **Node churn** (reboot, reset): per-node entries reflect current membership; stale nodes are pruned on reconcile.
@@ -200,6 +230,8 @@ backups    Degraded                    1        40d
 - Unit: each adapter against recorded fixtures of its source (CRD samples, metric snapshots, REST payloads), asserting the produced `conditions`.
 - Integration: spin a kind/dev cluster, inject known-bad states (faulty DRBD resource, cordoned node, expired backup), assert `Health` objects report them.
 - e2e/manual: reproduce a subset of the motivating incident (stalled kube-ovn DS, stale backup) and confirm the health page/`kubectl` surfaces the root fact.
+- Resilience: assert a stalled/slow adapter is marked `Unknown` within its timeout without blocking other adapters, and that an object past its `freshUntil` (controller stopped) is surfaced as `Unknown` by consumers rather than a stale `Healthy`.
+- RBAC: assert a tenant credential can read only its own namespace and cannot `list` `Health` cluster-wide or in `cozy-system`.
 
 ## Rollout
 
@@ -212,8 +244,9 @@ backups    Degraded                    1        40d
 
 - CRD kind/name: `Health` (object-per-component) vs a single aggregate object per scope. Object-per-component gives cleaner `kubectl get`, per-object RBAC, and smaller writes; the aggregate gives one-shot reads. Leaning object-per-component.
 - Reconcile interval and staleness threshold defaults per component.
-- Should backup SLA thresholds live in this CRD's `spec` or be sourced from the backup policy owner?
-- Whether the HelmRelease "root of cascade" logic belongs in this controller or a separate platform-status adapter.
+- Backup SLA thresholds are policy-owned (not tenant-writable); still open is whether they are set directly in this CRD's `spec.sla` or mirrored from a dedicated backup-policy owner, and how precedence resolves if both exist.
+- The HelmRelease adapter reports not-ready releases as facts in Phase 1; naming a single cascade root is deferred to the Phase 4 hint layer. Open: whether that hint logic lives in this controller or a separate platform-status component.
+- Default `freshUntil` multiple of the reconcile interval, per component.
 
 ## Alternatives considered
 
