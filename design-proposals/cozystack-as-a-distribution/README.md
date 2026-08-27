@@ -292,6 +292,25 @@ copy:
 
 This is not cosmetic and cannot be deleted the way the tag can — the library genuinely is part of the rendered chart. It is a statement about what a package *is*: a package's version must be a function of its own directory **and** the libraries it vendors, and a `cozy-lib` change legitimately bumps every consumer. Which makes `cozy-lib` a de-facto part of 36 packages' interface with no version on it — the same undeclared-interface problem [Testing](#testing) raises for cross-package `lookup`, appearing inside the first-party archive rather than between catalogs. Partial upgrades will not isolate a `cozy-lib` fix, and the design should say so rather than discover it later.
 
+#### The counterfactual, also measured
+
+"Drop the tag and the churn goes away" is a claim, so it was tested rather than asserted. Both release trees were reassembled the way the `ArtifactGenerator` does — package directory plus the library charts copied into it — and content-hashed twice: as shipped, and with the Cozystack version removed from every image reference so the ref is `repo@sha256:…` alone.
+
+As shipped the model reproduces the cluster exactly: 73 moved, 134 held, with the same split by cause. That agreement is what licenses trusting it on the change it cannot observe directly.
+
+| | moved | held |
+|---|---|---|
+| as shipped | 73 | 134 |
+| version removed from every vendored ref | **59** | **148** |
+
+**Fourteen artifacts stop moving outright, and they are precisely the data plane:** Cilium in all five variants, LINSTOR, MetalLB, Multus, kubeovn-plunger, Kamaji, linstor-gui, objectstorage-controller and seaweedfs-system. Those are the same packages whose 16 pod restarts were measured above, so the fix removes every one of them.
+
+Four tag-only movers survive — `apps/clickhouse`, `apps/http-cache`, `apps/mariadb`, `extra/seaweedfs` — and the reason is instructive rather than a shortfall: they stop moving *for the tag* and keep moving because they vendor `cozy-lib`, which changed in this release.
+
+Which reorders the remaining work. After the tag fix the 59 survivors are 29 library fan-out, 18 genuine image rebuilds and 12 changed chart sources — so **the library question is no longer a footnote, it is the largest single cause of churn left.** Fixing both would take the release from 73 moved artifacts to 30, every one of them for a reason inside the package.
+
+One implementation note the experiment produced. A first attempt at the transform matched only `repo:tag@sha256:…` and recovered 4 of the 18, because `hack/lib/image-refs.sh` documents five ref shapes and two of the common ones put the tag elsewhere — a bare `tag: v1.6.1` with the digest in a sibling key (Cilium), and `tag: v1.6.1@sha256:…` as a YAML value. A digest-only change has to cover every shape that file enumerates, and `image-refs.sh` is the right and only place to enumerate them.
+
 #### Stop vendoring the tag
 
 **The tag fix is smaller than any other item in this proposal and independent of all of them.** Write `ghcr.io/cozystack/cozystack/metallb@sha256:…` and nothing else. The tag continues to exist in the registry — `hack/promote-retag.sh` pushes it — and the release manifest names it, so nothing that a human or a mirror needs is lost; only the copy that sits inside the chart and forces a reconcile goes away. `hack/promote-rewrite-tags.sh` and its bats suite are deleted outright, and the rc-leftover scan in `hack/verify-promoted-packages.sh` has nothing left to scan for. This is worth doing on its own merits whatever happens to the rest of the proposal, and its effect is measurable on the very next patch release.
@@ -538,7 +557,7 @@ Both precedents carry a piece Cozystack does not have yet, and the model is only
 
 The ordering is chosen so that each phase is independently valuable and independently revertible, and so that the cheapest item with the largest measurable effect comes first.
 
-1. **Stop vendoring the tag.** Pin first-party images by digest alone in every chart, delete `hack/promote-rewrite-tags.sh` and its bats suite, and pass `--reproducible` to the pool push. No design commitment of any kind. Measured on a cluster ([§4](#4-the-versioned-pool)), this removes 18 of the 73 artifact moves a patch release causes, and with them the Cilium, LINSTOR, MetalLB and objectstorage-controller pod restarts that deliver no new bytes.
+1. **Stop vendoring the tag.** Pin first-party images by digest alone in every chart — covering all five ref shapes `hack/lib/image-refs.sh` enumerates, not just the inline one — delete `hack/promote-rewrite-tags.sh` and its bats suite, and pass `--reproducible` to the pool push. No design commitment of any kind. Measured against the real trees ([§4](#4-the-versioned-pool)), it takes a patch release from 73 moved artifacts to 59 and removes every one of the Cilium, LINSTOR, MetalLB and objectstorage-controller pod restarts, which deliver no new bytes.
 2. **Cadence only.** Adopt the four-week train, publish the support window, cut `release-YYYY.MM` branches. No code changes. Two or three cycles of evidence before anything else depends on the cadence holding.
 3. **Land the upgrade lane.** Get [cozystack#3276](https://github.com/cozystack/cozystack/pull/3276) merged and promote it from advisory to required for release PRs. Independently valuable — it is already finding upgrade-only defects nothing else reaches — and everything downstream of the manifest depends on being able to test an upgrade of one.
 4. **Read the source-watcher archive path.** Confirm that `ArtifactGenerator`'s re-tar normalises entry metadata the way the `flux` CLI's does; the CLI half is already established in [§4](#4-the-versioned-pool). This is a code read, not a cluster experiment.
@@ -554,7 +573,7 @@ The ordering is chosen so that each phase is independently valuable and independ
 ## Open questions
 
 - **~~Is the generated tarball reproducible?~~ Answered: yes.** 134 artifacts held a byte-identical digest across two different pool revisions on a live upgrade ([§4](#4-the-versioned-pool)). Kept here only so a reader of an earlier draft can see it was closed by measurement.
-- **How is a library's version accounted for in its consumers'?** `cozy-lib` is vendored into 36 artifacts, so one edit to it moved 25 otherwise-untouched packages. Does a consumer's version bump with its library — making 36 packages move whenever `cozy-lib` does, honestly but expensively — or does the library become a separately versioned package the consumer references, which is a delivery change? See [§4](#4-the-versioned-pool).
+- **How is a library's version accounted for in its consumers'? This is now the largest open item.** `cozy-lib` is vendored into 36 artifacts, so one edit to it moved 25 otherwise-untouched packages — and once the tag fix lands it accounts for 29 of the 59 remaining moves, more than any other cause ([§4](#4-the-versioned-pool)). Does a consumer's version bump with its library, which is honest but moves 36 packages whenever `cozy-lib` does? Or does the library become a separately versioned package the consumer references rather than embeds, which is a delivery change and the only route to isolating a `cozy-lib` fix in a partial upgrade?
 - **Do `flux-plunger` and `flux-shard-operator` belong to core?** They exist only to make Flux deliver packages, which argues core; they are also Flux-version-coupled plumbing that a future delivery change would replace wholesale, which argues package. The classification in [§1](#1-four-tiers-one-package-model) puts them in core provisionally.
 - **Manifest kind and home.** A CRD applied to the cluster, a plain OCI artifact read by tooling, or both? #23's `TapIndex` cache is the obvious reader either way.
 - **How does the CalVer name relate to the existing `v1.x` stream?** Is `2026.08` a rename of the same stream, or does a final `v1.x` release announce the switch? What do existing release branches and backport automation do at the boundary?
@@ -603,6 +622,8 @@ Collected from `main` on 2026-07-27 (post-`v1.6.0`) and re-measured on 2026-08-2
 | Pods restarted on a byte-identical image | Cilium 3, LINSTOR 8, MetalLB 4, objectstorage-controller 1 | same run; metallb pods came back on the digests both tags carry |
 | Artifacts bundling a library chart | 36 of 207, all `cozy-lib`, copied in by the `ArtifactGenerator` | `kubectl get ag -A -o yaml` |
 | source-watcher re-tar determinism | confirmed — 134 artifacts held a byte-identical digest across two pool revisions | same run |
+| Counterfactual: version removed from every vendored ref | 59 moved / 148 held; the 14 eliminated are Cilium (5 variants), LINSTOR, MetalLB, Multus, kubeovn-plunger, Kamaji, linstor-gui, objectstorage-controller, seaweedfs-system | both trees reassembled as the ArtifactGenerator does and content-hashed; reproduces the cluster exactly when run unmodified |
+| Largest cause remaining after that fix | `cozy-lib` fan-out, 29 of 59 | same model |
 | Charts building from the root Go context | 11 (`COPY api pkg cmd internal`), so one `internal/` change moves every one of their digests | `packages/*/*/Makefile`, `images/*/Dockerfile` |
 | Flux archive determinism | byte-identical across builds; entries normalised to mtime `1970-01-01`, uid/gid `0` | `flux build artifact` twice on one tree, flux 2.8.6 |
 | `--reproducible` on the pool push | available, not passed | `packages/core/installer/Makefile:37` |
