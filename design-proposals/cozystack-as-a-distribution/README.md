@@ -7,11 +7,13 @@
 
 ## Overview
 
-Cozystack has exactly one version number, and everything wears it. 160 of the 164 charts under `packages/` ship with `version: 0.0.0 # Placeholder, the actual version will be automatically set during the build process`, stamped at build time from `COZYSTACK_VERSION`; the whole `packages/` tree is pushed as a single OCI artifact; a single digest in `packages/core/installer/values.yaml` selects it; and one `OCIRepository` fans that digest out to 98 `PackageSource` objects. A Postgres chart fix and a change to the aggregated apiserver are, as far as delivery is concerned, the same event.
+Cozystack has exactly one version number, and everything wears it. `COZYSTACK_VERSION` comes from `git describe --tags` in `hack/common-envs.mk` and every package Makefile reads it; the whole `packages/` tree is pushed as a single OCI artifact; a single digest in `packages/core/installer/values.yaml` selects it; and one `OCIRepository` fans that digest out to 98 `PackageSource` objects. A Postgres chart fix and a change to the aggregated apiserver are, as far as delivery is concerned, the same event.
+
+The charts themselves carry no version at all. All 164 under `packages/` ship `version: 0.0.0 # Placeholder, the actual version will be automatically set during the build process`, and nothing in the pool build ever replaces it: `helm package --version $(COZYSTACK_VERSION)` appears only in the `repo` target of `packages/{apps,system,extra,library}/Makefile`, which builds the separate Helm repository under `_out/repos/`, while the neighbouring `fix-charts` target *resets* the field to `0.0.0`. The pool is `flux push artifact --path=../../../packages` over the source tree, so what ships is `version: 0.0.0`, 164 times. The placeholder comment describes a build step that does not exist.
 
 This proposal replaces that single number with four, arranged the way an operating-system distribution arranges its own: a **core** on semantic versioning (the apiserver, controller, operator, CRDs, and the delivery contract itself), **packages** and **apps** each carrying their own semantic version, and a **distribution** — the thing users install and talk about — on calendar versioning, released monthly. A release stops being "the state of a git tree at a tag" and becomes what a distribution release has always been: a manifest that pins an exact set of component versions, tested together, shipped together, supported together.
 
-The change is smaller than it sounds, because the platform is already most of the way there and nobody has been calling the pieces by their distribution names. `PackageSource` and `Package` are a package database. Bundles are metapackages. `helm.sh/resource-policy: keep` on the `Package` CRs means the installed set already diverges from the shipped set — that is `dpkg --get-selections`, implemented by accident. `cozypkg` is `apt` with the version, repository, and index code removed. The per-package pre-upgrade migration hook exists and is used by four packages already. And the delivery layer already does the hardest part: generated artifact revisions are content-derived, so helm-controller already skips a package whose content did not change — the per-release rewrite of every `Chart.yaml` version is what guarantees no package is ever unchanged. What is genuinely missing is narrow: a versioned pool, an index, and eventually a version field on the source reference. This proposal specifies those and then connects the in-flight proposals that each assume some part of them.
+The change is smaller than it sounds, because the platform is already most of the way there and nobody has been calling the pieces by their distribution names. `PackageSource` and `Package` are a package database. Bundles are metapackages. `helm.sh/resource-policy: keep` on the `Package` CRs means the installed set already diverges from the shipped set — that is `dpkg --get-selections`, implemented by accident. `cozypkg` is `apt` with the version, repository, and index code removed. The per-package pre-upgrade migration hook exists and is used by four packages already. And the delivery layer already does the hardest part: generated artifact revisions are content-derived, so helm-controller already skips a package whose content did not change. What defeats it is narrower and more embarrassing than a version scheme — a cosmetic version string vendored inside each chart's image reference, rewritten on every release even for images that were not rebuilt (see [§4](#4-the-versioned-pool)). What is genuinely missing is narrow: a versioned pool, an index, and eventually a version field on the source reference. This proposal specifies those and then connects the in-flight proposals that each assume some part of them.
 
 The case is made from platform release engineering rather than from ecosystem ambition — the costs it addresses are paid every release cycle today, in a repository with no external catalogs at all. That framing is deliberate and is set out in [Why this is a release-engineering proposal](#why-this-is-a-release-engineering-proposal-not-a-marketplace-proposal), because it determines build order: the internal requirement can be satisfied with no discovery surface whatsoever, while a discovery surface cannot be satisfied without it.
 
@@ -22,7 +24,7 @@ This proposal is deliberately a joining piece. Several accepted or in-flight pro
 | Proposal | What it establishes | How this proposal relates |
 |---|---|---|
 | [community#43](https://github.com/cozystack/community/pull/43) — Out-of-tree application catalogs (`@lllamnyp`, Review) | Three application tiers (platform / curated catalog / external catalog), catalog repositories as OCI artifacts, e2e cost as the driver, a declared minimum platform version checked at `PackageSource` reconciliation | **Supplies the version axis #43 assumes.** #43 defines the *component structure* of the distribution (Debian's main/universe split); this proposal defines what a version means inside it and where the declared minimum platform version comes from. #43 is the stronger near-term motivator and should not wait on this |
-| [community#18](https://github.com/cozystack/community/pull/18) — Cozymarketplace (`@kvaps`, **accepted**, merged 2026-08-24 as [`design-proposals/cozymarketplace`](https://github.com/cozystack/community/blob/main/design-proposals/cozymarketplace/README.md)) | Repository-as-unit, a krew-style meta-index, a repository is one versioned OCI artifact, `cozypkg` repository commands | **Adopted as-is for external repositories; extended, not replaced, for the platform's own.** #18 makes per-package pinning a non-goal **for its Phase 1**, which is the right call for the problem #18 is solving; it is a sequencing statement, not a permanent exclusion. This proposal reaches a different conclusion for first-party packages from a different requirement — see [§8](#8-repository-as-unit-versus-package-as-unit) |
+| [community#18](https://github.com/cozystack/community/pull/18) — Cozymarketplace (`@kvaps`, **accepted**, merged 2026-08-24 as [`design-proposals/cozymarketplace`](https://github.com/cozystack/community/blob/main/design-proposals/cozymarketplace/README.md)) | Repository-as-unit, a krew-style meta-index, a repository is one versioned OCI artifact, `cozypkg` repository commands | **Adopted as-is for external repositories; extended, not replaced, for the platform's own.** #18 makes per-package pinning a non-goal **for its Phase 1**, which is the right call for the problem #18 is solving; it is a sequencing statement, not a permanent exclusion. This proposal is the Phase 2 it leaves room for, scoped to the first-party archive — see [§8](#8-repository-as-unit-versus-package-as-unit) |
 | [community#12](https://github.com/cozystack/community/pull/12) — Community package index and `cozypkg` authoring (`@kvaps`, `@IvanHunters`, closed 2026-07-16) | `cozypkg tap` / `init` / `push` / `search`, metadata-only index, `community.` name prefixing, an optional expected-signing-identity per entry | **Its package-level axis is revived here, on a different justification.** #12 was package-centric; #18 superseded it with a repository-centric model and #12 was closed. That supersession is sound on ecosystem grounds. This proposal re-derives the package-level axis from platform release engineering instead, and reuses #12's `cozypkg` surface and index-entry shape rather than inventing new ones |
 | [community#23](https://github.com/cozystack/community/pull/23) — Cozymarketplace supplementary (`@IvanHunters`, **accepted**, merged 2026-08-24 as [`design-proposals/cozymarketplace-supplementary`](https://github.com/cozystack/community/blob/main/design-proposals/cozymarketplace-supplementary/README.md)) | Marketplace endpoints in `cozystack-api`, a `TapIndex` cache, a pull credential set as `spec.secretRef` on the Flux source a tap already creates (no CRD change), `cozypkg validate` plus a two-lane index CI gate | **Consumed unchanged.** The `TapIndex` cache is the natural home for the release manifest / index reader described below. Note that #23 restates #18's position — "per-package version pinning remains out of scope, siding with `#18`" — so this proposal now differs from two accepted documents rather than one draft; see [§8](#8-repository-as-unit-versus-package-as-unit) |
 | [community#6](https://github.com/cozystack/community/pull/6) — ApplicationDefinition multi-version conversion (`@kvaps`, Draft) | `versions[]` with a storage version, `to`/`from` conversion templates, a `_version` stamp, a background migration controller | **Orthogonal axis, and the thing that makes semver honest.** #6 versions the *API surface* of an app; this proposal versions the *package*. Their relationship is what gives "breaking change" a testable definition — see [What MAJOR means](#what-major-means) |
@@ -85,7 +87,7 @@ One counter-fact to handle: `api/apps/v1alpha1/` is a **separate Go module** (`a
 
 ### The problem
 
-- **Every release moves every chart, and the version stamp is why.** Because chart versions are rewritten from `COZYSTACK_VERSION` before the pool is pushed, a release changes the version of 160 charts whether or not their content changed — and since generated artifact revisions are content-derived (see [§4](#4-the-versioned-pool)), that stamp is what forces every HelmRelease to upgrade. The delivery machinery would already skip unchanged packages; the single version number is what prevents any package from ever being unchanged. Users upgrading for a Postgres fix take the whole platform with them, and upgrade windows, blast radius, and rollback all scale with the size of the tree rather than the size of the change.
+- **A release moves packages that did not change, and a decorative tag string is why.** Measured across `v1.6.1..v1.6.2`, 35 of the 164 packages have any changed file at all: 9 changed chart source, 13 had an image digest move, and **13 moved because the version substring inside an image reference was rewritten while the digest stayed byte-identical.** The remaining 129 are untouched. Since generated artifact revisions are content-derived (see [§4](#4-the-versioned-pool)), each of those 13 nevertheless gets a new artifact digest and a HelmRelease upgrade, for a change Kubernetes never reads — it pulls by digest. So the churn is neither total nor unavoidable; it is manufactured by one line of cosmetics per chart, and removing it is a smaller change than anything else in this proposal.
 - **Breaking changes are held hostage.** A breaking change in one app forces either a platform major (which frightens users away from an upgrade that is mostly bug fixes) or an indefinite delay. There is no way to say "MongoDB 4.0 is breaking, the platform is not".
 - **A package fix cannot ship without a platform release.** Today the only route to a released cluster is a backport, and the backport bot fails silently on conflict and imports whole files for files absent on the target branch. Security fixes inherit that latency.
 - **Nothing can be tested or supported at package granularity,** because nothing *is* a package at release granularity. #43 wants catalog repositories with their own CI against a matrix of supported Cozystack releases; there is no version to put in that matrix except the whole platform's.
@@ -96,7 +98,7 @@ One counter-fact to handle: `api/apps/v1alpha1/` is a **separate Go module** (`a
 Per-package versioning has come up before in an ecosystem context — publishing, discovery, letting third parties ship apps — and in that context it was reasonably set aside. This proposal deliberately does not argue from ecosystem ambition, a roadmap item, or what other platforms have. It argues from four things that hurt today, in a repository with no external catalogs at all:
 
 1. **A fix cannot reach a released cluster without a platform release.** The only route today is a backport, and the backport automation fails silently on conflict and imports whole files when the target branch lacks the file being modified. Security fixes inherit that latency and that failure mode.
-2. **Every upgrade is a full-platform upgrade.** A month whose substance is three bug fixes still moves 160 chart versions, re-reconciles the tree, and asks operators for a maintenance window sized to the whole platform rather than to the change.
+2. **An upgrade is sized by the release, not by the change.** A patch release whose substance is nine chart-source fixes moves 35 packages, 13 of them for a rewritten tag string alone ([§4](#4-the-versioned-pool)), and the operator is asked for a maintenance window sized to the release rather than to the change — because nothing in the release tells them which 9 mattered.
 3. **Breaking changes are structurally discouraged.** With one version, a breaking change in one app is a platform-level event. The rational response is to defer it, and deferred schema debt is why [#6](https://github.com/cozystack/community/pull/6) exists at all — the shapes it wants to fix (`users` as a map, `postgresql.parameters.max_connections`) have been wrong for a long time and stayed wrong because there was no way to charge the cost to one app.
 4. **Release readiness is all-or-nothing.** `v1.6.0` needed four release candidates and a NO-GO on rc.1 for upgrade-only blockers in two components. With a single version, two blocked components block everything; with a manifest, they hold at their previous versions and the train ships.
 
@@ -126,7 +128,7 @@ None of those four require a marketplace, a community index, or a single externa
 
 | Tier | Contents | Versioning | Cadence |
 |---|---|---|---|
-| **Core** | `cozystack-api`, `cozystack-controller`, `cozystack-operator`, the `cozystack.io` CRDs, and the delivery contract (`PackageSource`, `Package`, `ApplicationDefinition`, `ApplicationGroupDefinition`) | SemVer | On its own, as needed |
+| **Core** | The mechanism: the aggregated apiserver, the controllers that reconcile Cozystack's own API, the tenant machinery, the package and application system, the `cozystack.io` CRDs, and the delivery contract (`PackageSource`, `Package`, `ApplicationDefinition`, `ApplicationGroupDefinition`) | SemVer | On its own, as needed |
 | **Packages** | Platform components — operators, CSI/CNI, monitoring, ingress; today's `packages/system` | SemVer, Cozystack's own, not upstream's | Continuous, released from `main` |
 | **Apps** | User-facing managed applications; today's `packages/apps` (and `packages/extra` after #39) | SemVer | Continuous, released from `main` |
 | **Distribution** | The thing users install and name | CalVer `YYYY.MM` | Monthly |
@@ -134,6 +136,36 @@ None of those four require a marketplace, a community index, or a single externa
 Mechanically, packages and apps are the **same object** — both are `PackageSource` + `Package` + charts, and both should stay that way. The distinction is a `section` on the package (Debian's `Section:` field), used for catalog presentation, tiering, and support policy, not for delivery. This mirrors #39's central argument one level up: a directory is not a mechanism, and behaviour that differs should be a declared field.
 
 Core is the one genuine exception, and it must be defined by **contract, not by binary**. If core's version tracks the Go code, a controller bug fix and a CRD field removal both read as "core changed" and the number communicates nothing. Core's semver describes the compatibility of the CRD groups, the `PackageSource`/`Package`/`ApplicationDefinition` semantics, and the operator's artifact-resolution behaviour. The binaries are implementation.
+
+#### Where the line falls
+
+The governing analogy is Kubernetes itself: the apiserver, the controller manager and the API machinery *are* Kubernetes, while the CNI, the CSI driver and the ingress controller are things that run on it, however indispensable. Applied here, **core is the mechanism and a package is anything that runs a workload** — including storage and networking, which are load-bearing but are not the platform.
+
+Eleven charts build their image from the repository root with `COPY api pkg cmd internal`, which makes them the set where the line is not obvious. Classified:
+
+| Chart or binary | What it does | Tier |
+|---|---|---|
+| `cozystack-api` | aggregated apiserver | **core** |
+| `cozystack-controller` | reconciles `Tenant` and `Application` | **core** |
+| `cozystack-operator` (ships in `packages/core/installer`) | `PackageSource` / `Package` | **core** |
+| `lineage-controller-webhook` | admits against `api/v1alpha1`, Cozystack's own CRDs | **core** |
+| `cozypkg` | the package manager (released as a binary asset, not an image) | **core** |
+| `packages/core/platform` | bundles, sources, the shape of the platform | **core** |
+| `flux-plunger`, `flux-shard-operator` | keep Flux delivering packages | **core**, but see the open question below |
+| `backup-controller`, `backupstrategy-controller` | own API group `api/backups/*`; a backup service | package |
+| `securitygroup-controller`, `kubeovn-plunger` | networking | package |
+
+Everything else under `packages/{system,apps,extra}` is a package without argument.
+
+#### Two consequences the rest of this proposal depends on
+
+**The delivery boundary is in the wrong place today, and moving it is real work.** Only two things currently ship outside the package pool: the CRDs, concatenated from `internal/crdinstall/manifests/*.yaml` into `_out/assets/cozystack-crds.yaml`, and the operator, rendered from `packages/core/installer` by the root `manifests` target. Flux itself comes from `internal/fluxinstall/manifests/fluxcd.yaml`. Everything else in the table above — the apiserver, the controller, the lineage webhook — travels through the pool as ordinary `packages/system/*` charts, on the same path as Cilium. Declaring them core therefore means moving three charts from the pool into the bootstrap lane, which changes how they are installed, upgraded and rolled back. This is the largest single piece of unscoped work in the proposal and it should be planned as its own change, not folded into the versioning work.
+
+A naming collision comes with it: `packages/core/` today holds `flux-aio`, `installer`, `platform`, `talos` and `testing`, of which only `platform` and part of `installer` are core in the sense used here. The directory name will have to give way, most likely by the same argument #39 makes — the tier is a declared field, not a path.
+
+**The Go tree stays one unit, so package versions must not be derived from image digests.** All eleven charts build from one `go.mod` and one build context, so a change anywhere in `internal/` invalidates the cache for every one of them and moves every digest. Splitting the module is explicitly not proposed: the coupling is real but the cost of severing it exceeds the benefit, and core being a single Go module is consistent with core being a single SemVer unit.
+
+The consequence is that a package's version cannot be a function of its image digest, because that digest moves for reasons belonging to a different tier. `backup-controller` is a package whose image is rebuilt whenever the apiserver changes. Two things follow, and both are already required for other reasons: the digest must not live inside the chart (see [§4](#4-the-versioned-pool) — it moves to the release manifest, which is also what removes the tag-rewrite churn), and a package's version must be derived from changes to *its own* directory rather than from its build output.
 
 ### 2. The distribution mapping
 
@@ -207,9 +239,38 @@ An earlier draft of this proposal treated the choice as gated on an unknown — 
 
 The field is optional, and cozystack never sets it: `reconcileArtifactGenerators` constructs `OutputArtifact{Name, Copy}` at `internal/operator/packagesource_reconciler.go:241-244`, and the string `Revision` does not appear anywhere in that file. The `@<alias>` pattern constrains the field *when set*; it is not evidence that revisions track the source. So generated artifact revisions are already content-derived, on every cluster running today.
 
-**This reframes the whole proposal, and it is the most important finding in it.** Content-derived revisions mean helm-controller already ignores a package whose content did not change. The reason every package nevertheless upgrades on every release is the version stamp itself: `packages/core/installer/Makefile` rewrites `Chart.yaml` from `COZYSTACK_VERSION` for all 160 charts before the pool is pushed, so every chart's content changes on every release, so every artifact digest changes, so every HelmRelease upgrades. **The single global version number is not merely a labelling problem — it is the direct mechanical cause of full-platform upgrade churn.** Giving charts real, stable versions does not merely enable partial upgrades as a future feature; it stops manufacturing the churn that makes them impossible.
+**This reframes the whole proposal.** Content-derived revisions mean helm-controller already ignores a package whose content did not change — so the question is not how to make partial upgrades possible, but what is currently preventing them. It is not the chart version, which never enters the pool (see [Overview](#overview)). It is a decorative version string vendored inside each chart's image reference.
 
-One narrower question remains, and it is the one worth testing: **is the generated tarball deterministic for identical input content across two different source revisions?** If source-watcher preserves modification times from its unpack of the source, the digest could vary build-to-build even for byte-identical files, and Option A would need a determinism fix upstream rather than a design change here. This is a tarball-reproducibility question, not an architecture question, and it does not need a Cozystack cluster: source-controller plus source-watcher on kind, two OCI artifacts differing in one directory, and a comparison of `status.artifact.digest` on an untouched `ExternalArtifact` across the two. The result belongs in this document before the design is locked.
+#### What actually manufactures the churn
+
+Every package Makefile writes its built image back into its own chart as `:$(IMAGE_TAG)@sha256:…`, and at promotion `hack/promote-rewrite-tags.sh` rewrites the rc substring to the stable one across every ref-bearing file — `packages/*/*/values.yaml`, `packages/*/*/images/*.tag`, and the files declared in `hack/lib/image-refs.sh`. Promotion deliberately does not rebuild; the script's own header says "only the cosmetic tag string moves from `1.6.0-rc.4` to `1.6.0`". The result, from the real `v1.6.1..v1.6.2` diff:
+
+```
+packages/system/metallb/values.yaml
+-      tag: v1.6.1@sha256:9d8ba76cdb9c7c6221334ad05d706dee22b138b3e90c1fe8fc884925b7480c02
++      tag: v1.6.2@sha256:9d8ba76cdb9c7c6221334ad05d706dee22b138b3e90c1fe8fc884925b7480c02
+```
+
+Identical digest, different file. Kubernetes resolves this reference by digest and never reads the tag, but the chart's bytes changed, so its generated artifact digest changed, so its HelmRelease upgraded. Classified across the whole tree for that release:
+
+| `v1.6.1` → `v1.6.2` | packages |
+|---|---|
+| untouched | **129** |
+| tag string only, image digest unchanged | **13** |
+| image digest moved (rebuild) | 13 |
+| chart source changed | 9 |
+
+Two things follow. First, "every release moves every chart" was never true: a patch release moves 35 of 164, and a minor (`v1.5.4` → `v1.6.0`) moves 92. Second, 13 of those 35 move for a string no runtime reads.
+
+**The fix is smaller than any other item in this proposal and independent of all of them: stop vendoring the tag.** Write `ghcr.io/cozystack/cozystack/metallb@sha256:…` and nothing else. The tag continues to exist in the registry — `hack/promote-retag.sh` pushes it — and the release manifest names it, so nothing that a human or a mirror needs is lost; only the copy that sits inside the chart and forces a reconcile goes away. `hack/promote-rewrite-tags.sh` and its bats suite are deleted outright, and the rc-leftover scan in `hack/verify-promoted-packages.sh` has nothing left to scan for. This is worth doing on its own merits whatever happens to the rest of the proposal, and its effect is measurable on the very next patch release.
+
+#### The tarball determinism question is answered
+
+An earlier draft listed as an open question whether the generated tarball is reproducible for identical input content, on the theory that unpack-time modification times could vary the digest. **It does not.** Flux normalises the archive: entries are written with mtime `1970-01-01`, uid/gid `0`, and fixed modes. Building the same directory twice with `flux build artifact` — pinned at 2.8.6, the version all three release workflows install — produces byte-identical output, `touch` in between included.
+
+One residual, stated precisely rather than waved away: that exercises the `flux` CLI's archive path, not source-watcher's re-tar inside `ArtifactGenerator`. The two share the upstream `fluxcd/pkg` archive code, so the remaining check is reading that code path rather than standing up a cluster, and rollout phase 3 shrinks accordingly.
+
+A related loose end worth fixing in the same pass: `flux push artifact --reproducible` exists — it fixes the OCI created-timestamp at epoch — and `packages/core/installer/Makefile:37` does not pass it. That affects the pool manifest's own digest, not the per-component artifacts, so it does not cause the churn above; it is simply free determinism that is currently declined.
 
 Option B remains the target for external catalogs, and the groundwork is favourable: `ArtifactGenerator.spec.sources[]` is **already a list with aliases** upstream, and the copy operations already address `@alias/path/**`. Cozystack always writes exactly one entry (`packagesource_reconciler.go:268-275`), so the change is confined to `reconcileArtifactGenerators`. The cost is object count — from 2 `OCIRepository` objects to roughly 100, each with a 5-minute poll interval, plus source-watcher's `emptyDir` unpack (`internal/fluxinstall/manifests/fluxcd.yaml:8287-8288`) rebuilding on every pod restart. That must be load-tested, not assumed. The recommended sequencing is therefore Option A for the first-party archive now, Option B when external catalogs land.
 
@@ -225,12 +286,20 @@ SemVer without a written rule is noise, and this is the item most likely to quie
 | **MINOR** | Additive schema only (new optional keys with defaults); no removed or retyped keys; no immutable-field or selector change | Upgrade in place; may ship a per-package migration; release-note entry |
 | **MAJOR** | Any of: a removed or retyped values key; a change of storage version under #6; a workload rename or immutable-field change requiring adoption or recreation; a change to a capability the package provides to others (#39) | Requires a conversion path (#6) or a documented manual action; may not be crossed by a partial upgrade without an explicit gate |
 
-Two CI gates make this real, and both must ship in the same phase as the version numbers:
+#### Computed, not hand-written
 
-1. **Content changed implies version bumped.** A package whose rendered output differs from the previous release without a version bump fails the build. Without this, an unchanged chart version over changed content becomes an OCI/Flux cache-poisoning bug.
-2. **Schema-diff classifies the bump.** Compare the generated OpenAPI schema against the previous version and assert the bump is at least as large as the diff implies. Removal or retyping demands MAJOR.
+Maintaining 164 `Chart.yaml` versions by hand is not viable, so PATCH and MINOR are **derived**: a package's version is a function of the changes to its own directory since the last release, computed at build time. That keeps the number honest for free and removes an entire class of "forgot to bump" review comments.
 
-The second gate is where #6 and this proposal meet: #6 gives an app the ability to *survive* a storage-form change, and this proposal gives it the number that *advertises* one. A MAJOR without a `to`/`from` pair is a manual-action release; with one, it is transparent.
+What a computed number cannot do is recognise a breaking change — no diff of files tells you that removing a values key strands existing clusters. **MAJOR is therefore declared, not derived.** The author states it, and CI's job is to check the declaration is honest rather than to produce it.
+
+Two CI gates make that real, and both must ship in the same phase as the version numbers:
+
+1. **Content changed implies version moved.** A package whose rendered output differs from the previous release without a version change fails the build. With derivation this is close to tautological, which is the point — it is the check that derivation is actually wired up. Without it, an unchanged chart version over changed content becomes an OCI/Flux cache-poisoning bug.
+2. **Schema-diff classifies the bump.** Compare the generated OpenAPI schema against the previous version and assert the declared bump is at least as large as the diff implies. Removal or retyping demands MAJOR, and a package that removed a key while declaring MINOR fails.
+
+The prior art for gate 2 is already in the tree and should be reused rather than re-invented: `cmd/api-gate` compares the Cozystack API surface across two checkouts, reports whether the change is "sizeable" — a new group, a new resource, or a break to an existing one — and CI turns that verdict into a required review from a designated API owner. That is exactly the shape wanted here, one tier down and with the verdict compared against a declaration instead of routed to a human.
+
+Gate 2 is also where #6 and this proposal meet: #6 gives an app the ability to *survive* a storage-form change, and this proposal gives it the number that *advertises* one. A MAJOR without a `to`/`from` pair is a manual-action release; with one, it is transparent.
 
 ### 6. Migrations: per-package, generalising a pattern that already exists
 
@@ -294,15 +363,15 @@ Two existing defects to fix while touching it: `add -f` on an existing Package f
 
 ### 8. Repository-as-unit versus package-as-unit
 
-This is the one place where this proposal reaches a different conclusion from an existing one, so it is set out in full rather than elided.
+This is the one place where this proposal could read as contradicting an accepted one, so it is set out in full rather than elided. The short version: it does not contradict #18, it continues it. #18 scopes its exclusion of per-package pinning to **Phase 1** — "out of scope for Phase 1; there is no per-package pinning today and the design proceeds without it" — which is a statement about sequencing, not a permanent property of the model. This proposal is the Phase 2 that sentence leaves room for, and it inherits #18's model wherever #18 has one.
 
 **The history matters, because it is a considered position and not an oversight.** [#12](https://github.com/cozystack/community/pull/12) (2026-05-26) was package-centric: publish, index, and install individual packages. [#18](https://github.com/cozystack/community/pull/18) (2026-06-23) proposed the repository as the unit instead, listing the package-centric model under Alternatives considered and rejecting it on the grounds that a thematic repository carries a "tested together" guarantee that a loose package catalog does not. #12 was then closed on 2026-07-16, and both #18 and #23 were merged on 2026-08-24 — which under the [approval process](https://github.com/cozystack/community/blob/main/design-proposals/README.md#approval-process) makes them accepted, not merely proposed. This proposal therefore argues against a settled position rather than a competing draft, and the burden is correspondingly higher. For the problem #18 addresses — how a community publishes coherent, mutually-tested sets of applications that Cozystack maintainers have not reviewed — **that reasoning is correct, and this proposal adopts #18's model unchanged for that case.** A third-party repository is authored and tested as a set, its author owes Cozystack no compatibility guarantee, and a repository-level tag costs nothing because the OCI artifact already exists.
 
-The different conclusion here comes from a requirement neither #12 nor #18 was scoped to weigh: **the platform's own release engineering.** #18's "tested together" argument is exactly the argument for a manifest — and a manifest that can only name whole repositories cannot express "these three packages moved and the other 155 did not". Shipping `2026.09` with the same core and three bumped apps is the entire value of the partial-upgrade goal, and it is unreachable if the finest addressable unit is the repository. So the disagreement is narrow and does not touch #18's thesis: it is about whether the *first-party archive* is one repository or many packages, not about how community repositories should work.
+The extension proposed here comes from a requirement neither #12 nor #18 was scoped to weigh: **the platform's own release engineering.** #18's "tested together" argument is exactly the argument for a manifest — and a manifest that can only name whole repositories cannot express "these three packages moved and the other 155 did not". Shipping `2026.09` with the same core and three bumped apps is the entire value of the partial-upgrade goal, and it is unreachable if the finest addressable unit is the repository. So the divergence is narrow and does not touch #18's thesis: it is about whether the *first-party archive* is one repository or many packages, not about how community repositories should work. Nothing here asks #18 or #23 to be amended.
 
 Both are true at different tiers, which is also how Debian works — the archive is versioned per package and resolved by a release; a third-party PPA is versioned as a unit and you take what it gives you.
 
-Two practical notes for whoever reconciles these. First, adopting per-package versioning for the first-party archive costs #18 nothing: its meta-index, tap flow, and repository-level tags are unaffected, and the manifest reader this proposal needs is the same `TapIndex` cache [#23](https://github.com/cozystack/community/pull/23) already specifies. Second, #12's concrete surface — `tap` / `untap` / `init` / `push` / `search`, `community.`-prefixed source names, metadata-only index entries with an optional expected signing identity — is reusable as written; the package-level axis is being revived here on new grounds, not the specific ergonomics being re-litigated.
+Two practical notes for whoever reconciles these. First, adopting per-package versioning for the first-party archive costs #18 nothing and asks nothing of it: its meta-index, tap flow, and repository-level tags are unaffected, and the manifest reader this proposal needs is the same `TapIndex` cache [#23](https://github.com/cozystack/community/pull/23) already specifies. Second, #12's concrete surface — `tap` / `untap` / `init` / `push` / `search`, `community.`-prefixed source names, metadata-only index entries with an optional expected signing identity — is reusable as written; the package-level axis is being revived here on new grounds, not the specific ergonomics being re-litigated.
 
 | Origin | Versioned unit | Rationale |
 |---|---|---|
@@ -401,7 +470,7 @@ Either way, security fixes need an exception path: a patch release of the curren
 
 ## Testing
 
-- **Conformance, in-tree and gating:** a synthetic package published at two versions; assert that upgrading the manifest from v1 to v2 reconciles exactly that package and leaves an untouched neighbour's `ExternalArtifact` digest and HelmRelease revision unchanged. This is the acceptance test for the entire proposal, and it subsumes the determinism check in rollout phase 2.
+- **Conformance, in-tree and gating:** a synthetic package published at two versions; assert that upgrading the manifest from v1 to v2 reconciles exactly that package and leaves an untouched neighbour's `ExternalArtifact` digest and HelmRelease revision unchanged. This is the acceptance test for the entire proposal.
 - **CI gates:** content-changed-implies-bump, and schema-diff-classifies-bump, both run per PR over the package tree.
 - **Migration framework:** unit tests on the `cozy-lib` version helper including the string-vs-integer comparison at 10; per-package hook tests reusing the existing helm-unittest harness.
 - **Upgrade e2e:** a two-release chain (`2026.08` → `2026.09`) with a partial manifest diff, asserting untouched workloads are not restarted. The existing seed → upgrade → verify lane is the right host for this.
@@ -410,24 +479,27 @@ Either way, security fixes need an exception path: a patch release of the curren
 
 ## Rollout
 
-The ordering is chosen so that each phase is independently valuable and independently revertible, and so that the riskiest item (the versioned pool) is preceded by the experiment that de-risks it.
+The ordering is chosen so that each phase is independently valuable and independently revertible, and so that the cheapest item with the largest measurable effect comes first.
 
-1. **Cadence only.** Adopt the four-week train, publish the support window, cut `release-YYYY.MM` branches. No code changes. Two or three cycles of evidence before anything else depends on the cadence holding.
-2. **Determinism check.** Confirm on kind (source-controller + source-watcher only) that a generated artifact's digest is stable for identical input content across two source revisions. Option A is already the chosen path per [§4](#4-the-versioned-pool); this phase only establishes whether it needs an upstream reproducibility fix alongside it.
-3. **Manifest, inert.** Publish the release manifest with all versions equal to the current platform version. Add `version` to the data model. Nothing resolves differently. Add the two CI gates.
-4. **ApplicationDefinition consolidation.** One coordinated pass folding this proposal's fields with #39's, #6's, and #3448's, before external catalogs depend on the shape.
-5. **Migration framework.** `cozy-lib` migration helper; port the four existing ad-hoc hooks onto it; new migrations are authored per-package; the global lane is frozen except for cross-cutting cases.
-6. **First real partial upgrade.** One release where the manifest moves a small number of low-risk packages (`bucket`, `http-cache` — not `postgres`, not `kubernetes`) and everything else holds. Measure what the tooling misses.
-7. **`cozypkg`.** Versions, search, show, upgrade, hold, non-interactive output, and documentation.
-8. **Repositories.** #43's catalogs and #18's taps land on the now-versioned mechanism; the manifest's `repositories` list ships the org catalog enabled-by-default per #43's shim plan.
-9. **CalVer switch.** Rename the release stream once the manifest, partial upgrades, and the support window are all proven. Last, not first.
+1. **Stop vendoring the tag.** Pin first-party images by digest alone in every chart, delete `hack/promote-rewrite-tags.sh` and its bats suite, and pass `--reproducible` to the pool push. No design commitment of any kind, and per [§4](#4-the-versioned-pool) it should stop 13 of the 35 packages a patch release moves. The effect is measurable on the next patch release, which makes it the honest test of whether the rest of this proposal is aimed at the right problem.
+2. **Cadence only.** Adopt the four-week train, publish the support window, cut `release-YYYY.MM` branches. No code changes. Two or three cycles of evidence before anything else depends on the cadence holding.
+3. **Read the source-watcher archive path.** Confirm that `ArtifactGenerator`'s re-tar normalises entry metadata the way the `flux` CLI's does; the CLI half is already established in [§4](#4-the-versioned-pool). This is a code read, not a cluster experiment.
+4. **Extract core.** Move `cozystack-api`, `cozystack-controller` and `lineage-controller-webhook` out of the package pool into the bootstrap lane alongside the operator and the CRDs, and resolve the `packages/core/` naming collision (see [§1](#1-four-tiers-one-package-model)). This is the largest piece of work in the list and it is deliberately placed before any versioning change, because a tier boundary that delivery does not honour cannot carry a version.
+5. **Manifest, inert.** Publish the release manifest with all versions equal to the current platform version. Add `version` to the data model. Nothing resolves differently. Add the two CI gates.
+6. **ApplicationDefinition consolidation.** One coordinated pass folding this proposal's fields with #39's, #6's, and #3448's, before external catalogs depend on the shape.
+7. **Migration framework.** `cozy-lib` migration helper; port the four existing ad-hoc hooks onto it; new migrations are authored per-package; the global lane is frozen except for cross-cutting cases.
+8. **First real partial upgrade.** One release where the manifest moves a small number of low-risk packages (`bucket`, `http-cache` — not `postgres`, not `kubernetes`) and everything else holds. Measure what the tooling misses.
+9. **`cozypkg`.** Versions, search, show, upgrade, hold, non-interactive output, and documentation.
+10. **Repositories.** #43's catalogs and #18's taps land on the now-versioned mechanism; the manifest's `repositories` list ships the org catalog enabled-by-default per #43's shim plan.
+11. **CalVer switch.** Rename the release stream once the manifest, partial upgrades, and the support window are all proven. Last, not first.
 
 ## Open questions
 
-- **Is the generated artifact tarball reproducible?** Option A is chosen ([§4](#4-the-versioned-pool)), but if source-watcher's tarball carries unpack-time modification times, identical content can yield differing digests and partial upgrades need an upstream determinism fix alongside this work. Checkable on kind; the answer changes the implementation's dependencies, not the design.
+- **Does source-watcher's re-tar normalise entry metadata?** The `flux` CLI's archive path does — mtime epoch, uid/gid zero, byte-identical output across builds ([§4](#4-the-versioned-pool)) — and the two share upstream archive code, but that has not been read. It is a code read rather than a cluster experiment, and the answer changes the implementation's dependencies, not the design.
+- **Do `flux-plunger` and `flux-shard-operator` belong to core?** They exist only to make Flux deliver packages, which argues core; they are also Flux-version-coupled plumbing that a future delivery change would replace wholesale, which argues package. The classification in [§1](#1-four-tiers-one-package-model) puts them in core provisionally.
 - **Manifest kind and home.** A CRD applied to the cluster, a plain OCI artifact read by tooling, or both? #23's `TapIndex` cache is the obvious reader either way.
 - **How does the CalVer name relate to the existing `v1.x` stream?** Is `2026.08` a rename of the same stream, or does a final `v1.x` release announce the switch? What do existing release branches and backport automation do at the boundary?
-- **Support window length.** Three releases? Six? Security-only tail? This must be answered before phase 1, not after.
+- **Support window length.** Three releases? Six? Security-only tail? This must be answered before the cadence changes in rollout phase 2, not after.
 - **Does core ship between trains?** Recommendation above is no; maintainers should confirm.
 - **Version reporting and diagnostics.** <a id="diagnostics"></a>With holds and partial upgrades, a cluster's state is a version vector rather than a single string. `cozypkg`, the dashboard, and the diagnostic bundle (`cozyreport` / crust-gather) must all carry it, or support gets harder rather than easier. Who owns that surface?
 - **Inter-package compatibility.** Debian works because packages have declared ABIs. Helm charts have none — the real interface is the values schema plus what one chart `lookup`s about another's live state, and several charts do exactly that (the Harbor jobservice storage-class preservation, the SeaweedFS fullname adoption). Should cross-package `lookup` be forbidden outside core, or should packages declare an interface version?
@@ -437,10 +509,10 @@ The ordering is chosen so that each phase is independently valuable and independ
 
 ## Alternatives considered
 
-- **Keep one version, improve the tooling.** Better changelogs and better test-impact analysis reduce the symptoms and leave the structure: every release still moves every chart, a breaking app change still forces a platform decision, and a package fix still cannot ship without a platform release.
+- **Keep one version, improve the tooling.** Better changelogs and better test-impact analysis reduce the symptoms and leave the structure: a release still moves packages nothing changed in, a breaking app change still forces a platform decision, and a package fix still cannot ship without a platform release. Rollout phase 1 is the part of this alternative worth taking — it is cheap, it is real, and it is not a substitute for the rest.
 - **SemVer for the distribution too, no CalVer.** Rejected because the distribution's version has no honest semantic meaning once components carry their own — a monthly release containing one app major and forty patches is neither major nor minor. A date is truthful. It also removes the perverse incentive to avoid necessary breaking changes because "we are not ready for 2.0".
 - **CalVer everywhere, including packages.** Rejected: package consumers need compatibility information from the version, which is exactly what a date does not carry.
-- **Repository-as-unit for everything (strict #18).** Adopted unchanged for community repositories, where its "tested together" reasoning holds. Not adopted for the first-party archive, for one reason: a repository-level version cannot express a partial upgrade, which is the proposal's primary goal. See [§8](#8-repository-as-unit-versus-package-as-unit) for why this is a narrow disagreement about the archive rather than a rejection of #18's model.
+- **Repository-as-unit for everything (strict #18).** Adopted unchanged for community repositories, where its "tested together" reasoning holds. Not adopted for the first-party archive, for one reason: a repository-level version cannot express a partial upgrade, which is the proposal's primary goal. See [§8](#8-repository-as-unit-versus-package-as-unit) for why this extends #18 into its own Phase 2 rather than rejecting its model.
 - **Wait for the marketplace work and take per-package versioning as a side effect of it.** Rejected on sequencing. The internal costs enumerated in [Why this is a release-engineering proposal](#why-this-is-a-release-engineering-proposal-not-a-marketplace-proposal) are paid every cycle now and do not depend on any ecosystem work landing; tying their fix to a discovery surface that is still under discussion delays it for reasons unrelated to it. The dependency runs the other way — the marketplace benefits from a versioned archive, not the reverse.
 - **Per-package versions but no manifest — resolve with SemVer ranges at install time.** Rejected firmly. Ranges without a lockfile import npm's resolution problem into a platform with no lockfile and no ability to test the resolved set. The manifest *is* the lockfile.
 - **Let users compose versions freely.** Rejected as a supported mode. A distribution decides the set; that is what makes it testable and supportable. Holds exist as an escape hatch and are labelled unsupported.
@@ -449,12 +521,12 @@ The ordering is chosen so that each phase is independently valuable and independ
 
 ## Appendix A — measured facts
 
-Collected from `main` on 2026-07-27 (post-`v1.6.0`). Line references are to that state.
+Collected from `main` on 2026-07-27 (post-`v1.6.0`) and re-measured on 2026-08-27 (post-`v1.6.2`). Line references are to the later state.
 
 | Fact | Value | Source |
 |---|---|---|
-| Charts on the `0.0.0` build-time placeholder | 160 of 164 (excluding vendored `charts/`) | `packages/**/Chart.yaml` |
-| Charts already carrying a hand-maintained version | 4 — `apps/foundationdb` `0.1.0`, `system/cozystack-scheduler` `0.3.0`, `system/kubeovn` `0.38.0`, `tests/cozy-lib-tests` `0.1.0`. Nothing reads them; the inconsistency is itself evidence that the convention is unenforced | same |
+| Charts on the `0.0.0` placeholder | 164 of 164 at depth 2 (excluding vendored `charts/`) | `packages/*/*/Chart.yaml` |
+| Anything that replaces that placeholder in the pool | nothing. `helm package --version` runs only in the `repo` target, which builds `_out/repos/`; `fix-charts` resets the field to `0.0.0` | `packages/{apps,system,extra,library}/Makefile` |
 | Package directories | 23 apps, 126 system, 8 extra | `packages/` |
 | `PackageSource` objects shipped | 98, all referencing `cozystack-packages` | `packages/core/platform/sources/*.yaml` |
 | `OCIRepository` objects in play | 2 (`cozystack-platform`, its clone `cozystack-packages`) | `main.go:564-602`, `repository.yaml:19` |
@@ -465,7 +537,12 @@ Collected from `main` on 2026-07-27 (post-`v1.6.0`). Line references are to that
 | `cozypkg` size / commits / documentation | 1811 lines / 3 commits / 0 lines of docs | `cmd/cozypkg/`, `git log` |
 | Core code churn, 12 months | ~620 commits across `internal/`, `pkg/`, `api/` | `git log --since='12 months ago'` |
 | Generated artifact revision derivation | content digest — the field is optional and cozystack never sets it | `fluxcd.yaml:522-528` (CRD doc), `packagesource_reconciler.go:241-244` (no `Revision`) |
-| Consequence | the delivery layer would already skip unchanged packages; the per-release chart-version rewrite is what guarantees none are ever unchanged | `packages/core/installer/Makefile` |
+| Packages moved by a patch release | 35 of 164 — 9 chart source, 13 image digest, **13 tag string only** — 129 untouched | `git diff v1.6.1..v1.6.2 -- packages/` |
+| Packages moved by a minor release | 92 of 164 | `git diff v1.5.4..v1.6.0 -- packages/` |
+| Charts building from the root Go context | 11 (`COPY api pkg cmd internal`), so one `internal/` change moves every one of their digests | `packages/*/*/Makefile`, `images/*/Dockerfile` |
+| Flux archive determinism | byte-identical across builds; entries normalised to mtime `1970-01-01`, uid/gid `0` | `flux build artifact` twice on one tree, flux 2.8.6 |
+| `--reproducible` on the pool push | available, not passed | `packages/core/installer/Makefile:37` |
+| Consequence | the delivery layer already skips unchanged packages; what defeats it is the version substring vendored into image references and rewritten at promotion | `hack/promote-rewrite-tags.sh`, `hack/lib/image-refs.sh` |
 
 ## Appendix B — unrelated defects found while surveying
 
