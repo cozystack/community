@@ -5,10 +5,11 @@
 - **Date:** `2026-07-15`
 - **Status:** Draft
 
-> **This is a stub.** The problem statement, the primitives survey, and the object
-> model are worked out; the controller mechanics, the provisioner contract details,
-> and the rollout are deliberately sketched. It is opened early to settle the
-> **shape** — is an address a resource? — before anyone writes code.
+> **The shape is settled and implemented; the contract details are not.** The problem
+> statement, the primitives survey, and the object model are worked out, and phase 1 of
+> *Rollout* now exists in code (see *Implementation status*). Deliberately still open:
+> the provisioner contract's own API (capabilities are not modelled yet), the admission
+> policy of *Security*, the sequencing beyond phase 1, and the open questions below.
 
 ## Overview
 
@@ -53,7 +54,7 @@ pattern, and the overlap is worth naming up front so reviewers are not surprised
   own is an open question (below); the name choice keeps that door open.
 
 Kinds are qualified by API group, so the short-name overlap is not a collision. The
-kinds live in `ipam.cozystack.io` (see *Positioning*).
+kinds live in `local.sdn.cozystack.io` (see *Positioning*).
 
 ## Scope and related proposals
 
@@ -67,6 +68,10 @@ kinds live in `ipam.cozystack.io` (see *Positioning*).
   proposal takes a position on it (see *Alternatives*): the **class** idea is right
   and should survive in some form; binding an address's lifetime to a `Service` is
   the part that cannot serve this use case.
+- **Depended on by:** `design-proposals/endpoint-attachments` (community #45), which
+  attaches one endpoint of an application to an external address. It consumes an
+  `IPAddressClaim` and the association annotation of §5; this proposal does not wait on
+  it and lands independently.
 - **Deferred to a sibling:** the *datapath* for whole-IP 1:1 NAT (all ports in, and
   the workload egressing **as** that address) — today provided by
   [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables rules. That is a
@@ -88,13 +93,61 @@ Cozystack-only machinery required to run it.
 Standalone value does **not** mean it lives outside the Cozystack API group. Cozystack
 already ships components that are fully standalone products yet live under
 `*.cozystack.io` — `etcd-operator.cozystack.io` is the precedent. This belongs there the
-same way: the kinds live in **`ipam.cozystack.io`**, and the component is deliberately
-shaped so Cozystack integrates it cleanly (a default class, and the exposure-request path
-of #29 able to name a claim). Standalone-valuable and in-the-Cozystack-group are not in
-tension, and designing for easy Cozystack integration is a goal, not a compromise.
+same way, and the component is deliberately shaped so Cozystack integrates it cleanly (a
+default class, and an exposure path able to name a claim). Standalone-valuable and
+in-the-Cozystack-group are not in tension, and designing for easy Cozystack integration
+is a goal, not a compromise.
+
+It also belongs in the **networking** group rather than a new one of its own. Cozystack
+networking is `sdn.cozystack.io` today: `SecurityGroup` lives there, served by the
+Cozystack API as a tenant-facing interface over Cilium network policies. Cozyplane serves
+its own `SecurityGroup` in that same group, plus `local.sdn.cozystack.io` for the kinds it
+serves as CRDs. Addresses are the third networking feature to want a home, and the
+argument here is only that networking APIs should not accumulate several different group
+names: **one `sdn` family**, with the `local.` prefix marking CRD-served kinds and the
+bare group the aggregated ones. So the kinds live in **`local.sdn.cozystack.io`**.
+`ipam.cozystack.io` is not wrong on its own terms — it adds a fourth name to a subject
+area that should have one.
+
+To be clear that this is a proposal and not an appeal to precedent:
+`local.sdn.cozystack.io` is new, nothing serves it today, and this would be among the
+first components to introduce it. Nor does the group
+string create a Cozystack dependency for a standalone user — the same three CRDs install
+under any name.
 
 Whether the kinds are greenfield or an adoption of Cluster API's IPAM kinds is an open
 question (below).
+
+## Implementation status
+
+Phase 1 of *Rollout* exists:
+
+- **[address-controller](https://github.com/lllamnyp/address-controller)** — the
+  class-agnostic core: the three kinds, claim–address binding, status, reclaim, and the
+  contract per-class drivers plug into. It never touches a Service.
+- **[metallb-iad](https://github.com/lllamnyp/metallb-iad)** — the reference per-class
+  driver, for addresses announced by MetalLB. A reservation is held as a placeholder
+  Service in a driver-owned namespace, so MetalLB's own accounting refuses to
+  double-assign a held address.
+
+One backend proves little on its own, so the load-bearing evidence is a **second
+consumer**. [Cozyplane](https://github.com/lllamnyp/cozyplane) wears reserved addresses
+through this contract with **no module import, no CRD dependency, and no informer on the
+claim kinds**: it copies a claim name into the association annotation (§5) on a Service it
+already owns, and the driver does the rest. With the mechanism absent entirely it behaves
+identically, auto-assigning instead — reserved and dynamic are one code path. Validated
+end to end on a three-node cluster running address-controller + metallb-iad + MetalLB +
+cozyplane: an address survived delete-and-rebind and stayed externally reachable
+throughout.
+
+Note precisely which seam that tests. *Rollout* §2 — a second **provisioner** — is the
+*allocation* seam, and it remains outstanding. What is demonstrated is the *association*
+seam: that a backend with an entirely different datapath can wear a reserved address while
+knowing nothing about the ledger beyond one annotation. The coupling turned out looser
+than this document assumed it would need to be.
+
+The `ValidatingAdmissionPolicy` of *Security* is implemented in neither repository. It is
+the outstanding half of phase 1, not a phase 2 item.
 
 ## Context
 
@@ -226,20 +279,20 @@ Load-bearing findings, because the design is shaped by them:
 
 ```yaml
 # Admin, once per address source.
-apiVersion: ipam.cozystack.io/v1alpha1
+apiVersion: local.sdn.cozystack.io/v1alpha1
 kind: IPAddressClass
 metadata:
   name: public
   annotations:
-    ipaddressclass.ipam.cozystack.io/is-default-class: "true"
+    ipaddressclass.local.sdn.cozystack.io/is-default-class: "true"
 spec:
-  provisioner: metallb.ipam.cozystack.io  # who fulfils claims of this class
+  provisioner: metallb.drivers.local.sdn.cozystack.io  # who fulfils claims of this class
   reclaimPolicy: Retain                  # Retain | Delete   (default Retain)
   parameters:                            # opaque to the core controller
     addresses: ["203.0.113.0/24"]
 ---
 # Tenant. This is the whole tenant-facing API.
-apiVersion: ipam.cozystack.io/v1alpha1
+apiVersion: local.sdn.cozystack.io/v1alpha1
 kind: IPAddressClaim
 metadata: {name: web, namespace: tenant-a}
 spec:
@@ -252,7 +305,7 @@ status:
       address: 203.0.113.7   # what the tenant reads, and puts in DNS
 ---
 # Cluster-scoped. The inventory. Created by the provisioner, not the tenant.
-apiVersion: ipam.cozystack.io/v1alpha1
+apiVersion: local.sdn.cozystack.io/v1alpha1
 kind: IPAddress
 metadata: {name: ip-203-0-113-7}
 spec:
@@ -327,7 +380,7 @@ A workload references the **claim**, never the raw address:
 kind: Service
 metadata:
   annotations:
-    ipam.cozystack.io/ip-address-claim: web    # a claim in THIS namespace
+    local.sdn.cozystack.io/ip-address-claim: web    # a claim in THIS namespace
 spec: {type: LoadBalancer, ...}
 ```
 
@@ -431,16 +484,16 @@ draw from it *automatically*; they draw from the admin's other pools. Explicit s
 guarantee.
 
 > *"A cluster-admin runs `kubectl create -f bad-service.yaml --as
-> system:serviceaccount:cozy-ipam:ipam-controller`, referencing the reserved pool and
-> maybe pinning a specific address."* — Admission cannot stop this: the request carries
-> the controller's identity, and a cluster-admin is the cluster's trust root anyway (they
-> can rewrite the policy or edit MetalLB objects directly). Layer 2 is what applies. The
-> Service is assigned a reserved address; the controller sees an assignment no claim
-> authorizes; the `IPAddress` goes `Conflict` with the offending Service named. The
-> reservation is not silently overwritten — the conflict is surfaced for an operator (or
-> an automated policy) to resolve. That is the honest boundary: the model defends tenants
-> against each other, and turns admin/impersonator collisions into **visible faults**
-> rather than pretending to prevent them.
+> system:serviceaccount:cozy-address-controller:address-controller`, referencing the
+> reserved pool and maybe pinning a specific address."* — Admission cannot stop this: the
+> request carries the controller's identity, and a cluster-admin is the cluster's trust
+> root anyway (they can rewrite the policy or edit MetalLB objects directly). Layer 2 is
+> what applies. The Service is assigned a reserved address; the controller sees an
+> assignment no claim authorizes; the `IPAddress` goes `Conflict` with the offending
+> Service named. The reservation is not silently overwritten — the conflict is surfaced
+> for an operator (or an automated policy) to resolve. That is the honest boundary: the
+> model defends tenants against each other, and turns admin/impersonator collisions into
+> **visible faults** rather than pretending to prevent them.
 
 **Cilium LB-IPAM.** Cilium has no `autoAssign` flag; the equivalent is `serviceSelector`.
 The reserved `CiliumLoadBalancerIPPool` carries a `serviceSelector` matching a label the
@@ -496,7 +549,7 @@ and the design is explicit about which threat each one covers.
 **Layer 1 — admission, against tenants.** Turn the ungatable annotation into a reference
 to an RBAC-gated object:
 
-1. A tenant may only write `ipam.cozystack.io/ip-address-claim`, naming an object in
+1. A tenant may only write `local.sdn.cozystack.io/ip-address-claim`, naming an object in
    their **own namespace**, which RBAC *can* gate.
 2. The **controller** writes the backend's raw pool/pin annotations.
 3. A `ValidatingAdmissionPolicy` **rejects a non-allowlisted principal** writing *any*
@@ -515,8 +568,9 @@ principals **outside** an explicit, admin-configurable allowlist.
 
 **Layer 2 — reconciliation, for everyone admission cannot bind.** Layer 1 is keyed on
 identity, so it is defeated by anyone who can impersonate an allowlisted ServiceAccount —
-which a cluster-admin can (`--as system:serviceaccount:cozy-ipam:ipam-controller`), along
-with rewriting the policy or editing MetalLB objects directly. **This is a real trust
+which a cluster-admin can (`--as
+system:serviceaccount:cozy-address-controller:address-controller`), along with rewriting
+the policy or editing MetalLB objects directly. **This is a real trust
 boundary, not a bug to be closed:** a cluster-admin is the cluster's trust root, and
 handing out a reserved address is within their authority, not an escalation. What the
 design owes here is not prevention but **detection**. Because the `IPAddress` ledger is
@@ -575,9 +629,12 @@ the `ResourceQuota` are for, and it is a bound, not a gate.
 Sketch — sequencing is an open question:
 
 1. CRDs + core controller + the **MetalLB** provisioner + the admission policy. (The
-   admission policy is not phase 2. See *Security*.)
+   admission policy is not phase 2. See *Security*.) The controllers and the driver
+   exist; the admission policy does not — see *Implementation status*.
 2. The Cilium provisioner. Proves the abstraction is not a MetalLB adapter — **this is
    the phase that either validates or falsifies the design**, and it should come early.
+   A second *consumer* has since exercised the association half (*Implementation
+   status*); a second *provisioner* is what remains.
 3. A cloud provisioner (adoption path, `source.providerRef`). Proves the source union.
 
 ## Open questions
