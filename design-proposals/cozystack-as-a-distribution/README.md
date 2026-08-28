@@ -159,6 +159,25 @@ Eleven charts build their image from the repository root with `COPY api pkg cmd 
 
 Everything else under `packages/{system,apps,extra}` is a package without argument.
 
+#### What carries the version
+
+The tier says what a thing is. A separate question is what object the number attaches to, and the honest answer is not the chart directory.
+
+`PackageSource` already groups what has to ship together, and the tree proves it: 31 of the 99 sources span more than one top-level directory, 23 of them `apps` + `system`. That is not untidiness. An application's chart lives in `apps/<x>` while the `ApplicationDefinition` that serves it lives in `system/<x>-rd`, often with its operator, and none of the three is installable without the others. The dependency graph is drawn at the same granularity — all 251 `dependsOn` edges are source-to-source, not chart-to-chart. This is a Debian source package producing several binaries at one version, already implemented and already load-bearing.
+
+So the unit is the `PackageSource`: 99 of them rather than 164 charts. [§3](#3-the-release-manifest)'s manifest already keys on source names (`cozystack.linstor`, `cozystack.postgres-application`) — the example anticipated this before the prose did. Two things the proposal needs then land on objects that exist: a version on the source, and a constraint on the `dependsOn` edges it already declares.
+
+Measured on `v1.6.1` → `v1.6.2` at that granularity, and it is the number that decides the granularity question:
+
+| Unit | Held on a patch release |
+|---|---|
+| `PackageSource`, as things stand | 49 of 99 |
+| `PackageSource`, after the tag fix | 57 of 99 |
+| `PackageSource`, after the tag fix and the library shrink | **83 of 99** |
+| Directory group (core / system / apps / extra / library) | **0 of 5** |
+
+The last row is not a rounding artefact. Every release touches every group: the four most recent transitions moved 6, 4, 5 and 6 groups out of the six that exist.
+
 #### Two consequences the rest of this proposal depends on
 
 **The delivery boundary is in the wrong place today, but moving it needs no new machinery.** The installer chart renders exactly three things — the operator Deployment, the `cozy-system` namespace, and a pre-install Job that labels it. It carries no `crds/` directory and no CRD hook. What installs the CRDs depends on the path: the chart passes `--install-crds=true` and `--install-flux=true` to the operator (both default to `false` in the binary), so on the Helm path the operator installs them itself at startup from embedded manifests, via `crdinstall.Install` and `fluxinstall.Install`, then creates the platform `PackageSource`. On the `kubectl apply` path the same manifests ship as a release asset — `make manifests` concatenates `internal/crdinstall/manifests/*.yaml` into `_out/assets/cozystack-crds.yaml` and `hack/upload-assets.sh` uploads it beside the rendered operator — and the operator applies them idempotently afterwards. One source, two deliveries.
@@ -405,6 +424,18 @@ Two CI gates make that real, and both must ship in the same phase as the version
 The prior art for gate 2 is already in the tree and should be reused rather than re-invented: `cmd/api-gate` compares the Cozystack API surface across two checkouts, reports whether the change is "sizeable" — a new group, a new resource, or a break to an existing one — and CI turns that verdict into a required review from a designated API owner. That is exactly the shape wanted here, one tier down and with the verdict compared against a declaration instead of routed to a human.
 
 Gate 2 is also where #6 and this proposal meet: #6 gives an app the ability to *survive* a storage-form change, and this proposal gives it the number that *advertises* one. A MAJOR without a `to`/`from` pair is a manual-action release; with one, it is transparent.
+
+#### Why the unit cannot be coarser than an API surface
+
+This is the argument against versioning by group or by repository, and it is not about granularity of convenience. It is that a coarse unit makes MAJOR unverifiable and then meaningless.
+
+Gate 2 works by diffing a generated OpenAPI schema against the previous version of the same object. A `PackageSource` has one — its components' `ApplicationDefinition` schemas are a closed set. A group of thirty applications has no single API surface to diff, so there is nothing to compare a group's declared MAJOR against. The declaration stops being checkable, and an unchecked SemVer is a convention, which is the failure this section exists to prevent.
+
+The same applies to #6. A conversion is written between two storage versions of one app's API, and it lives with that app. A group MAJOR cannot carry `to`/`from` pairs, because there is no single schema being converted, so the mechanism that makes a breaking change survivable has nowhere to attach.
+
+And it degrades what the number tells an operator. A group MAJOR says something in the group broke, not what. Every package in the group that did not break is dragged to a major with it, so the signal moves from "you must act" to "somebody must act, possibly not you" — and after two releases where the major did not concern them, operators stop reading it. A version whose majors are usually irrelevant is worse than no version, because it costs attention and returns nothing.
+
+None of this argues against grouping. It argues that grouping is a support and presentation concern — the `section` field, the tiers in #43 — and not the thing the number attaches to.
 
 ### 6. Migrations: per-package, generalising a pattern that already exists
 
@@ -664,6 +695,7 @@ The ordering is chosen so that each phase is independently valuable and independ
 - **Per-package versions but no manifest — resolve with SemVer ranges at install time.** Rejected firmly. Ranges without a lockfile import npm's resolution problem into a platform with no lockfile and no ability to test the resolved set. The manifest *is* the lockfile.
 - **Let users compose versions freely.** Rejected as a supported mode. A distribution decides the set; that is what makes it testable and supportable. Holds exist as an escape hatch and are labelled unsupported.
 - **Split the repository first, version second** (i.e. do #43 before this). Not rejected — these are compatible and #43 has the more urgent driver in e2e cost. The note is only that #43's catalogs will need a version axis and will otherwise invent a local one per catalog.
+- **Version by group rather than by package** (one number for core, one for system, one per app layer), which is the shape a repository split implies. Rejected on measurement, and the measurement is one-sided. It does buy something real: an edge needs a declared contract only when its two ends can move independently, so grouping absorbs most of them — with directory-sized groups, 247 of the 251 `dependsOn` edges become intra-group and only 4 cross. But it costs the entire partial-upgrade goal. Every release touches every group; the last four transitions moved 6, 4, 5 and 6 of the six directory groups, so "upgrade what changed" degenerates to "upgrade everything". Against that, versioning the `PackageSource` holds 83 of 99 units on the same release ([§1](#1-four-tiers-one-package-model)). Trading a 15-declaration problem for the whole benefit is not a good trade. The decisive objection is separate and is in [§5](#5-what-major-means): a group has no API surface to diff, so a group's MAJOR cannot be verified, cannot carry #6's conversions, and cannot tell an operator which component actually broke.
 - **Cut the system layer out as well**, so core, system and the app layers above it become separate repositories each declaring a minimum version of the layer beneath. This is #43 plus one more cut, raised in review and not yet written up; the increment over #43 is the system split, not the idea of splitting. Not evaluated here, and not opposed: the version axis applies to it unchanged, as it does to #43. One observation for whoever writes it. Coarser granularity does not by itself remove the need for declared contracts, and the archive has a live example: `_barman.tpl` is an undeclared edge between `apps/postgres` and `system/keycloak` ([§4](#4-the-versioned-pool)), keycloak being a consumer because it runs a CNPG Postgres of its own. Any split that puts those two in different repositories turns that edge into a cross-repository one rather than eliminating it, which is an argument for declaring contracts alongside a split rather than instead of one.
 - **Design a new migration framework from first principles.** Rejected in favour of generalising the four per-package hooks already in the tree. The existing pattern is proven, and its ordering guarantees are strictly better than the global counter's.
 
@@ -694,6 +726,10 @@ Collected from `main` on 2026-07-27 (post-`v1.6.0`) and re-measured on 2026-08-2
 | `cozy-lib` size and shape | 728 lines, 43 helpers; two of them (`rbac.subjectsForTenantAndAccessLevel` 27 consumers, `resources.defaultingSanitize` 21) carry 48 of ~55 consumer relationships | `packages/library/cozy-lib/templates/*.tpl` |
 | `cozy-lib` with no consumer outside its own test chart | all of `_tls.tpl` (92 lines), 14 of the 15 helpers in `_cozyconfig.tpl`, and `rbac.subjectsForTenant` | same |
 | The change that caused the 25-package fan-out | one added file, `_barman.tpl`, 24 lines, 2 consumers | `git diff --name-status v1.6.1..v1.6.2 -- packages/library/cozy-lib` |
+| `PackageSource` objects, and how many span directories | 99 total, 31 span more than one (23 `apps`+`system`, 7 `extra`+`system`, 1 all three) | `packages/core/platform/sources/*.yaml` |
+| `dependsOn` edges, and how many cross a directory group | 251 total, 247 within, **4 crossing** | same |
+| Held on a patch release, by candidate unit | `PackageSource` 49 of 99 today, 57 after the tag fix, **83 after the tag fix and the library shrink**; directory group **0 of 5** | `v1.6.1..v1.6.2` against the source definitions |
+| Groups touched per release | 6, 4, 5 and 6 of six, over the last four transitions | `git diff --name-only <a>..<b> -- packages/` |
 | source-watcher re-tar determinism | confirmed — 134 artifacts held a byte-identical digest across two pool revisions | same run |
 | Counterfactual: version removed from every vendored ref | 59 moved / 148 held, 16/95 HelmReleases, **21/164 pods** (against 73 / 134 / 23 / 43); the 14 eliminated are Cilium (6 artifacts), LINSTOR, linstor-gui, MetalLB, Multus, kubeovn-plunger, Kamaji, objectstorage-controller, seaweedfs-system | same stand, two rebuilt pools pushed and applied in sequence |
 | Data-plane pods restarted under that counterfactual | Cilium 0, LINSTOR 0, MetalLB 0, Multus 0, objectstorage-controller 0 | same run |
