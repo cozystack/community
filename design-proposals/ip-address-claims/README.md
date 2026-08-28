@@ -15,7 +15,7 @@
 
 A tenant cannot *own* an address. They can only cause one to appear as a side effect
 of creating a `Service type: LoadBalancer`, and it evaporates when that Service does.
-There is no object to hold, keep, quota, bill, hand to another workload, or point DNS
+There is no object to hold, keep, quota, hand to another workload, or point DNS
 at with confidence.
 
 This proposal makes the address a resource. Applying the `PersistentVolume` pattern
@@ -182,10 +182,10 @@ None of these are expressible. The address has no independent existence, so:
 - **It cannot be shown.** No inventory. "Which addresses do we own, and who has them?"
   has no answer short of listing every Service in the cluster.
 
-This is a **new capability**, argued on its own merits: hold, move, quota, enumerate,
-bill. Cozystack has no prior reserve-then-associate mechanism to preserve — the
-platform uses kube-ovn only for subnets and VPCs, not for its EIP objects — so there
-is nothing here being restored, only something being added.
+This is a **new capability**, argued on its own merits: hold, move, quota, enumerate.
+Cozystack has no prior reserve-then-associate mechanism to preserve — the platform uses
+kube-ovn only for subnets and VPCs, not for its EIP objects — so there is nothing here
+being restored, only something being added.
 
 ## Goals
 
@@ -298,6 +298,8 @@ metadata: {name: web, namespace: tenant-a}
 spec:
   className: public          # empty => the default class
   family: IPv4               # IPv4 | IPv6 | Dual
+  # addressName: ip-203-0-113-7   # optional: bind this specific Available address --
+                                  # the PVC spec.volumeName analogue, single-family only
 status:
   phase: Bound
   addresses:                 # a list, so a Dual claim can report v4 + v6
@@ -392,44 +394,66 @@ Remove the annotation and the announcement is withdrawn, but the `IPAddress` sta
 `Bound` to its claim and simply becomes inert — **a reserved address, held, attached to
 nothing.** Which is what an unassociated EIP is.
 
+**The annotated object is not always a Service.** Some consumers *own* the Service they
+are announced on rather than being one: under Gateway API the implementation renders the
+data-plane Service from the `Gateway`, so there is no user-authored Service to annotate,
+and the object the user does write has no way to name an address. The contract is therefore
+an **annotated object that resolves to an address consumer** — `Service` is the first
+member and `Gateway` the obvious second. Which object a given backend annotates, and where
+it lands the pin (`Gateway.spec.addresses`, infrastructure annotations propagated onto the
+generated Service, or the generated Service itself), is the provisioner's business (§4).
+The consequence that is *not* the provisioner's business is in *Security*:
+`Gateway.spec.addresses` names an address **by value**, so it is the same escalation
+surface as a backend pin annotation and the admission policy has to cover it.
+
 This is the claim-first path: the address exists before the Service names it. §6 covers
 the opposite order — when an eager allocator hands a Service an address before any claim
 exists.
 
 ### 6. When the allocator gets there first
 
-An eager allocator does not wait to be asked. MetalLB assigns an address the moment it sees
-a `Service type: LoadBalancer`, before any `IPAddressClaim` exists and whether or not one
-ever will. So the inventory cannot assume every address originates from a claim: the
-controller must also work **backwards** — observing `status.loadBalancer` on Services and
-reconciling the addresses it finds into `IPAddress` objects after the fact — so the
-cluster-scoped inventory converges on what is actually in use rather than only on what was
-asked for.
+An eager allocator does not wait to be asked. MetalLB assigns an address the moment it
+sees a `Service type: LoadBalancer`, before any `IPAddressClaim` exists and whether or not
+one ever will. Two things follow.
+
+**A reservation is held in the allocator's own books, not merely recorded in ours.** For
+every address that is reserved but not currently attached, the provisioner keeps a
+**holder**: for MetalLB, a selectorless `type: LoadBalancer` Service in a provisioner-owned
+namespace, which MetalLB assigns the address to and, having no endpoints, never announces —
+held in the backend's accounting, silent on the wire. Neither MetalLB nor Cilium will give
+one address to a second Service without an explicit sharing key, so for as long as the
+holder exists the reservation is enforced by the allocator itself rather than by our
+detection. This is the primary guarantee, and it is what makes a reserved-but-unattached
+address safe to leave lying around.
+
+**The inventory still works backwards.** The ledger cannot assume every address originates
+from a claim: the controller also observes `status.loadBalancer` on Services and reconciles
+what it finds into `IPAddress` objects after the fact, so the inventory converges on what is
+actually in use rather than only on what was asked for. Its authority is **scoped to ranges
+a class manages**; addresses from pools no class owns are observed, not adjudicated —
+otherwise every foreign auto-assign pool in the cluster becomes a source of `Conflict`
+noise.
 
 This is loosely the shape of a `StatefulSet` `volumeClaimTemplate` — a workload causing a
-first-class object to exist without anyone hand-writing it — but the analogy is weak and
-not worth leaning on:
+first-class object to exist without anyone hand-writing it — but the analogy is weak and not
+worth leaning on. An address is **non-fungible**: any 20 GiB PV substitutes for any other, a
+specific IP does not, and that scarce identity is the whole reason an inventory is needed.
+And **the allocator does not wait for us**, so claim-first and allocator-first allocations
+can race and the inventory can transiently disagree with the live `status.loadBalancer` set.
+The design commits to **eventual consistency** there, and to Service → inventory
+reconciliation as a first-class direction alongside claim → address.
 
-- **An address is non-fungible.** Any 20 GiB PV substitutes for any other; a specific IP
-  does not. "Give me one" and "give me *this* one" are different requests, and that exact,
-  scarce identity is the whole reason an inventory is needed.
-- **The allocator does not wait for us.** A `volumeClaimTemplate` PVC materialises a volume
-  only through the provisioner; here MetalLB has already acted by the time the controller
-  looks. Claim-first and allocator-first allocations can therefore race, and the inventory
-  can transiently disagree with the live `status.loadBalancer` set.
+What remains once holders are in place is narrower than a general theft window, and worth
+naming precisely rather than waving at:
 
-The design commits only to **eventual consistency** here, and to Service → inventory
-reconciliation as a first-class direction alongside claim → address. How the race is
-resolved is implementation, not settled in this document.
-
-And eventual consistency really is the ceiling for now. An eager allocator that gets there
-first can hand a plain Service an address that is already `Bound` to a claim but not yet
-associated — a reserved-but-inert address it has no way of knowing is spoken for. Layer 2
-(§8) detects the collision, but there is no clean remedy today: the address is already
-announced for the wrong Service, and the allocator will not surrender it on request. A real
-fix likely waits for the per-provider provisioners (§4), where allocation is ours and can
-decline a reserved address in the first place. Until then this is an acknowledged gap,
-deferred to the implementation phase.
+- **The handoff.** Releasing the holder and pinning the workload's own Service is not
+  atomic. For that window the address is unheld and an eager allocator could hand it to
+  whichever Service happens to be asking. Narrow, but real — and one of the intervals where
+  layer 1 of *Security* earns its place.
+- **Annotation writers.** With a reserved pool set `autoAssign: false` a plain Service
+  cannot *automatically* draw a reserved address; it can only get one by naming the pool or
+  pinning the address explicitly. That is precisely the write layer 1 gates and layer 2
+  detects.
 
 ### 7. What an admin actually configures
 
@@ -566,6 +590,21 @@ Istio Services ship with pool annotations already set). A naive "reject everyone
 controller" breaks reconciliation on day one, so the policy denies the write only for
 principals **outside** an explicit, admin-configurable allowlist.
 
+*The allowlist's hard case: trusted principals applying untrusted content.* An identity
+allowlist assumes a trusted principal writes content it authored, and that assumption fails
+wherever a privileged controller applies material some user supplied. Two shapes of this are
+ordinary rather than exotic: a GitOps reconciler that applies user-authored releases under
+its **own** identity instead of impersonating the user, and a cloud-controller-manager that
+copies Service annotations from a user-controlled cluster into an infrastructure Service
+verbatim. Allowlist such a deputy and every user behind it inherits the ability to write a
+pin annotation; deny it and legitimate reconciliation breaks. So **annotation filtering at
+the deputy is a precondition of layer 1, not a hardening extra**: a strip-list for the gated
+keys in any controller that forwards user-supplied annotations, and impersonation rather
+than ambient authority in any reconciler applying user-authored content. Until those hold
+for a given deputy, layer 1 is **partial** for the users behind it and layer 2 is what
+covers them. The design says so rather than assuming a trusted identity implies trusted
+content.
+
 **Layer 2 — reconciliation, for everyone admission cannot bind.** Layer 1 is keyed on
 identity, so it is defeated by anyone who can impersonate an allowlisted ServiceAccount —
 which a cluster-admin can (`--as
@@ -596,14 +635,23 @@ the `ResourceQuota` are for, and it is a bound, not a gate.
 - **Claim deleted, `Delete`** → address returned to the range; the backend object is torn down.
 - **Service references a claim in another namespace** → rejected. Cross-namespace address
   sharing is not a thing.
-- **Two Services reference one claim** → the second is rejected. A 1:1 binding is 1:1;
-  silently letting the second win is how an address goes quietly dead.
+- **Two Services reference one claim** → resolved by reconciliation, not at admission. A
+  `ValidatingAdmissionPolicy` cannot see the claim — CEL is given the request object and the
+  policy's params, not arbitrary cluster state — so admission-time rejection would need a
+  webhook. Instead one association wins by a deterministic rule, the loser reports
+  `Conflicted`, and the address is never silently moved. A 1:1 binding is 1:1; letting the
+  second win quietly is how an address goes dead.
 - **Plain Service pulls a reserved address** (explicit `address-pool`/pin, or a request
   made under an impersonated controller identity) → not prevented in general; **detected**.
   The `IPAddress` goes `Conflict`, the offending Service is named, and the reservation is
   not silently overwritten. See §8 and *Security*.
-- **Backend lacks `Pin`** → the class rejects claims at admission, loudly, rather than
-  allocating an address that can never be attached.
+- **A `Dual` claim associated with a single-stack Service** → the Service carries the one
+  family it has; the other address stays `Bound` to the claim and inert. The claim is not
+  `Lost`, and the unattached family is never silently released.
+- **Backend lacks `Pin`** → claims against that class are refused loudly, rather than
+  allocating an address that can never be attached. With no capability registry there is
+  nothing for admission to consult, so this is the provisioner refusing and reporting it on
+  the claim, not an admission-time rejection.
 - **Address adopted from a provider, then released provider-side** → `IPAddress` goes
   `Lost`. It must not silently re-allocate.
 
