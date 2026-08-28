@@ -310,6 +310,31 @@ That also makes `cozy-lib` the natural pilot for the versioned pool in Option A 
 
 Until then `cozy-lib` is a de-facto part of 36 packages' interface with no version on it, which is the same undeclared-interface problem [Testing](#testing) raises for cross-package `lookup`, inside the first-party archive rather than between catalogs.
 
+#### The library is also carrying things that are not shared
+
+Versioning `Library` is the structural fix. There is a cheaper one next to it, and for this particular release it would have been sufficient on its own.
+
+`cozy-lib` is 728 lines and 43 helpers, and its consumer counts are extremely uneven. Excluding the library itself and its own test chart:
+
+| File | Lines | Consumers outside the library |
+|---|---|---|
+| `_resources.tpl` | 224 | `defaultingSanitize` 21, `toFloat` 5, `sanitize` 4, `flatten` 2, `javaHeap` 1 |
+| `_rbac.tpl` | 106 | `subjectsForTenantAndAccessLevel` 27 |
+| `_resourcepresets.tpl` | 98 | none directly; the preset table `_resources.tpl` reads |
+| `_network.tpl` | 23 | `disableLoadBalancerNodePorts` 6 |
+| `_cozyconfig.tpl` | 153 | `image` 3. The other 14 helpers have **no caller at all** |
+| `_barman.tpl` | 24 | 2 — `apps/postgres` and `system/keycloak` |
+| `_strings.tpl` | 3 | 1 — `apps/vpc` |
+| `_tls.tpl` | 92 | **none** |
+
+Two helpers out of 43 carry 48 of the roughly 55 consumer relationships, and they are the two that deserve to be there: the tenant RBAC subject model and the resource-preset model, both genuinely cross-cutting. `_tls.tpl` says of itself "there is no production caller yet - this is the pattern one uses". The public surface of `_cozyconfig.tpl` — `root-host`, `bundle-name`, the `ns-*` accessors, the `ipv4-*` CIDRs, `branding`, `scheduling` — is exercised only by `tests/cozy-lib-tests`; its apparent in-library callers are `Usage:` lines inside doc comments. `cozy-lib.rbac.subjectsForTenant` has no caller of either kind.
+
+`_barman.tpl` is the interesting one, because it explains the whole event. Its two consumers are `apps/postgres` and `system/keycloak`, and keycloak is there because it runs a CNPG Postgres of its own. So the library is acting as a private channel between two packages rather than as a shared abstraction — the same package-to-package edge [Testing](#testing) worries about, wearing a library's clothes and therefore invisible to anything looking for one.
+
+And it is the whole of the fan-out. The only change to `cozy-lib` in this release was `A packages/library/cozy-lib/templates/_barman.tpl`. **Twenty-five packages moved because a 24-line template with two consumers was added to a chart 36 packages embed.** Had it lived in `apps/postgres`, the library would have moved nothing.
+
+So the two fixes compose rather than compete. Versioning `Library` decides *when* a consumer takes a change; shrinking the library decides *how often there is one to take*. `_tls.tpl`, `_strings.tpl`, `_barman.tpl` and `_cozyconfig.tpl` minus `image` are 265 of the 728 lines, and they change for reasons that concern one or two packages rather than 36. Moving them back to their consumers is hygiene with no design commitment attached, and it is worth doing first for the same reason the tag fix is.
+
 #### The counterfactual, run on the same cluster
 
 "Drop the tag and the churn goes away" is a claim, so it was run rather than asserted. Both release trees were rebuilt with the Cozystack version removed from every image reference — all five ref shapes, so the ref is `repo@sha256:…` alone — pushed as two pool artifacts, and the same stand was pointed at the first, allowed to settle, then pointed at the second. The measurement is that second transition, against the same 207 artifacts.
@@ -598,14 +623,15 @@ The ordering is chosen so that each phase is independently valuable and independ
 3. **Land the upgrade lane.** Get [cozystack#3276](https://github.com/cozystack/cozystack/pull/3276) merged and promote it from advisory to required for release PRs. Independently valuable — it is already finding upgrade-only defects nothing else reaches — and everything downstream of the manifest depends on being able to test an upgrade of one.
 4. **Read the source-watcher archive path.** Confirm that `ArtifactGenerator`'s re-tar normalises entry metadata the way the `flux` CLI's does; the CLI half is already established in [§4](#4-the-versioned-pool). This is a code read, not a cluster experiment.
 5. **Extract core.** Move `cozystack-api`, `cozystack-controller` and `lineage-controller-webhook` out of the package pool into the bootstrap lane alongside the operator and the CRDs, as a third embedded-manifest `Install()` next to `crdinstall` and `fluxinstall`, and resolve the `packages/core/` naming collision (see [§1](#1-four-tiers-one-package-model)). The mechanism is not new; the work is handing ownership over from the platform `Package` without recreating the workloads, plus deciding where the config-hash rollout lives. Deliberately placed before any versioning change, because a tier boundary that delivery does not honour cannot carry a version.
-6. **Version the library.** Add `version` to `Library`, resolve `cozy-lib` at it, and let consumers move when they take a new one. One library and 36 consumers is the smallest thing that exercises the versioned pool end to end, and it is worth 29 of the 59 artifact moves that survive phase 1 ([§4](#4-the-versioned-pool)).
-7. **Manifest, inert.** Publish the release manifest with all versions equal to the current platform version. Add `version` to the data model. Nothing resolves differently. Add the two CI gates.
-8. **ApplicationDefinition consolidation.** One coordinated pass folding this proposal's fields with #39's, #6's, and #3448's, before external catalogs depend on the shape.
-9. **Migration framework.** `cozy-lib` migration helper; port the four existing ad-hoc hooks onto it; new migrations are authored per-package; the global lane is frozen except for cross-cutting cases.
-10. **First real partial upgrade.** One release where the manifest moves a small number of low-risk packages (`bucket`, `http-cache` — not `postgres`, not `kubernetes`) and everything else holds. Measure what the tooling misses.
-11. **`cozypkg`.** Versions, search, show, upgrade, hold, non-interactive output, and documentation.
-12. **Repositories.** #43's catalogs and #18's taps land on the now-versioned mechanism; the manifest's `repositories` list ships the org catalog enabled-by-default per #43's shim plan.
-13. **CalVer switch.** Rename the release stream once the manifest, partial upgrades, and the support window are all proven. Last, not first.
+6. **Shrink the library.** Move `_barman.tpl` to its two consumers, `_strings.tpl` to `apps/vpc`, delete `_tls.tpl` and the uncalled surface of `_cozyconfig.tpl`, and drop `cozy-lib.rbac.subjectsForTenant`. Hygiene, no design commitment, and it removes the class of change that caused this release's 25-package fan-out ([§4](#4-the-versioned-pool)).
+7. **Version the library.** Add `version` to `Library`, resolve `cozy-lib` at it, and let consumers move when they take a new one. One library and 36 consumers is the smallest thing that exercises the versioned pool end to end, and it is worth 29 of the 59 artifact moves that survive phase 1.
+8. **Manifest, inert.** Publish the release manifest with all versions equal to the current platform version. Add `version` to the data model. Nothing resolves differently. Add the two CI gates.
+9. **ApplicationDefinition consolidation.** One coordinated pass folding this proposal's fields with #39's, #6's, and #3448's, before external catalogs depend on the shape.
+10. **Migration framework.** `cozy-lib` migration helper; port the four existing ad-hoc hooks onto it; new migrations are authored per-package; the global lane is frozen except for cross-cutting cases.
+11. **First real partial upgrade.** One release where the manifest moves a small number of low-risk packages (`bucket`, `http-cache` — not `postgres`, not `kubernetes`) and everything else holds. Measure what the tooling misses.
+12. **`cozypkg`.** Versions, search, show, upgrade, hold, non-interactive output, and documentation.
+13. **Repositories.** #43's catalogs and #18's taps land on the now-versioned mechanism; the manifest's `repositories` list ships the org catalog enabled-by-default per #43's shim plan.
+14. **CalVer switch.** Rename the release stream once the manifest, partial upgrades, and the support window are all proven. Last, not first.
 
 ## Open questions
 
@@ -658,6 +684,9 @@ Collected from `main` on 2026-07-27 (post-`v1.6.0`) and re-measured on 2026-08-2
 | HelmReleases and pods moved by it | 23 of 95 HelmReleases, **43 of 164 pods replaced** | same run |
 | Pods restarted on a byte-identical image | Cilium 3, LINSTOR 8, MetalLB 4, objectstorage-controller 1 | same run; metallb pods came back on the digests both tags carry |
 | Artifacts bundling a library chart | 36 of 207, all `cozy-lib`, copied in by the `ArtifactGenerator` | `kubectl get ag -A -o yaml` |
+| `cozy-lib` size and shape | 728 lines, 43 helpers; two of them (`rbac.subjectsForTenantAndAccessLevel` 27 consumers, `resources.defaultingSanitize` 21) carry 48 of ~55 consumer relationships | `packages/library/cozy-lib/templates/*.tpl` |
+| `cozy-lib` with no consumer outside its own test chart | all of `_tls.tpl` (92 lines), 14 of the 15 helpers in `_cozyconfig.tpl`, and `rbac.subjectsForTenant` | same |
+| The change that caused the 25-package fan-out | one added file, `_barman.tpl`, 24 lines, 2 consumers | `git diff --name-status v1.6.1..v1.6.2 -- packages/library/cozy-lib` |
 | source-watcher re-tar determinism | confirmed — 134 artifacts held a byte-identical digest across two pool revisions | same run |
 | Counterfactual: version removed from every vendored ref | 59 moved / 148 held, 16/95 HelmReleases, **21/164 pods** (against 73 / 134 / 23 / 43); the 14 eliminated are Cilium (6 artifacts), LINSTOR, linstor-gui, MetalLB, Multus, kubeovn-plunger, Kamaji, objectstorage-controller, seaweedfs-system | same stand, two rebuilt pools pushed and applied in sequence |
 | Data-plane pods restarted under that counterfactual | Cilium 0, LINSTOR 0, MetalLB 0, Multus 0, objectstorage-controller 0 | same run |
