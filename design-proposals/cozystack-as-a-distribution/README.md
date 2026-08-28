@@ -160,9 +160,13 @@ Everything else under `packages/{system,apps,extra}` is a package without argume
 
 #### Two consequences the rest of this proposal depends on
 
-**The delivery boundary is in the wrong place today, but moving it needs no new machinery.** The installer chart renders exactly three things — the operator Deployment, the `cozy-system` namespace and its labels. Everything else in the bootstrap lane is installed by the operator itself at startup, from embedded manifests: `crdinstall.Install` for the `cozystack.io` CRDs, `fluxinstall.Install` for Flux, then `installPlatformPackageSource`. Everything after that travels through the pool, including the apiserver, the controller and the lineage webhook, which are ordinary `packages/system/*` charts on the same path as Cilium.
+**The delivery boundary is in the wrong place today, but moving it needs no new machinery.** The installer chart renders exactly three things — the operator Deployment, the `cozy-system` namespace, and a pre-install Job that labels it. It carries no `crds/` directory and no CRD hook. What installs the CRDs depends on the path: the chart passes `--install-crds=true` and `--install-flux=true` to the operator (both default to `false` in the binary), so on the Helm path the operator installs them itself at startup from embedded manifests, via `crdinstall.Install` and `fluxinstall.Install`, then creates the platform `PackageSource`. On the `kubectl apply` path the same manifests ship as a release asset — `make manifests` concatenates `internal/crdinstall/manifests/*.yaml` into `_out/assets/cozystack-crds.yaml` and `hack/upload-assets.sh` uploads it beside the rendered operator — and the operator applies them idempotently afterwards. One source, two deliveries.
 
-So declaring them core means a third `Install()` from embedded manifests alongside the two that already work, not a new delivery path. Ordering is already handled — the CRDs go in before the `PackageSource` exists.
+Everything after that travels through the pool, including the apiserver, the controller and the lineage webhook, which are ordinary `packages/system/*` charts on the same path as Cilium.
+
+So declaring them core means a third embedded-manifest `Install()` alongside the two that already work, not a new delivery path. Ordering is already handled: the CRDs go in before the `PackageSource` exists.
+
+It does add one decision the two existing installs already answer implicitly. Anything moved into the bootstrap lane has to be present on *both* paths, or the Helm install and the `kubectl apply` install stop containing the same platform. The apiserver would need its own entry in the release assets, not only its `Install()`.
 
 The real work is the ownership migration rather than the mechanism. Those three are HelmReleases owned by the platform `Package` today, so the change has to hand ownership to the operator without recreating the workload; recreating the apiserver mid-upgrade is the failure this must not have. `helm.sh/resource-policy: keep` is already on the bundle-emitted `Package` CRs, which is the right half of the primitive, but the handover itself has to be designed.
 
