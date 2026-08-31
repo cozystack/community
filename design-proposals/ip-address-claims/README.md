@@ -64,10 +64,13 @@ kinds live in `local.sdn.cozystack.io` (see *Positioning*).
   entry should be able to name an `IPAddressClaim` instead of implicitly minting an
   address — but neither needs the other to land first, and this proposal does not
   assume #29's shape.
-- **Related:** an `ExposureClass` kind exists today in `network.cozystack.io`. This
-  proposal takes a position on it (see *Alternatives*): the **class** idea is right
-  and should survive in some form; binding an address's lifetime to a `Service` is
-  the part that cannot serve this use case.
+- **Related:** `Service.spec.loadBalancerClass`, the upstream field selecting which LB
+  implementation serves a Service. An `IPAddressClass` names a provisioner and a pool,
+  which in practice implies the implementation that will announce the address, so the two
+  classes are adjacent and have to agree — see the open question below. (An
+  `ExposureClass` kind was proposed alongside community #29 and never shipped; there is no
+  `network.cozystack.io` group. That direction went to `loadBalancerClass` instead —
+  cozystack/cozystack#3164, cozystack/cozystack#3218.)
 - **Depended on by:** `design-proposals/endpoint-attachments` (community #45), which
   attaches one endpoint of an application to an external address. It consumes an
   `IPAddressClaim` and the association annotation of §5; this proposal does not wait on
@@ -114,6 +117,15 @@ To be clear that this is a proposal and not an appeal to precedent:
 first components to introduce it. Nor does the group
 string create a Cozystack dependency for a standalone user — the same three CRDs install
 under any name.
+
+The obvious objection is that `ipam.` describes the object better than `sdn.` does: an
+address ledger is not a datapath concern, and its consumers include Gateways and cloud
+providers that are not SDN either. That is a fair reading, and the reason it does not win
+here is that this is **not all of IPAM and cannot become it** — allocation stays with the
+allocator, since AWS and MetalLB both keep it — so an `ipam.cozystack.io` group would
+promise a generality the component deliberately does not have. If upstream moves and that
+generality becomes real, it is a v2 question. Until then the kinds sit with the rest of
+networking.
 
 Whether the kinds are greenfield or an adoption of Cluster API's IPAM kinds is an open
 question (below).
@@ -212,14 +224,18 @@ being restored, only something being added.
   with the LB implementation. This proposal allocates and binds; it never puts a
   packet on a wire.
 - **The 1:1 NAT datapath.** See *Scope*.
-- **Multiple platform-owned addresses per workload.** A claim binds to one Service;
-  a workload holds one claim. Requesting *N* owned addresses for one workload is a
-  step beyond "an address is a resource", and it is not clear the case is even real:
-  the obvious example (a VM acting as a router or VPN concentrator) attaches its extra
-  addresses on a **tunnel interface the platform neither owns nor sees**, which makes
-  it orthogonal to address *reservation* rather than an extension of it. Deferred until
-  a concrete platform-owned use case exists. Dual-stack (one v4 + one v6) is a separate,
-  narrower question and is treated below, not folded into this.
+- **Multiple owned addresses on one consumer.** A claim binds to **one consumer at a
+  time**, and that 1:1 rule is real and enforced. No limit on a *workload* is claimed:
+  nothing stops an application from having several Services, each with its own claim and
+  its own address, and a managed service reachable on a public address and an internal
+  routable one at the same time is exactly that — two Services, two claims, no new
+  concept. What stays out of scope is *N* owned addresses on a single consumer. The
+  obvious example (a VM acting as a router or VPN concentrator) attaches its extra
+  addresses on a **tunnel interface the platform neither owns nor sees**, which makes it
+  orthogonal to address *reservation*; the platform-owned variant would need an internal
+  address and in-guest configuration per address. Deferred until a concrete platform-owned
+  use case exists. Dual-stack (one v4 + one v6) is a separate, narrower question, treated
+  below rather than folded into this.
 - **Replacing the LB implementation.** MetalLB/Cilium/cloud stay exactly where they
   are; this sits above them.
 - **IPv4-only thinking.** The model is family-agnostic; a claim may request v4, v6, or
@@ -298,8 +314,7 @@ metadata: {name: web, namespace: tenant-a}
 spec:
   className: public          # empty => the default class
   family: IPv4               # IPv4 | IPv6 | Dual
-  # addressName: ip-203-0-113-7   # optional: bind this specific Available address --
-                                  # the PVC spec.volumeName analogue, single-family only
+  # addressName: ip-203-0-113-7   # optional: bind this specific address (see below)
 status:
   phase: Bound
   addresses:                 # a list, so a Dual claim can report v4 + v6
@@ -325,6 +340,23 @@ status:
     namespace: tenant-a
     name: web-lb
 ```
+
+**`spec.addressName` — asking for a *specific* address.** The
+`PersistentVolumeClaim.spec.volumeName` analogue: a claim may name one `IPAddress` rather
+than take whatever its class yields. It is meaningful only for a single-family claim, and
+the controller honours it only if every ordinary condition already holds — the address is
+`Available`, carries no `claimRef`, is not being deleted, and its class and family match
+the ones the claim resolved. A name that matches nothing eligible is not an error: the
+claim stays `Pending` and keeps waiting, exactly as it would with no `addressName` at all.
+The field therefore **narrows a candidate set and never widens one**. It cannot pull an
+address out of another class, take one away from another claim, or reclaim a `Released`
+address before an admin has cleared its `claimRef`.
+
+What it deliberately does *not* do is authorize. `IPAddress` is cluster-scoped, so a claim
+naming one names an object outside its own namespace. Neither this field nor
+`spec.className` — equally free-text, and equally unable to be gated by namespace RBAC —
+decides which classes a namespace may draw from. That gap is identical with or without
+`addressName`, and closing it belongs above this controller; see *Security*.
 
 `IPAddressClaim.status.addresses` is a **list** deliberately: a `Dual` claim binds a
 v4 and a v6 `IPAddress` and must report both, and a scalar `address` field could not.
@@ -623,9 +655,22 @@ visible faults instead of quiet theft.
 Landing layer 1 is worth doing on its own, independent of the rest of the model: the
 theft window it closes is live in any cluster running a shared auto-assign pool today.
 
-Note this does not, by itself, close field-level authorization in general — a tenant who
-can create an `IPAddressClaim` can still consume an address. That is what the class and
-the `ResourceQuota` are for, and it is a bound, not a gate.
+**Where this component stops.** The two layers above cover the surface a reservation can
+be *stolen* through. They do not close field-level authorization in general: a tenant who
+can create an `IPAddressClaim` can consume an address, may name any `spec.className`, and
+may name a specific `IPAddress` through `spec.addressName` (§2). `ResourceQuota` bounds how
+many addresses they hold; nothing here decides *which class* a namespace is entitled to
+draw from.
+
+That is deliberate rather than unfinished. This component's job is the **capability** —
+reserve an address, hold it, attach it, detach it, release it — and a capability that also
+tried to be its own policy engine would have to encode a tenancy model it does not have and
+cannot see. The gating belongs where the tenancy model lives: a `ValidatingAdmissionPolicy`
+restricting which classes a namespace may name (the same mechanism as layer 1, with a
+different subject), or platform machinery that mints claims on a tenant's behalf instead of
+letting tenants write claims directly. **`spec.className` and `spec.addressName` are the two
+fields such a policy must cover** — naming them here is the point, so that a deployment
+hardening this does not have to discover them.
 
 ## Failure and edge cases
 
@@ -645,6 +690,9 @@ the `ResourceQuota` are for, and it is a bound, not a gate.
   made under an impersonated controller identity) → not prevented in general; **detected**.
   The `IPAddress` goes `Conflict`, the offending Service is named, and the reservation is
   not silently overwritten. See §8 and *Security*.
+- **`spec.addressName` names an address that is absent, `Bound`, `Released`, or of another
+  class or family** → nothing binds; the claim stays `Pending` with the ordinary waiting
+  reason. Naming an address filters, it never seizes.
 - **A `Dual` claim associated with a single-stack Service** → the Service carries the one
   family it has; the other address stays `Bound` to the claim and inert. The claim is not
   `Lost`, and the unattached family is never silently released.
@@ -697,10 +745,15 @@ Sketch — sequencing is an open question:
    the contract? (Leaning: our own — we need reclaim policy and association, which it has
    no concept of. But the shape is not novel and review should know that.) This is the
    greenfield-vs-adopt question *Positioning* leaves open.
-3. **`ExposureClass`.** A class kind already exists in `network.cozystack.io`. Is
-   `IPAddressClass` a second class kind, or the same one grown a provisioner? Answering
-   this depends on the fate of `ExposureClass`/`ServiceExposure`, which is being
-   re-examined independently.
+3. **`IPAddressClass` and `Service.spec.loadBalancerClass`.** A class names a provisioner
+   and a pool, which implies the LB implementation that will announce the address; a
+   Service names its implementation directly in `spec.loadBalancerClass` (§1.5). A Service
+   whose `loadBalancerClass` selects an implementation other than the one behind its
+   claim's class is asking two backends for one address, and nothing notices today. Should
+   a class declare the `loadBalancerClass` it corresponds to, so association can resolve
+   the pair and check it? Note what the answer cannot be: `loadBalancerClass` is immutable
+   on an existing Service, so a mismatch must surface as a **refused association with a
+   reason**, never a silent rewrite.
 4. **Dual-stack.** Does one `IPAddress` carry a v4 and a v6 address, or does a `Dual` claim
    bind two `IPAddress`es? (PV has no precedent. Leaning: two objects, one claim — the
    status list already admits it.)
@@ -711,8 +764,9 @@ Sketch — sequencing is an open question:
 
 ## Alternatives considered
 
-**Bind the address to a Service (`ServiceExposure`-shaped).** A namespaced object naming
-a `serviceRef`, which allocates an address and reports it in status. **Rejected as the
+**Bind the address to a Service** — the shape community #29 proposed as
+`ServiceExposure`. A namespaced object naming a `serviceRef`, which allocates an address
+and reports it in status. **Rejected as the
 model for *this* problem:** it fuses *allocation* with *association*, so the address's
 lifetime is the Service's lifetime — which is the exact thing being fixed. It cannot
 express "keep this address, the workload is gone", which is the entire user request.
