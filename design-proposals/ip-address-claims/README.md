@@ -66,8 +66,8 @@ kinds live in `local.sdn.cozystack.io` (see *Positioning*).
   assume #29's shape.
 - **Related:** `Service.spec.loadBalancerClass`, the upstream field selecting which LB
   implementation serves a Service. An `IPAddressClass` names a provisioner and a pool,
-  which in practice implies the implementation that will announce the address, so the two
-  classes are adjacent and have to agree — see the open question below. (An
+  which determines the implementation that will announce the address. An `IPAddressClass`
+  therefore **fixes** the `loadBalancerClass` a consuming Service must carry (§5). (An
   `ExposureClass` kind was proposed alongside community #29 and never shipped; there is no
   `network.cozystack.io` group. That direction went to `loadBalancerClass` instead —
   cozystack/cozystack#3164, cozystack/cozystack#3218.)
@@ -224,18 +224,23 @@ being restored, only something being added.
   with the LB implementation. This proposal allocates and binds; it never puts a
   packet on a wire.
 - **The 1:1 NAT datapath.** See *Scope*.
-- **Multiple owned addresses on one consumer.** A claim binds to **one consumer at a
-  time**, and that 1:1 rule is real and enforced. No limit on a *workload* is claimed:
-  nothing stops an application from having several Services, each with its own claim and
-  its own address, and a managed service reachable on a public address and an internal
-  routable one at the same time is exactly that — two Services, two claims, no new
-  concept. What stays out of scope is *N* owned addresses on a single consumer. The
-  obvious example (a VM acting as a router or VPN concentrator) attaches its extra
-  addresses on a **tunnel interface the platform neither owns nor sees**, which makes it
-  orthogonal to address *reservation*; the platform-owned variant would need an internal
-  address and in-guest configuration per address. Deferred until a concrete platform-owned
-  use case exists. Dual-stack (one v4 + one v6) is a separate, narrower question, treated
-  below rather than folded into this.
+- **Several owned addresses on one consumer.** One rule is settled and enforced: a claim
+  is consumed by **one consumer at a time**, so two consumers cannot quietly share a
+  reservation. The converse is *not* settled, and this proposal does not pretend it is —
+  how many claims one consumer may hold is open. No limit on a *workload* is claimed:
+  nothing stops an application owning several Services, each with its own claim, and a
+  managed service reachable on a public address and an internal routable one at once is
+  exactly that — two Services, two claims, no new concept. But a single consumer wearing
+  several addresses is a real case rather than a hypothetical one, and Gateway API states
+  it outright: `Gateway.spec.addresses` is a **list**, so one Gateway legitimately wears
+  several addresses, and nothing in the model below says how several claims attach to one
+  consumer or how a provisioner renders that. **Acknowledged and deferred to future
+  work.** Two neighbouring cases stay out with it: *N* owned addresses on a workload whose
+  extra addresses live on a **tunnel interface the platform neither owns nor sees** (a VM
+  acting as a router or VPN concentrator), which is orthogonal to reservation; and the
+  platform-owned variant of it, which would need an internal address and in-guest
+  configuration per address. Dual-stack (one v4 + one v6) is a separate, narrower
+  question, treated below rather than folded into this.
 - **Replacing the LB implementation.** MetalLB/Cilium/cloud stay exactly where they
   are; this sits above them.
 - **IPv4-only thinking.** The model is family-agnostic; a claim may request v4, v6, or
@@ -303,6 +308,8 @@ metadata:
     ipaddressclass.local.sdn.cozystack.io/is-default-class: "true"
 spec:
   provisioner: metallb.drivers.local.sdn.cozystack.io  # who fulfils claims of this class
+  loadBalancerClass: metallb.io/public   # the implementation that announces it;
+                                         # empty => the cluster's default implementation
   reclaimPolicy: Retain                  # Retain | Delete   (default Retain)
   parameters:                            # opaque to the core controller
     addresses: ["203.0.113.0/24"]
@@ -421,6 +428,22 @@ spec: {type: LoadBalancer, ...}
 The controller resolves the claim → address, verifies the claim is in the Service's own
 namespace, and writes the backend's pin annotation (§1.2). MetalLB/Cilium/the cloud then
 allocates and announces exactly that address.
+
+**The class fixes the `loadBalancerClass`.** An `IPAddressClass` names the pool and the
+provisioner that carves it, which determines the LB implementation that will announce
+anything drawn from it; the class states that implementation in
+`spec.loadBalancerClass`, and a consuming Service must match it — empty matching empty,
+meaning the cluster's default implementation (§1.5). This is not a preference: a Service
+whose `loadBalancerClass` selects one implementation while its claim's address is held by
+another is asking two backends for one address, and both will be wrong about who owns it.
+The provisioner's own holder Services (§6) carry the class's value for the same reason.
+
+The check can only ever be a **refusal**, never a repair: `loadBalancerClass` is immutable
+on an existing Service, so a mismatch surfaces as a refused association naming both
+values, and whoever creates the Service — a chart, a controller minting one on a tenant's
+behalf, or a user — is responsible for setting it at creation. A controller that creates
+the Service *and* names the claim has no excuse for getting it wrong, since it can read
+the class first.
 
 Remove the annotation and the announcement is withdrawn, but the `IPAddress` stays
 `Bound` to its claim and simply becomes inert — **a reserved address, held, attached to
@@ -745,22 +768,17 @@ Sketch — sequencing is an open question:
    the contract? (Leaning: our own — we need reclaim policy and association, which it has
    no concept of. But the shape is not novel and review should know that.) This is the
    greenfield-vs-adopt question *Positioning* leaves open.
-3. **`IPAddressClass` and `Service.spec.loadBalancerClass`.** A class names a provisioner
-   and a pool, which implies the LB implementation that will announce the address; a
-   Service names its implementation directly in `spec.loadBalancerClass` (§1.5). A Service
-   whose `loadBalancerClass` selects an implementation other than the one behind its
-   claim's class is asking two backends for one address, and nothing notices today. Should
-   a class declare the `loadBalancerClass` it corresponds to, so association can resolve
-   the pair and check it? Note what the answer cannot be: `loadBalancerClass` is immutable
-   on an existing Service, so a mismatch must surface as a **refused association with a
-   reason**, never a silent rewrite.
-4. **Dual-stack.** Does one `IPAddress` carry a v4 and a v6 address, or does a `Dual` claim
+3. **Dual-stack.** Does one `IPAddress` carry a v4 and a v6 address, or does a `Dual` claim
    bind two `IPAddress`es? (PV has no precedent. Leaning: two objects, one claim — the
    status list already admits it.)
-5. **PureLB.** Does it have *any* "request this exact IP" mechanism? If not, it cannot be a
+4. **PureLB.** Does it have *any* "request this exact IP" mechanism? If not, it cannot be a
    backend, and that should be stated rather than discovered.
-6. **Sharing one address across Services** (different ports — GCP and Cilium both permit
-   it). Does a claim bind to one Service, or may several reference it on disjoint ports?
+5. **Sharing one address across Services** (different ports — GCP and Cilium both permit
+   it). Today one consumer at a time holds a claim and a second reference is refused (§5).
+   Should that relax to several consumers on disjoint ports? It is the mirror of the
+   deferred several-addresses-on-one-consumer case in *Non-goals*, and the two probably
+   want answering together, since both are really "what is the cardinality between a claim
+   and the things that wear it".
 
 ## Alternatives considered
 
