@@ -98,7 +98,11 @@ git push --force-with-lease
 
 Also link the email address you commit with to your GitHub account, or the commit will not be attributed to your profile and your work will not appear in the contributor statistics.
 
-If an AI agent materially helped write the change, name it with an `Assisted-By:` trailer alongside the sign-off, for example `Assisted-By: Claude <noreply@anthropic.com>`.
+If an AI agent materially helped write the change, add the `Assisted-by: LLM` trailer alongside the sign-off. The trailer discloses assistance without naming a model or vendor: do not put a model or vendor name into a trailer or an authorship line, including a `Co-authored-by:` trailer or a `Generated with <tool>` footer, and never add a `Claude-Session:` trailer or a link to an assistant session to a commit message, PR description, or comment.
+
+```bash
+git commit --signoff --trailer "Assisted-by: LLM" -m "fix(postgres): update operator to version 1.2.3"
+```
 
 ## 7. Rebase before opening the PR
 
