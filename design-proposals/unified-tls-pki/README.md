@@ -25,8 +25,8 @@ All repository paths below refer to the `cozystack/cozystack` repository. A path
 
 ## Decisions
 
-- [0001. The trust anchor is declared by a namespaced `TenantProjection` and published as `<release>.tenant-ca`](./decisions/0001-the-trust-anchor-is-declared-by-a-namespaced-sentinel.md) — why the source-selection label and the `<release>-ca-cert` name were set aside.
 - [0002. mongodb sources the trust anchor from its leaf Secret, not from the operator's CA Secret](./decisions/0002-mongodb-sources-the-trust-anchor-from-the-leaf-secret.md) — the three properties that beat the obvious source.
+- [0001. The trust anchor is declared by a namespaced `TenantProjection` and published as `<release>.tenant-ca`](./decisions/0001-the-trust-anchor-is-declared-by-a-namespaced-sentinel.md) — why the source-selection label and the `<release>-ca-cert` name were set aside.
 
 ## Context
 
