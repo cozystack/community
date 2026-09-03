@@ -20,7 +20,7 @@ The mongodb chart's `TenantProjection` names the leaf Secret `{{ .Release.Name }
 
 ## Why not the alternatives
 
-These three are the chart's own stated reasons, recorded in the comment above [`packages/apps/mongodb/templates/tenant-projection.yaml`](https://github.com/cozystack/cozystack/blob/main/packages/apps/mongodb/templates/tenant-projection.yaml) as it merged in [#2692](https://github.com/cozystack/cozystack/pull/2692); the second and third are claims about PSMDB's behaviour that the comment asserts and this record has not independently verified against upstream.
+These three are the chart's own stated reasons, recorded in the comment above [`packages/apps/mongodb/templates/tenant-projection.yaml`](https://github.com/cozystack/cozystack/blob/main/packages/apps/mongodb/templates/tenant-projection.yaml) as it merged in [#2692](https://github.com/cozystack/cozystack/pull/2692). The second and third are claims about PSMDB's behaviour, and both hold at the operator version the platform pins, `v1.22.0` (`packages/system/mongodb-operator/charts/psmdb-operator/Chart.yaml`). In the operator's own source, `createSSLManually` (`pkg/controller/perconaservermongodb/ssl.go`) writes the leaf and the internal Secret and nothing else, so the self-signed fallback never produces `<cluster>-ca-cert`; that name belongs to the cert-manager path alone, reached through `applyCertManagerCertificates` and `CertificateCA` (`pkg/psmdb/tls/certificate.go`). `mergeNewCA` (same `ssl.go`) merges the old and the new CA into the leaf's `ca.crt` with `MergePEM` (`pkg/psmdb/tls/pem.go`) and leaves `-ca-cert` untouched.
 
 **Why not `<release>-ca-cert`, the operator's CA Secret:**
 
