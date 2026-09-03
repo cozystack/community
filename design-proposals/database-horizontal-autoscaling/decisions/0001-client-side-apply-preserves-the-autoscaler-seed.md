@@ -45,6 +45,6 @@ Format follows Michael Nygard's architecture decision records
 (https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 and MADR (https://adr.github.io/madr/).
 
-Once merged, the header block above is maintained (Status, Superseded by,
-Implemented in must track reality) and the prose below it is frozen.
+Once merged, the header block above is maintained (Status, Superseded by, Implemented in must track reality) and the prose below it is frozen — with one active exception: "Revisit if" stays a live trigger. When one of its conditions occurs the decision is revisited by *superseding* this record — a new ADR plus a Status / "Superseded by" bump in the maintained header — never by editing the frozen prose in place. The gate to act on is therefore the header, not the frozen body.
+
 -->
