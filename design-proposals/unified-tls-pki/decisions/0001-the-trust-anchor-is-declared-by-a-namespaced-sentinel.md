@@ -6,7 +6,7 @@
 - **Deciders:** `@lexfrei, @lllamnyp`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** the API-owner review on [`cozystack/cozystack#3299`](https://github.com/cozystack/cozystack/pull/3299), recorded in the proposal by [`cozystack/community#36`](https://github.com/cozystack/community/pull/36)
-- **Implemented in:** [`cozystack/cozystack#3407`](https://github.com/cozystack/cozystack/pull/3407) and [`cozystack/cozystack#3408`](https://github.com/cozystack/cozystack/pull/3408)
+- **Implemented in:** [`cozystack/cozystack#3407`](https://github.com/cozystack/cozystack/pull/3407), [`cozystack/cozystack#3408`](https://github.com/cozystack/cozystack/pull/3408), and [`cozystack/cozystack#3411`](https://github.com/cozystack/cozystack/pull/3411), which added the release-prefix pattern the Consequences below rely on
 
 ## Context
 
