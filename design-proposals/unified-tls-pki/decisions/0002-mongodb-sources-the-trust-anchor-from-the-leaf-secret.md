@@ -10,9 +10,9 @@
 
 ## Context
 
-The contract said the sentinel names the engine's CA-bearing Secret and the controller strips everything but `ca.crt`. Every engine that had converged when mongodb landed fit that sentence: nats and qdrant name the CA their chart's cert-manager graph renders, and postgres names the CA CloudNativePG creates. So did every engine designed but not yet converged — redis over its chart's cert-manager CA, kafka over Strimzi's key-free one.
+The contract said the sentinel names the engine's CA-bearing Secret and the controller strips everything but `ca.crt`, and for the engines converged at the time that was unambiguous: nats and qdrant have the CA their chart's cert-manager graph renders, and postgres has the one CloudNativePG creates. Each had exactly one object worth naming.
 
-mongodb was the first engine with two candidate sources. The Percona PSMDB operator mints a cert-manager chain at runtime and writes both a key-bearing CA Secret at `<release>-ca-cert` and a leaf Secret at `<release>-ssl` that carries `ca.crt` alongside its own key pair. Reading the contract literally pointed at `<release>-ca-cert`, and three properties of that name argued against it, none of which is visible in the resulting template without the comment that now sits above it.
+mongodb had two. The Percona PSMDB operator mints a cert-manager chain at runtime and writes both a key-bearing CA Secret at `<release>-ca-cert` and a leaf Secret at `<release>-ssl` that carries `ca.crt` alongside its own key pair. Reading the contract literally pointed at `<release>-ca-cert`, and three properties of that name argued against it, none of which is visible in the resulting template without the comment that now sits above it.
 
 ## Decision
 
