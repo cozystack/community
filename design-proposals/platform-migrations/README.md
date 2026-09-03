@@ -56,7 +56,13 @@ A fourth cost is unbilled. Migration `43` matched the owning Helm release agains
 
 ### 1. Identity and layout
 
-Identity is `YYYYMMDD-slug`. Tier is the **directory**, so nothing is parsed at render time and there is no generated index to keep in sync.
+Identity is the **slug** and nothing else: `redis-failover-group-label`. No date, no sequence number, no hash in the filename. The slug is the ledger key and is the one thing about a migration that may never change.
+
+That is forced rather than chosen. §3 shows that execution order cannot be derived from anything an author knows while writing the migration, so an ordinal in the name is a claim the name cannot keep, and maintaining it costs a rename on every stale rebase. Removing it also removes the only reason two concurrent PRs would ever have to look at each other.
+
+Grammar is `^[a-z0-9]+(-[a-z0-9]+)*$`, at most 60 characters, unique across **both** tiers — the ledger key has no tier dimension, and a migration may be moved between tiers before it ships. Liquibase had to invent `logicalFilePath` precisely because it derived identity from a path and every file move silently minted new changesets; keying on the bare slug avoids that class outright.
+
+Tier is the **directory**, so nothing about tiering is parsed at render time.
 
 The integer set does not survive alongside the new one. It is carried untouched only while the conversion is staged, and §10 renames all of it, after which there is one identity scheme, one runner path and nothing a contributor has to know about integers. Leaving them in place permanently is explicitly rejected: it would mean a dual-mode runner forever, `targetVersion` forever, and every new contributor learning a deprecated scheme next to the live one in order to add a migration.
 
@@ -66,11 +72,14 @@ During the transition:
 packages/core/platform/images/migrations/migrations/
   1 .. 56            # transitional only — frozen, never extended, converted by §10
   lib/
-  revoked            # IDs that must not run (§8)
+  revoked            # slugs that must not run (§8)
+  order.d/           # release-assigned execution order (§3), machine-written only
+    00001-v1.6.0
+    00002-v1.6.3
   pre-apply/         # blocking, runs in the pre-upgrade hook Job
-    20260812-redis-failover-group-label
+    redis-failover-group-label
   background/        # non-blocking, run by cozystack-operator
-    20260814-clickhouse-keeper-pvc-labels
+    clickhouse-keeper-pvc-labels
 ```
 
 After the conversion, which is the shape to design against:
@@ -79,12 +88,16 @@ After the conversion, which is the shape to design against:
 packages/core/platform/images/migrations/migrations/
   lib/
   revoked
+  order.d/
+    00000-legacy                             # the converted integer set, in its original order
+    00001-v1.6.0
+    …
   pre-apply/
-    20250409-01-mariadb-operator-secrets     # was `1`
+    mariadb-operator-secrets                 # was `1`
     …                                        # one file per converted integer
-    20260812-redis-failover-group-label
+    redis-failover-group-label
   background/
-    20260814-clickhouse-keeper-pvc-labels
+    clickhouse-keeper-pvc-labels
 ```
 
 ### 2. Tiers
@@ -115,38 +128,97 @@ The two tiers already exist informally, written into the migration headers. Migr
 
 ### 3. Ordering
 
-Sorting is plain lexicographic byte order over the filename, so the ID grammar is `YYYYMMDD[-NN]-slug` where `NN` is an **optional, two-digit zero-padded** sequence for pinning order within a day:
+Order is assigned when a release is cut, because that is the only moment the necessary fact exists.
+
+**Why nothing else can carry it.** Call the release that first shipped a migration its **shipping release**. Take two migrations with different shipping releases, and a cluster that upgrades through the earlier one and later through the later one. On the first hop the earlier migration is pending and the later one is not in that image at all, so this cluster runs them in shipping-release order — it had no other option available to it. Every other cluster has to match, or they disagree. That is the entire requirement, and it can be stated in one line:
+
+> The execution order must never contradict shipping-release order.
+
+Nothing an author knows while writing a migration tells them its shipping release, because it depends on which release happens to be cut next and on whether the PR is still in review by then. A date, a name, a checksum of the contents, a random identifier, a declared dependency — none of these has any relationship to shipping-release order, so each of them agrees with it only by accident. The failure is not hypothetical:
+
+> A PR opened in July sits in review for months. A second PR, opened in August and knowing nothing about the first, merges ahead of it and ships in 1.7. The July PR is then rebased, merges, and ships in 1.8. A cluster going 1.6 → 1.7 → 1.8 runs the August migration first, because in 1.7 the July one does not exist. A cluster going 1.6 → 1.8 has both pending at once and runs whichever the key sorts first. Under any authoring-time key those two clusters disagree, and no dependency was declared because the July author never knew the August PR existed.
+
+**A dependency graph does not rescue this.** The idea is the natural one: declare edges between migrations, topologically sort the whole set once, and have every cluster run its pending migrations in that single order. It looks sound, because given one fixed list any two clusters that both run `X` and `Y` take their relative order from the same place.
+
+There is no one fixed list. Each release's image holds a different set of migrations, so each release produces a different sorted list. And sorting by declared dependencies does not produce one answer, it produces *an* answer: for a pair with no edge between them the dependency rule has no opinion about which comes first, and yet a list must put one of them somewhere. Some other rule has to decide, and in practice that rule is alphabetical order of the file names. Since almost no pair of migrations has a declared edge, that fallback rule is what actually produces the order. Worked through:
+
+- 1.7's image holds `etcd-crds-precreate` and `vm-disk-bus-default`, with no dependency declared between them. The fallback rule applies, so the list is alphabetical — `etcd-crds-precreate`, `vm-disk-bus-default` — and a cluster reaching 1.7 runs both.
+- 1.8 adds `vm-cloudinit-drive`, again with no edge. 1.8's list is now `etcd-crds-precreate`, `vm-cloudinit-drive`, `vm-disk-bus-default`: the new migration sorted into the **middle**.
+- The cluster already at 1.7 has `vm-disk-bus-default` recorded, so at 1.8 it runs `vm-cloudinit-drive` *after* it. A cluster arriving at 1.8 from 1.6 runs the list as written and takes `vm-cloudinit-drive` *before* it. They disagree — and the graph played no part, because there were no edges to play one.
+
+So the requirement lands on the fallback rule, not on the dependencies: **adding a migration must only ever extend the order at its end, and never insert into its middle.** Alphabetical order of names does not do that, since a new name can land anywhere in the alphabet. Ordering by date does not either — that is the July PR inserting ahead of August. A batch number does, because a newly added migration always receives the newest batch, which is by definition at the end.
+
+**The manifest.** Order lives in `order.d/`, one file per release cut, created and never afterwards modified or deleted:
 
 ```
-20261014-01-drop-legacy-crds
-20261014-02-adopt-onto-new-crds
-20261014-unrelated-label-backfill
+order.d/00003-v1.7.0-rc.1
 ```
 
-Zero-padding is what makes this work — unpadded, `10` would sort before `2`. CI validates the grammar so an unpadded sequence cannot merge. Two edges: an ID that omits `NN` sorts *after* one that has it on the same date (`0` sorts before any letter), and two PRs both choosing `-01-` do not collide, since the slugs differ and the tie breaks deterministically on slug.
-
-`NN` covers intent and readability but enforces nothing. Where one migration genuinely depends on another — across any dates — it is declared and verified:
-
-```sh
-# cozystack-migration: requires=20260801-etcd-crds
+```
+# batch 00003, sealed at v1.7.0-rc.1 by hack/seal-migration-batch.sh
+clickhouse-keeper-pvc-labels
+vm-pool-adopt
+etcd-crds-precreate
 ```
 
-The runner topologically sorts on `requires` and fails loudly on a missing or cyclic dependency rather than guessing.
+Bare slugs, one per line. Tier is not repeated — it is the directory the script lives in, and duplicating it here would let the two drift.
 
-Merge order is deliberately not encoded and must not be relied on: a PR merged in June can carry a later date than one merged in July. What the scheme guarantees is that every cluster — fresh install or two years old — walks the same total order.
+**Within a batch, nothing needs assembling.** Two migrations sealed in the same batch are seen by every cluster in one pass off one image, so the agreement requirement says nothing about their relative order and any deterministic rule satisfies it. That collapses the release step to *assigning a label*: no reconstruction of merge order, no rank counter, no git archaeology. The rule is alphabetical order of the slugs, then reordered where a `requires` in the same batch demands it.
+
+**The prefix invariant, which is the whole guarantee in one check.** Because batches only ever append, each release's manifest is a literal prefix of the next one's. So the property this section exists to deliver is verified at every cut by comparing the head of the new manifest against the previous release's, byte for byte. Nothing in the ecosystem has an equivalent — Alembic can only assert `alembic heads | wc -l` is 1, and `opm validate` only reports `multiple channel heads found in graph`. Under `order.d/` the invariant is additionally structural: add-only is a property of the filesystem, visible in `git diff --name-status`, rather than a lint asserting that the first N lines of a file did not change.
+
+**What the release cut does.** `hack/seal-migration-batch.sh <tag>`, run before the image build:
+
+1. `new` = slugs present under `pre-apply/` and `background/` and absent from every existing batch.
+2. If `new` is empty, write nothing.
+3. Sort `new` alphabetically, then reorder to satisfy any `requires` edges among them, keeping alphabetical order everywhere those edges say nothing; fail on a cycle, on a `requires` naming a slug that does not exist, and on a `requires` pointing at a *later* batch.
+4. Write `order.d/<max+1, zero-padded>-<tag>`.
+5. Refuse if any earlier batch file differs from its committed content, or if any manifest entry names a slug that neither exists on disk nor is flagged `retired` (§11).
+
+`cut-prerelease.yaml` is the single entry point for pre-release tags and dispatches from the branch the tag belongs to, and `tags.yaml` already performs `git add . && git commit -m "Prepare release <tag>"` on that branch — so the batch file has an existing, serialised, CI-owned slot to be written into. No PR author writes a manifest line, and CI rejects a PR that adds one.
+
+**`requires`: who writes it, when, and what it can say.** It is written by the migration's author, in that migration's own header, at the time the migration is written, and it may only name a slug that **already exists in the tree** — CI rejects a dangling target. That bounds what it can express: a dependency on something already merged, never on something not yet written. Which is exactly why the scenario above cannot be fixed by declaring anything.
+
+What the edge does depends on where its target already sits. If the target was sealed in an earlier batch, the dependency is satisfied before the runner starts and `requires` acts purely as a check. If both are still unsealed they land in the same batch, and the release step uses the edge to order them within it. Either way it is resolved at the cut and frozen into the manifest, so the runner parses no headers and evaluates no dependencies. What remains is the value worth keeping: a declared dependency CI can verify, which fails loudly instead of running in the wrong order.
+
+**What is guaranteed, and what is not.** Every cluster upgrading along one release line runs any two migrations in the same relative order. Cross-line, order may differ for exactly one class: a migration backported to a maintenance branch, which is assigned a batch on that branch and a later batch on `main`. Trying to reconcile the two would mean splicing an entry into the middle of `main`'s already-sealed manifest, which is precisely what the prefix invariant forbids — so it is not reconciled. That divergence is safe by the same reasoning that justified the backport: it is the maintainer's assertion that the migration is correct on a branch missing everything in between. CI reports the affected pairs by diffing `order.d/` across branches, so the assertion is explicit rather than assumed. Today the same divergence exists and is invisible — [#3534](https://github.com/cozystack/cozystack/issues/3534) was found by hand.
+
+**A backport, worked through.** `kubeadm-keep-policy` is authored on `main` and is needed on the 1.5 line too.
+
+1. The PR merges to `main`. No release has been cut since, so no batch names it on either branch.
+2. `.github/workflows/backport.yaml` cherry-picks it onto `release-1.5`: same path, same slug, same bytes. **The author does nothing beyond the cherry-pick** — nothing to renumber, nothing to rename, no manifest to edit, because `order.d/` does not mention the slug yet.
+3. `v1.5.4-rc.1` is cut from `release-1.5`. That branch's manifest gains a batch containing `kubeadm-keep-policy`.
+4. `v1.7.0-rc.1` is cut from `main`. Main's manifest gains its own batch, also containing `kubeadm-keep-policy`, which was never sealed there.
+
+Two clusters then differ in order and agree in effect:
+
+```
+1.5.3 → 1.5.4 → 1.7.0    mariadb-operator-secrets, kubeadm-keep-policy, monitoring-move
+1.5.3 → 1.7.0            mariadb-operator-secrets, monitoring-move, kubeadm-keep-policy
+```
+
+`kubeadm-keep-policy` executes **exactly once** on both paths, because the ledger key is the slug and the slug is identical on both branches. That is [#3534](https://github.com/cozystack/cozystack/issues/3534) eliminated: the situation that today stamps a cluster past a migration it never ran.
+
+What differs is its position relative to `monitoring-move`, a 1.6 migration the 1.5 line never carried. Reconciling that would mean splicing the slug into `main`'s manifest at its 1.5.4 position — inside batches already sealed and shipped, which the prefix invariant forbids. So it is not reconciled, and the divergence is the backport's own premise: cherry-picking to `release-1.5` asserted the migration is correct on a branch holding none of 1.6.
 
 ### 4. Ledger
 
-The existing ConfigMap is extended rather than replaced by a new kind. One key per applied migration, `m.<id>`, whose value carries timestamp, script sha256, and outcome:
+The existing ConfigMap is extended rather than replaced by a new kind. One key per applied migration, `m.<slug>`, whose value carries timestamp, script sha256, and outcome:
 
 ```yaml
 data:
-  version: "57"                                       # legacy scalar, still advanced by integer migrations
-  baseline: "20260101-etcd-crds"                      # every older ID is applied; its keys are compacted away
-  m.20260812-redis-failover-group-label: "2026-08-12T10:04:00Z sha256:abcd… ok"
+  version: "57"                                    # legacy scalar, still advanced by integer migrations
+  complete-through: "00002"                        # watermark: a batch number (§3), not a date
+  m.redis-failover-group-label: "2026-08-12T10:04:00Z sha256:abcd… ok"
 ```
 
-**The ledger does not grow without bound.** `baseline` is a watermark: every ID older than it has been applied, and the individual keys below it are compacted away. Compaction only ever runs at the retention floor (§11), the point below which the runner already refuses to upgrade, so the watermark summarises a region that has been declared unsupported and nothing else. Records that did not reach `ok` — a `warn` failure, a `revoked` decision — are never compacted, whatever their date, because those are the entries someone will go looking for.
+The key is the bare slug. It carries no tier and no path, so moving a migration between `pre-apply/` and `background/` before it ships does not mint a second identity for the same work.
+
+**The watermark cannot hide a migration that still ships.** `complete-through` is the highest batch every one of whose entries has reached a terminal state — recorded in the ledger, or flagged `retired` (§11). It is a **batch number**, which is assigned at a release cut and always as the next one up, so a migration merged years after it was written still receives the newest batch. There is no value a newly merged migration can be given that sits below an existing watermark. Contrast a date: a July-dated file merging after the watermark passed July is below it and is treated as applied, which is exactly the silent skip this proposal exists to remove. golang-migrate demonstrates the failure in a shipped library — its single `version, dirty` row makes a late lower-numbered migration permanently unreachable, with no error and no override, and the request for a real applied-set has been open for years.
+
+The watermark is computed across **both** tiers. Scoping it to `pre-apply` alone would let it advance past a background migration that never finished, and the cluster would then be told it is complete when it is not.
+
+**The ledger does not grow without bound.** Compaction runs only at the retention floor (§11), removing the individual keys the watermark already covers. Records that did not reach `ok` — a `warn` failure, a `revoked` decision — are never compacted, whatever their age, because those are the entries someone will go looking for.
 
 Two properties make a ConfigMap the right container:
 
@@ -168,16 +240,16 @@ Shell stays. The contract around it is formalised.
 ```sh
 # cozystack-migration: tier=pre-apply        # pre-apply | background
 # cozystack-migration: on-error=abort        # abort | warn
-# cozystack-migration: requires=20260801-etcd-crds
+# cozystack-migration: requires=etcd-crds-precreate     # optional; must already exist (§3)
 ```
 
 `on-error=warn` turns the "best-effort by design" paragraph into something the runner enforces. The script is then written plainly fail-fast, and the runner decides what a non-zero exit means — instead of `|| true` per command, which also swallows the failures the author wanted to see.
 
 **A shared library, extended.** `migrations/lib/` already holds `cozystack-version.sh` and `seaweedfs-db-adopt.sh`, so the precedent exists. It grows helpers for operations that keep being re-implemented: a `kubectl` wrapper with retry on transient apiserver errors (what the `|| true` sites are really reaching for), a list helper that does not SIGPIPE under `pipefail` (migration `44` documents that trap in a comment), and the Helm-ownership adopt / `resource-policy: keep` pattern shared by `31`, `33`, `35`, `43`, `45` and `53` — by far the most repeated operation in the tree. It also grows a fleet-iteration helper: given an app kind, walk every instance of it and apply the same operation to each, carrying the errexit handling `lib/seaweedfs-db-adopt.sh` documents so one instance failing neither aborts the sweep silently nor passes unnoticed. That helper is the direct answer to the `43` class (§9) and is the one worth writing first.
 
-**A linter**, `hack/lint-migrations.sh`, wired into `make unit-tests`: filename matches the ID grammar; header present, parseable, and declaring `tier` and `on-error`; one shell dialect (`#!/bin/sh`, since the image is busybox — several migrations are currently `#!/bin/bash` for no stated reason); `shellcheck` clean; `requires` targets exist; no direct writes to the ledger. That last rule is where the architectural guard currently in `hack/cozystack-version-stamp.bats` moves to.
+**A linter**, `hack/lint-migrations.sh`, wired into `make unit-tests`: filename matches the slug grammar of §1; header present, parseable, and declaring `tier` and `on-error`; one shell dialect (`#!/bin/sh`, since the image is busybox — several migrations are currently `#!/bin/bash` for no stated reason); `shellcheck` clean; `requires` targets exist and name no later batch; no direct writes to the ledger; and no file added under `order.d/` by anything but the release job, which is the rule that keeps §3's guarantee structural rather than cultural. That last rule is where the architectural guard currently in `hack/cozystack-version-stamp.bats` moves to.
 
-**Tests become mandatory.** Every new ID migration ships a bats suite driving it against fake `kubectl` fixtures, and the linter fails a migration that has none. The pattern is established: `hack/migration-50-etcd-adopt.bats` drives the real script against `hack/testdata/migration-50/` with 28 cases. This is the highest-leverage rule in the set — migration `43`'s hardcoded release name is caught by a single test case using a non-default instance name.
+**Tests become mandatory.** Every new migration ships a bats suite driving it against fake `kubectl` fixtures, and the linter fails a migration that has none. The pattern is established: `hack/migration-50-etcd-adopt.bats` drives the real script against `hack/testdata/migration-50/` with 28 cases. This is the highest-leverage rule in the set — migration `43`'s hardcoded release name is caught by a single test case using a non-default instance name.
 
 **A scaffold**, `hack/new-migration.sh <slug>`, generating the script and test stub with the header filled in and today's date. Conventions that require reading a document get followed unevenly; conventions the tooling hands you get followed.
 
@@ -186,19 +258,35 @@ Shell stays. The contract around it is formalised.
 `run-migrations.sh` gains a second pass, so in-flight integer migrations merge unchanged:
 
 1. **Legacy pass** — unchanged `seq CURRENT (TARGET-1)` over `migrations/[0-9]+`, gated on `version`. Frozen: CI rejects any *new* integer file.
-2. **ID pass** — `pending = ls(pre-apply/) − applied − revoked`, topologically sorted, each recorded via patch on success.
+2. **Slug pass** — a single walk over the manifest, in batch-file order:
+
+```sh
+for batch in order.d/*; do                       # zero-padded, so plain glob order is correct
+  while read -r slug flag; do
+    ledger_has   "$slug" && continue             # already terminal on this cluster
+    is_revoked   "$slug" && { record "$slug" revoked-unless-present; continue; }
+    [ "$flag" = retired ] && continue            # deleted below the floor (§11)
+    script=$(find_script "$slug") || fail "$slug is in $batch but not in this image"
+    run_migration "$script" && record "$slug" ok
+  done < "$batch"
+done
+```
+
+There is no sorting, no dependency resolution and no version comparison at runtime: §3 settled all three at the release cut. That is what keeps the runner inside `/bin/sh` in a busybox image, and it is why `requires` never has to be parsed here.
+
+Two conditions are fatal and must stay fatal. A slug present on disk but in no batch means the release step did not run, and a slug in a batch but absent from the image means the packaging is wrong; both abort before anything executes. Downgrading either to a warning reintroduces the silent skip, and the whole ecosystem has converged on the same posture — Flyway refuses by default under `outOfOrder=false`, goose flipped its default to an error in v3.3.0, dbmate has `--strict`, Ecto has `:strict_version_order`.
 
 Legacy runs first. `background/` is not executed by the hook at all.
 
 ### 7. Execution
 
-**Pre-apply** stays the render-gated hook. The gate generalises from a scalar compare to a set difference: the chart already ships the scripts (there is no `.helmignore` in `packages/core/platform`), so `.Files.Glob "images/migrations/migrations/pre-apply/*"` yields the ID list at render with no content reads. The Job is only created when the difference is non-empty.
+**Pre-apply** stays the render-gated hook. The gate generalises from a scalar compare to a set difference: the chart already ships the whole migrations directory (there is no `.helmignore` in `packages/core/platform`), so `.Files.Glob "images/migrations/migrations/order.d/*"` yields the manifest at render, and the slug list falls out of it with no directory walk and no script reads. The Job is only created when the difference is non-empty. `templates/sources.yaml` already reads chart files this way, so the idiom is established here.
 
-**A fresh install records, it does not run.** Today a new cluster runs zero migrations, and that is two behaviours acting together rather than one rule: `templates/cozystack-version.yaml` stamps `targetVersion` straight into the ConfigMap when `lookup` finds none, and `templates/migration-hook.yaml` computes `$shouldRunMigrationHook` only inside `{{- if $configMap }}`, so with no ConfigMap the hook does not render at all. (The bootstrap branch in `run-migrations.sh` is unreachable through Helm for the same reason.) A set difference has no equivalent of that: an absent ConfigMap is an empty ledger, so `pending` would be the entire `pre-apply/` set and the first ID migration to land would change what a fresh install does.
+**A fresh install records, it does not run.** Today a new cluster runs zero migrations, and that is two behaviours acting together rather than one rule: `templates/cozystack-version.yaml` stamps `targetVersion` straight into the ConfigMap when `lookup` finds none, and `templates/migration-hook.yaml` computes `$shouldRunMigrationHook` only inside `{{- if $configMap }}`, so with no ConfigMap the hook does not render at all. (The bootstrap branch in `run-migrations.sh` is unreachable through Helm for the same reason.) A set difference has no equivalent of that: an absent ConfigMap is an empty ledger, so `pending` would be the entire `pre-apply/` set and the first slug migration to land would change what a fresh install does.
 
-So the install-time branch of `templates/cozystack-version.yaml` seeds the ledger, recording every shipped ID in both tiers with outcome `skipped-fresh-install`. `.Files.Glob` already yields that list at render, and the branch only evaluates when the ConfigMap is absent, so this is one loop on a path taken exactly once in a cluster's life. This belongs to Phase 1 rather than Phase 5: without it Phase 1 is not behaviour-preserving, and the seeding in §10 does not cover it — that condition tests for a `version` scalar with no `m.*` keys, and it seeds from `legacy-map`, which holds no ID migrations.
+So the install-time branch of `templates/cozystack-version.yaml` seeds the ledger, recording every slug in the manifest — both tiers — with outcome `skipped-fresh-install`, and setting `complete-through` to the newest batch. The manifest is already read at render for the gate, so this is one loop on a path taken exactly once in a cluster's life. This belongs to Phase 1 rather than Phase 5: without it Phase 1 is not behaviour-preserving, and the seeding in §10 does not cover it — that condition tests for a `version` scalar with no `m.*` keys, and it seeds from `legacy-map`, which holds no slug migrations.
 
-**Background** is orchestrated — not executed — by cozystack-operator, because the scripts live in the migrations image and the operator has neither them nor a Helm renderer. The chart therefore writes down the two things the operator cannot derive: which IDs are background, and which migrations image the current platform release pins.
+**Background** is orchestrated — not executed — by cozystack-operator, because the scripts live in the migrations image and the operator has neither them nor a Helm renderer. The chart therefore writes down the two things the operator cannot derive: which slugs are background and in what order, and which migrations image the current platform release pins.
 
 ```yaml
 apiVersion: v1
@@ -208,12 +296,12 @@ metadata:
   namespace: cozy-system
 data:
   image: ghcr.io/cozystack/cozystack/platform-migrations:v1.7.0@sha256:…
-  background: |
-    20260814-clickhouse-keeper-pvc-labels
-    20260814-tenant-ancestor-labels
+  background: |                                # manifest order, filtered to the background tier
+    clickhouse-keeper-pvc-labels
+    tenant-ancestor-labels
 ```
 
-The operator reconciles `pending = background − ledger − revoked`, creates one Job per pending ID from `image` with `ONLY=<id>`, and patches the ledger on success. Because the ConfigMap is re-rendered on every platform upgrade, the image ref and the list cannot drift from the release that shipped them. The operator is already `cluster-admin`, so this needs no RBAC change.
+The operator reconciles `pending = background − ledger − revoked`, walks it in the listed order, creates one Job per pending slug from `image` with `ONLY=<slug>`, and patches the ledger on success. Because the ConfigMap is re-rendered on every platform upgrade, the image ref and the list cannot drift from the release that shipped them. The operator is already `cluster-admin`, so this needs no RBAC change.
 
 Background Jobs run **serially**, one at a time in ID order: it matches the current model, keeps failure attribution unambiguous, and avoids two migrations touching the same objects concurrently.
 
@@ -223,27 +311,27 @@ Moving backfills off the blocking path also fixes a live operational problem: th
 
 ### 8. Revocation
 
-An ID file is immutable once it reaches any branch a release is cut from — editing `43` in place is what created the `53` situation. A faulty migration has two populations to serve, and both are handled explicitly.
+A migration file is immutable once it reaches any branch a release is cut from — editing `43` in place is what created the `53` situation. A faulty migration has two populations to serve, and both are handled explicitly.
 
-**Clusters that have not run it yet** must never run it. Its ID goes in `migrations/revoked`, and the runner subtracts that set from pending. It records `m.<id>: "… revoked"` **only when no key for that ID exists**, so the ledger stays a complete account of what was decided without overwriting what executed. The condition is the whole point: on a cluster that already ran the migration successfully, an unconditional write replaces `ok` with `revoked` and destroys the one fact an operator needs during the incident, which is whether this cluster executed it.
+**Clusters that have not run it yet** must never run it. Its slug goes in `migrations/revoked`, and the runner subtracts that set from pending. It records `m.<slug>: "… revoked"` **only when no key for that slug exists**, so the ledger stays a complete account of what was decided without overwriting what executed. The condition is the whole point: on a cluster that already ran the migration successfully, an unconditional write replaces `ok` with `revoked` and destroys the one fact an operator needs during the incident, which is whether this cluster executed it.
 
 **Clusters that already ran it** need repair, which is a new migration with a new ID handling both the never-ran and the ran-broken states.
 
 ```
-# 20260812-redis-failover-group-label stamped the wrong operator-group value.
-# Superseded by 20260901-redis-failover-group-fix.
-20260812-redis-failover-group-label
+# redis-failover-group-label stamped the wrong operator-group value.
+# Superseded by redis-failover-group-fix.
+redis-failover-group-label
 ```
 
 This turns a silent, dangerous edit into an explicit, reviewable one, and closes the never-ran population automatically rather than by remembering to fold the fix back into the original file.
 
-**Companion CI guard:** once an ID file exists on any branch releases are cut from, its content may not change (diff against merge-base). Scoping the guard to `main` alone would miss the [#3534](https://github.com/cozystack/cozystack/issues/3534) shape precisely: one ID carrying different content on a release branch is the same silent skip in a new spelling, and the guard has to run wherever the divergence can be introduced. The ledger checksum still catches it after the fact on a live cluster, but §11 argues that detection which can be ignored reproduces the failure it is meant to prevent, and that argument applies here too. Revocation is the sanctioned escape hatch, so the guard has somewhere to point.
+**Companion CI guard:** once a migration file exists on any branch releases are cut from, its content may not change (diff against merge-base). Scoping the guard to `main` alone would miss the [#3534](https://github.com/cozystack/cozystack/issues/3534) shape precisely: one slug carrying different content on a release branch is the same silent skip in a new spelling, and the guard has to run wherever the divergence can be introduced. The ledger checksum still catches it after the fact on a live cluster, but §11 argues that detection which can be ignored reproduces the failure it is meant to prevent, and that argument applies here too. Revocation is the sanctioned escape hatch, so the guard has somewhere to point.
 
 ### 9. Why migrations stay platform-level
 
-An earlier revision of this proposal moved migrations that only touch one package's objects into that package, delivered by that package's own pre-upgrade hook, with ledger keys namespaced as `m.<package>.<id>`. That does not work, and the reason is the incident this document opens with.
+An earlier revision of this proposal moved migrations that only touch one package's objects into that package, delivered by that package's own pre-upgrade hook, with ledger keys namespaced as `m.<package>.<slug>`. That does not work, and the reason is the incident this document opens with.
 
-A namespaced key has a package dimension and no instance dimension. `SeaweedFS` is a user-creatable kind: instance `foo` is owned by release `foo-system`, and a cluster can hold any number of them. One key `m.seaweedfs.20260812-db-adopt` covering N instances means the first release to run writes it and every other instance is skipped as already applied — the `43` failure again, now with a ledger entry on top asserting it succeeded. Adding an instance dimension to the key does close that hole, but it makes the ledger unbounded in the tenant's dimension rather than the platform's, and it asks a hook that can only see its own release to reason about a fan-out it cannot enumerate.
+A namespaced key has a package dimension and no instance dimension. `SeaweedFS` is a user-creatable kind: instance `foo` is owned by release `foo-system`, and a cluster can hold any number of them. One key `m.seaweedfs.db-adopt` covering N instances means the first release to run writes it and every other instance is skipped as already applied — the `43` failure again, now with a ledger entry on top asserting it succeeded. Adding an instance dimension to the key does close that hole, but it makes the ledger unbounded in the tenant's dimension rather than the platform's, and it asks a hook that can only see its own release to reason about a fan-out it cannot enumerate.
 
 The pattern that works is already in the tree: a platform-level migration that scans the fleet, which is what `lib/seaweedfs-db-adopt.sh` does. What `lib/` was missing is not a scoping mechanism but a helper for that iteration, including the errexit handling that file documents — the guard migration `43` lacked. §5 adds it.
 
@@ -261,9 +349,9 @@ The dual-mode runner is a transition device, not an end state. Leaving fifty-six
 
 The conversion is itself a migration of the migrations, and it is mechanical:
 
-1. Rename `migrations/1..56` to IDs derived from the release each shipped in, preserving order, so `1` becomes `20250409-01-mariadb-operator-secrets` and the rest follow up the set. The numeric suffix in the slug keeps the original sequence readable and guarantees the sort matches the old order exactly.
-2. Commit the integer → ID mapping as `migrations/legacy-map`, one `N <id>` pair per line.
-3. On first run against a cluster that has a `version` scalar but no `m.*` keys, the runner seeds the ledger from the map: every integer below `version` gets its `m.<id>` recorded with outcome `legacy` (no checksum — those files were not immutable when they ran). Idempotent, since the seeding condition is the absence of `m.*` keys. A fresh install never reaches this path: §7 seeds its ledger at install time, so the `m.*` keys are already there.
+1. Rename `migrations/1..56` to slugs describing what each does, so `1` becomes `mariadb-operator-secrets`. Order is not encoded in the names and does not need to be: step 1b writes `order.d/00000-legacy` listing all fifty-six slugs in their original integer order, which is by construction the order every existing cluster already ran them in. That batch sorts before every release batch, so the converted set keeps its position in the global sequence exactly.
+2. Commit the integer → slug mapping as `migrations/legacy-map`, one `N <slug>` pair per line. It is the seeding input for step 3 and the only place the old numbering survives.
+3. On first run against a cluster that has a `version` scalar but no `m.*` keys, the runner seeds the ledger from the map: every integer below `version` gets its `m.<slug>` recorded with outcome `legacy` (no checksum — those files were not immutable when they ran). Idempotent, since the seeding condition is the absence of `m.*` keys. A fresh install never reaches this path: §7 seeds its ledger at install time, so the `m.*` keys are already there.
 4. Delete the legacy pass, `targetVersion`, and `hack/check-migrations-target.sh`.
 
 Only step 3 touches clusters, and it writes ledger keys rather than running anything. A cluster stamped `57` ends up with fifty-six `legacy` records and behaves identically.
@@ -274,11 +362,21 @@ Today every migration ever written ships in the image forever, because a dense s
 
 What makes deletion safe is declaring a floor — the oldest platform version this release accepts as an upgrade source, which is already a supported-versions policy decision rather than a new one. Migrations that only ever applied to clusters below the floor are deleted; the runner compares the cluster's ledger against the floor and **refuses**, rather than warning, on a cluster beneath it, pointing at a staged upgrade through an intermediate release. Refusing is the only defensible choice: a warning that is ignored produces exactly the silent-skip failure this proposal exists to eliminate.
 
-The floor is also where the ledger compacts. Dropping a migration from the image while leaving its `m.<id>` key behind forever would make the ConfigMap grow monotonically for the life of the cluster, so the operation that deletes the file also advances `baseline` (§4) past it and removes the keys the watermark now covers. Only `ok` and `legacy` records compact. A `warn` failure or a `revoked` decision keeps its own key at any age, because a hole in the history is exactly the thing worth reading.
+Deleting a migration means deleting the script and flagging its manifest line `retired`, in the same commit:
+
+```
+# batch 00001, sealed at v1.6.0
+mariadb-operator-secrets    retired
+flux-tenants-cleanup        retired
+```
+
+The line stays. It costs about forty bytes and it is what lets the runner tell a retired migration from a slug it has never heard of — the second of which is a packaging error that must abort. The invariant CI enforces is one line long: **every manifest entry satisfies exactly one of {the script exists, the entry is flagged `retired`}**, and `retired` is never reversible. That is what makes it impossible for the watermark to cover something that still ships, without relying on anyone comparing dates.
+
+The floor is also where the ledger compacts. Leaving an `m.<slug>` key behind for every migration ever run would make the ConfigMap grow monotonically for the life of the cluster, so the same operation advances `complete-through` (§4) and removes the keys that watermark now covers. Only `ok` and `legacy` records compact. A `warn` failure or a `revoked` decision keeps its own key at any age, because a hole in the history is exactly the thing worth reading.
 
 ### 12. What this retires
 
-`hack/check-migrations-target.sh` and `targetVersion`, the cross-branch slot-alignment check proposed in [#3534](https://github.com/cozystack/cozystack/issues/3534), and the question of which PR owns a number. Backports become safe by construction: an ID applied on `release-1.5` is recorded, and the 1.6 upgrade skips it and runs its own.
+`hack/check-migrations-target.sh` and `targetVersion`, the cross-branch slot-alignment check proposed in [#3534](https://github.com/cozystack/cozystack/issues/3534), and the question of which PR owns a number. Backports become safe by construction: a slug applied on `release-1.5` is recorded under that slug, and the 1.6 upgrade skips it and runs its own.
 
 ## User-facing changes
 
@@ -320,10 +418,12 @@ One property improves: the ledger records a sha256 of each script as it ran, so 
 - Revoked ID, never applied here → skipped, and recorded as `revoked` so the ledger stays complete.
 - Revoked ID already applied here → skipped, and the existing `ok` record is left alone. Revocation never rewrites history.
 - `on-error=abort` migration fails → the hook Job fails, the platform upgrade does not proceed, and nothing is recorded for that ID.
-- `on-error=warn` migration fails → logged, upgrade proceeds, and the ID is recorded with a non-`ok` outcome so it is visible rather than indistinguishable from success.
+- `on-error=warn` migration fails → logged, upgrade proceeds, and the slug is recorded with a non-`ok` outcome so it is visible rather than indistinguishable from success.
 - Applied migration's file content changed since it ran → checksum mismatch reported. The migration is not re-run; repair is a new ID.
-- `requires` names an ID that does not exist, or the graph has a cycle → runner fails before executing anything.
-- Two migrations dated the same day with no `NN` and no `requires` → both run, in deterministic slug order, identically on every cluster.
+- `requires` names a slug that does not exist, names one in a later batch, or the graph has a cycle → the **release cut** fails. The runner never evaluates `requires`, because §3 resolved it into the manifest.
+- Slug on disk but in no batch → the release step did not run for this build. Runner aborts before executing anything.
+- Slug in a batch, not flagged `retired`, and absent from the image → packaging error. Runner aborts.
+- Two migrations sealed in the same batch with no `requires` → both run in slug order, identically on every cluster, because every cluster sees that batch in one pass off one image.
 - Cluster with `version` set and no `m.*` keys (Phase 5) → seeded from `legacy-map`; running twice seeds nothing further, since the condition is the absence of `m.*` keys.
 - Background Job fails → surfaces as a `Ready=False` condition with a distinct reason on the operator, and is retried on the next reconcile rather than blocking the upgrade. Whether repeated failure should eventually stop retrying is an open question below.
 - Cluster below the retention floor (Phase 5+) → runner refuses and names the intermediate release to upgrade through.
@@ -332,13 +432,13 @@ One property improves: the ledger records a sha256 of each script as it ran, so 
 
 Test-first throughout. The runner is a shell script driven against fake `kubectl` fixtures, a format already established by `hack/migration-50-etcd-adopt.bats` (28 cases against `hack/testdata/migration-50/`) and `hack/migration-seaweedfs-db-adopt.bats`.
 
-**Unit (bats, `hack/cozytest.sh`).** Runner: every case in *Failure and edge cases* above. Ordering: `20261014-02-*` runs after `-01-` and before `-10-`; a `requires` edge overrides lexicographic position; unpadded sequences are rejected. Ledger durability: `stamp_cozystack_version` after `record_migration` must not prune `m.*` keys, and a `revoked` record must not overwrite an existing `ok`. Compaction: advancing `baseline` removes `ok` and `legacy` keys below it and leaves `warn` and `revoked` records standing. Linter: missing or unparseable header, undeclared `tier`/`on-error`, `#!/bin/bash`, a ledger write from inside a migration, a migration with no bats suite, a dangling `requires` — each rejected.
+**Unit (bats, `hack/cozytest.sh`).** Runner: every case in *Failure and edge cases* above. Ordering: the runner walks batches in filename order and entries in listed order; a slug on disk and in no batch aborts; a slug in a batch and absent from the image aborts; a `retired` entry is skipped without a script. Seal step: a new batch appends only, `requires` reorders within a batch, a `requires` naming a later batch fails, the head of the new manifest equals the previous release's byte for byte. Ledger durability: `stamp_cozystack_version` after `record_migration` must not prune `m.*` keys, and a `revoked` record must not overwrite an existing `ok`. Compaction: advancing `complete-through` removes `ok` and `legacy` keys it covers and leaves `warn` and `revoked` records standing; a manifest entry that is neither present on disk nor `retired` is rejected. Linter: missing or unparseable header, undeclared `tier`/`on-error`, `#!/bin/bash`, a ledger write from inside a migration, a migration with no bats suite, a dangling `requires` — each rejected.
 
 **Unit (helm-unittest).** Render gate: nothing pending → zero documents; legacy-only pending; ID-only pending; both. Fresh install (no ConfigMap in `lookup`) → the seeded ledger renders, carrying one `skipped-fresh-install` record per shipped ID, and no Job renders at all. The existing `packages/core/platform/tests/migration_hook_skip_backup_test.yaml` asserts the hook's env by positional index, so it is rewritten alongside.
 
 **Controller (envtest).** Pending computation including revoked, Job creation, ledger patch on success, and a failing Job surfacing as `Ready=False` with a distinct reason rather than a retry storm.
 
-**E2E (upgrade lane).** [#3276](https://github.com/cozystack/cozystack/pull/3276) currently asserts the stamp reached `migrations.targetVersion`. Its replacement, required before Phase 5 retires `targetVersion`, is an **empty-pending assertion**: every ID under `pre-apply/` and `background/` in the tree under test must have a matching `m.<id>` ledger key whose outcome is `ok`, `legacy` or `revoked`. Both sides are cheap — `ls` the two directories in the checked-out tree, read the ConfigMap's keys — and it is strictly stronger than the integer compare, because it proves each individual migration reached a terminal state rather than that a counter moved. The background half is asynchronous, so it polls; any other outcome fails the lane and names the offending ID.
+**E2E (upgrade lane).** [#3276](https://github.com/cozystack/cozystack/pull/3276) currently asserts the stamp reached `migrations.targetVersion`. Its replacement, required before Phase 5 retires `targetVersion`, is an **empty-pending assertion**: every slug in the manifest of the tree under test that is not flagged `retired` must have a matching `m.<slug>` ledger key whose outcome is terminal — `ok`, `legacy`, `revoked` or `skipped-fresh-install`. Because a fresh install seeds every slug it ships, the lane must additionally assert that the slugs introduced between the base release and the release under test carry `ok` specifically, or it passes trivially on a clean install. Both sides are cheap — `cat order.d/*` in the checked-out tree, read the ConfigMap's keys — and it is strictly stronger than the integer compare, because it proves each individual migration reached a terminal state rather than that a counter moved. The background half is asynchronous, so it polls; any other outcome fails the lane and names the offending ID.
 
 Existing suites that pin the current shape and are rewritten rather than ported: `hack/cozystack-version-stamp.bats` (its architectural guard hardcodes the `>= 42` numeric-filename convention; it becomes a linter rule), and the literal next-version assertions (`51`, `54`) inside `hack/migration-50-etcd-adopt.bats` and `hack/migration-seaweedfs-db-adopt.bats`, which disappear with migration-side stamping. `hack/migration-seaweedfs-db-adopt.bats` also `sed`s `FROM alpine:` out of the Dockerfile, so that line's shape must be preserved.
 
@@ -348,7 +448,7 @@ Existing suites that pin the current shape and are rewritten rather than ported:
 
 Each phase is independently shippable.
 
-**Phase 1 — engine and contract.** Dual-mode runner, `record_migration`, set-difference render gate, header parser and `on-error` handling, `hack/lint-migrations.sh`, `hack/new-migration.sh`, `lib/` helpers including the fleet-iteration one, fresh-install ledger seeding (§7), and three CI guards (integer freeze, ID immutability on every release branch, ID grammar). Every migration is `pre-apply`, so runtime behaviour is unchanged. The linter enforces on `pre-apply/` and `background/` only; the 56 frozen integers are grandfathered.
+**Phase 1 — engine and contract.** Dual-mode runner, `record_migration`, set-difference render gate, header parser and `on-error` handling, `hack/lint-migrations.sh`, `hack/new-migration.sh`, `lib/` helpers including the fleet-iteration one, fresh-install ledger seeding (§7), `hack/seal-migration-batch.sh` wired into the release cut, and five CI guards (integer freeze, content immutability on every release branch, slug grammar and uniqueness, `order.d/` add-only and release-job-only, and the prefix check at the cut). Every migration is `pre-apply`, so runtime behaviour is unchanged. The linter enforces on `pre-apply/` and `background/` only; the 56 frozen integers are grandfathered.
 
 **Phase 2 — background tier.** Index ConfigMap template and the operator reconciler. Applies to new work only; the legacy integers stay frozen where they are, since `44`, `48`, `49` and `51` are already applied essentially everywhere.
 
@@ -356,13 +456,13 @@ Each phase is independently shippable.
 
 **Phase 4 — attrition.** Reduces the rate at which new migrations are needed; retires none of the existing ones. *Admission-time defaulting* for fields on objects Cozystack does not template: migration `51` exists because vm-operator stamps `volumeClaimTemplate` labels only onto PVCs created after the chart change, and the StatefulSet controller never re-labels an existing PVC — Cozystack cannot template those PVCs, a controller creates them. A `MutatingAdmissionPolicy` matching `CREATE` on `persistentvolumeclaims` owned by a cozystack-managed VMCluster stamps the label at creation. It must be capability-gated exactly as `packages/system/cozystack-basics/templates/ingress-hostname-policy.yaml` gates its VAP on `.Capabilities.APIVersions.Has`, because the management cluster floor is 1.33 while `MutatingAdmissionPolicy` is beta in 1.34 and GA in 1.36. It is prevention only — existing PVCs still need the one-shot backfill. *API-layer conversion* for the values-format class: migration `39` rewrites flat `resourcesPreset` names into instance-type names across every App CR, and `pkg/apis/apps/presets/legacy.go` records that the same table is mirrored in four places. Accepting the legacy spelling in the aggregated API's conversion and defaulting layer means the stored CR never has to be rewritten and roughly fifteen migrations of this shape stop existing. Each half warrants its own proposal.
 
-**Phase 5 — legacy conversion and retention.** Rename the integer set, commit `legacy-map`, implement seeding, delete the legacy pass and `targetVersion`. Depends only on Phase 1 plus at least one shipped release of soak, so the ID path is exercised before the seeding path is added; independent of Phases 2–4. The retention floor is introduced in the first release that actually deletes a migration, not before.
+**Phase 5 — legacy conversion and retention.** Commit `legacy-map`, implement seeding, delete the legacy pass and `targetVersion`. Rename the set to slugs and write `order.d/00000-legacy`. Depends only on Phase 1 plus at least one shipped release of soak, so the slug path is exercised before the seeding path is added; independent of Phases 2–4. The retention floor is introduced in the first release that actually deletes a migration, not before.
 
 ## Open questions
 
 - §9 keeps every migration platform-level, which is right while everything ships from one repository. If packages genuinely split out, what unit owns a ledger is open — plausibly the bundle rather than the package, since a bundle has cross-package migrations by construction and a single package does not.
 - Should `on-error=warn` migrations that fail be retried on the next upgrade, or recorded as attempted-and-failed and left alone? Retrying suits transient apiserver errors; not retrying avoids an indefinitely repeating failure nobody is watching.
-- Does `requires` need to express "must run in a strictly earlier upgrade" as distinct from "must run earlier in this pass"? No current migration needs it, and adding it later is not a breaking change.
+- Should the tier model gain a third value for work that is *convergent* — expressible as a predicate over current state rather than as a one-shot edit? The label backfills (`48`, `49`, `51`) and the defensive cleanup (`44`) are all of this shape: safe to re-run, order-independent, needing neither the manifest nor a ledger key. This is why `dpkg` and `rpm` survive version skips so calmly — their conditions are declarative, so history stops mattering. Splitting it out would shrink the ordered set to the genuinely one-shot minority (`52`, `53`, `55`) and with it the blast radius of any ordering bug. It costs one header value and is the cheapest risk reduction available, but it is a change to §2 rather than to §3 and is deliberately not folded in here.
 
 ## Alternatives considered
 
@@ -375,6 +475,16 @@ Each phase is independently shippable.
 **Runtime — operator-driven execution for everything.** Not rejected on the grounds an earlier draft of this section gave. That draft said the alternative loses the runs-before-chart-apply guarantee. It does not, and the correction is worth recording rather than quietly deleting: `migration-hook.yaml` is a `pre-upgrade,pre-install` hook on the platform chart, the same chart renders the `Package` CRs, and `internal/operator/package_reconciler.go` builds the HelmReleases from them — so the hook already sits ahead of every package rollout, and the §2 class that must precede a *different* package's operator is covered today. A per-package gate in the reconciler is finer-grained, which buys less blocking rather than more ordering.
 
 Two things do argue for keeping pre-apply on the hook for now, and a proposal moving it has to answer them first. The controller would need the incoming release's migrations *before* it rolls the bundle that carries them, which the hook gets free from the render; reading the artifact through source-controller, which fetches ahead of any rollout, is the shape to prove there. And the CRD costs in §4 stay unsized. One argument for the move survives both, and this proposal cannot answer it: a ledger entry can only say "done", while some work is an invariant that must hold across several upgrades — `lib/seaweedfs-db-adopt.sh` documents exactly that, noting its `keep` window "is not a one-shot". A controller can hold an invariant. That deserves its own proposal.
+
+**Ordering — a date or sequence in the filename.** Rejected by §3: an authoring-time key is independent of which release first ships the migration, so it agrees with the required order only by luck. The variant that repairs it — a CI rule refusing an ID older than the newest already merged — was rejected separately for its running cost, since it forces a rename on every stale rebase and stale rebases are common. A two-digit intra-day sequence fails for a sharper reason: the author picks it before knowing which migrations land in the same release, so it can express neither intra-day nor intra-release order.
+
+**Ordering — a declared dependency graph as the order.** Rejected by §3. Taking a subset of one fixed sorted list does preserve relative order, but different clusters sort different sets of migrations, so the result is decided by whatever rule orders the pairs that declare no dependency — and that rule must only ever add to the end of the order, never into the middle. Ordering by name, by date or by checksum all fail that. Django is the working example of the honest version of this design: it disclaims filename ordering outright, resolves divergent leaves with `makemigrations --merge`, and never promises a stable order for pairs with no declared edge. `requires` is kept, but as a checked assertion resolved at the release cut rather than as the ordering mechanism.
+
+**Ordering — the release step renames files, `goose fix` style.** goose is the one tool surveyed with a genuine release-time ordering step: it renames timestamped development files to sequential integers in CI once they are ready to ship. Rejected because the filename is the ledger key here, so a rename would rewrite cluster state and break cross-branch identity. The same effect without the rename is a manifest beside the files, which is what §3 specifies.
+
+**Ordering — a batch stamped into each script's header at release time.** Tempting because a cherry-pick then carries the assignment with the file. Rejected: a migration that reaches `release-1.6` before `main` cuts its next release is stamped on the branch while `main`'s copy is not, so the same slug ends up with two batches — and unlike a central manifest there is no single artifact where the conflict can be detected. It also weakens immutability from "once merged" to "once released" for no gain.
+
+**Ordering — forbid the skip, as kubeadm does.** `MaximumAllowedMinorVersionUpgradeSkew = 1` with no bypass flag, and Cluster API defers to it; Flyway's `outOfOrder=false` is the same posture. Requiring 1.6 → 1.7 → 1.8 would make the pending set exactly one release's worth on every cluster, satisfying the ordering requirement with no machinery at all. Rejected as a product decision rather than a technical one: the cost lands on air-gapped and slow-moving clusters, which are a real part of the Cozystack population, and it is very hard to relax later once the ordering machinery has been left unbuilt. It also does not close patch-level skips within a line, which is exactly where backports live.
 
 **Runtime — Kyverno `mutateExisting` for the backfill class.** Rejected: it adds a dependency, and its existing-resource mutation is explicitly asynchronous with variable delay — disqualifying wherever the mutation must land before a Helm prune.
 
