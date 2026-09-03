@@ -23,7 +23,7 @@ Migrations live in `packages/core/platform/images/migrations/` and are delivered
 
 `run-migrations.sh` walks `seq $CURRENT_VERSION $((TARGET_VERSION - 1))`. `CURRENT_VERSION` comes from a scalar in ConfigMap `cozy-system/cozystack-version`; `TARGET_VERSION` is hand-maintained in `values.yaml`. The chart's `templates/cozystack-version.yaml` creates that ConfigMap on first install, and the hook only renders when `currentVersion < targetVersion`, so a cluster with nothing pending never starts a pod.
 
-There are 56 migrations on disk and `targetVersion` is 57.
+At the time of writing there are 56 migrations on disk and `targetVersion` is 57. That count is a snapshot and this document does not keep it current — it is quoted because the scale is what the argument rests on, and every count below reads the same way.
 
 ### The problem
 
@@ -56,16 +56,34 @@ A fourth cost is unbilled. Migration `43` matched the owning Helm release agains
 
 ### 1. Identity and layout
 
-Identity is `YYYYMMDD-slug`. Tier is the **directory**, so nothing is parsed at render time and there is no generated index to keep in sync:
+Identity is `YYYYMMDD-slug`. Tier is the **directory**, so nothing is parsed at render time and there is no generated index to keep in sync.
+
+The integer set does not survive alongside the new one. It is carried untouched only while the conversion is staged, and §10 renames all of it, after which there is one identity scheme, one runner path and nothing a contributor has to know about integers. Leaving them in place permanently is explicitly rejected: it would mean a dual-mode runner forever, `targetVersion` forever, and every new contributor learning a deprecated scheme next to the live one in order to add a migration.
+
+During the transition:
 
 ```
 packages/core/platform/images/migrations/migrations/
-  1 .. 56            # legacy integer set — frozen, never extended
+  1 .. 56            # transitional only — frozen, never extended, converted by §10
   lib/
   revoked            # IDs that must not run (§8)
   pre-apply/         # blocking, runs in the pre-upgrade hook Job
     20260812-redis-failover-group-label
   background/        # non-blocking, run by cozystack-operator
+    20260814-clickhouse-keeper-pvc-labels
+```
+
+After the conversion, which is the shape to design against:
+
+```
+packages/core/platform/images/migrations/migrations/
+  lib/
+  revoked
+  pre-apply/
+    20250409-01-mariadb-operator-secrets     # was `1`
+    …                                        # one file per converted integer
+    20260812-redis-failover-group-label
+  background/
     20260814-clickhouse-keeper-pvc-labels
 ```
 
