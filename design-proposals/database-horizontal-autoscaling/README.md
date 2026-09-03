@@ -93,10 +93,10 @@ Each autoscalable chart wraps its replica field so that, when autoscaling is ena
 ```yaml
 # packages/apps/postgres/templates/db.yaml (illustrative)
 spec:
-{{- if .Values.autoscaling.enabled }}
-  instances: {{ max .Values.replicas (include "…effectiveMin" .) }}   # constant seed
+{{- if and .Values.autoscaling.enabled (not .Values.autoscaling.transition) (not .Values.autoscaling.dryRun) }}
+  instances: {{ max .Values.replicas (include "…effectiveMin" .) }}   # constant seed — active autoscaling
 {{- else }}
-  instances: {{ .Values.replicas }}
+  instances: {{ .Values.replicas }}   # static count — off, or the transition / dry-run staging modes (§Upgrade, §5)
 {{- end }}
 ```
 
@@ -104,7 +104,7 @@ The seed is a constant, so every reconcile renders the value it rendered last ti
 
 Seeding a constant rather than *omitting* the field is deliberate, and the reasoning — why the original omit design does not survive on the current platform, and why client-side apply makes the constant safe despite the reviewer's three-way-merge objection — is recorded in [decision 0001](decisions/0001-client-side-apply-preserves-the-autoscaler-seed.md). In short: an omitted field defaults to `1` (quorum-fatal), and under server-side apply the handoff prunes it whenever the HPA has not yet written `/scale` (a cluster idle at its floor), collapsing it to 1; a constant seed under client-side apply has neither failure.
 
-The conditional keys off `autoscaling.enabled`, **not** off presence of the field: the aggregated apps API re-materializes `replicas: 2` from the values-schema default on every round-trip (`packages/apps/postgres/values.schema.json`), so a `hasKey`-style check would always see the field. The one sentence here exists to stop a later "simplification" from re-deriving the branch condition from the field.
+The seed branch keys off the `autoscaling` flags (`enabled`, and neither `transition` nor `dryRun` — the two staging modes fall to the static-count branch), **not** off presence of the field: the aggregated apps API re-materializes `replicas: 2` from the values-schema default on every round-trip (`packages/apps/postgres/values.schema.json`), so a `hasKey`-style check would always see the field. The one sentence here exists to stop a later "simplification" from re-deriving the branch condition from the field.
 
 ### 4. Metric backend: KEDA
 
