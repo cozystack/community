@@ -240,6 +240,21 @@ Two consequences for the controller. First, it writes at runtime, after chart-re
 - The CA rotates → the controller re-copies `ca.crt` on the next source change; no chart re-render is required.
 - The application is deleted → Flux prunes the sentinel with the rest of the chart's objects, and Kubernetes garbage-collects the projected `<release>.tenant-ca` via its owner reference to the sentinel; the controller needs no delete path.
 
+The sentinel's `Ready` condition carries exactly these reasons, and they are the whole set an operator can meet:
+
+- `Projected` — every declared projection is published.
+- `NoRelease` — the sentinel reached the cluster without Flux's `helm.toolkit.fluxcd.io/name` label, so no release, and therefore no canonical name, can be derived from it.
+- `SourceInvalid` — the entry declares an empty `sourceSecretName`. The CRD pins a minimum length, so this is only reachable for an object admitted by an older CRD.
+- `SourceNotFound` — the named source Secret does not exist yet.
+- `SourceNotReady` — the source exists but does not carry the named key, or carries it empty; operators routinely create the Secret before populating it.
+- `SourceRejected` — the lifted value carries private key material, or fails the certificate gate.
+- `ProjectionCollision` — a Secret this controller did not create occupies the canonical name.
+- `ProjectionTerminating` — the previous projection is still being garbage-collected, so writing to it would land and then be thrown away.
+- `CanonicalNameOccupied` — the declared source is itself at the canonical name and carries private key material.
+- `MultipleCACertProjections` — one sentinel declares more than one `CACert` entry.
+- `ReleaseContested` — two sentinels in one namespace claim the same release.
+- `UnsupportedProjectionType` — the entry's type is not `CACert`. Unreachable while the CRD enum admits only that value, and kept as the explicit answer if the enum is widened before the code that handles a new type lands.
+
 ## Testing
 
 - The helper is already covered by `packages/tests/cozy-lib-tests/tests/tls_cacert_test.yaml`, including the fail-closed assertions.
