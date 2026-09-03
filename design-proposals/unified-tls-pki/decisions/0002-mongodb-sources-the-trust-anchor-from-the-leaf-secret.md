@@ -18,7 +18,11 @@ mongodb had two. The Percona PSMDB operator mints a cert-manager chain at runtim
 
 The mongodb chart's `TenantProjection` names the leaf Secret `{{ .Release.Name }}-ssl` with `sourceKey: ca.crt`, ungated — the PSMDB operator issues the chain unconditionally, so the source exists for every release.
 
-## Why not `<release>-ca-cert`
+## Why not the alternatives
+
+These three are the chart's own stated reasons, recorded in the comment above [`packages/apps/mongodb/templates/tenant-projection.yaml`](https://github.com/cozystack/cozystack/blob/main/packages/apps/mongodb/templates/tenant-projection.yaml) as it merged in [#2692](https://github.com/cozystack/cozystack/pull/2692); the second and third are claims about PSMDB's behaviour that the comment asserts and this record has not independently verified against upstream.
+
+**Why not `<release>-ca-cert`, the operator's CA Secret:**
 
 - **It is not a name the chart controls.** `<release>-ssl` is the name the chart itself sets in the PSMDB CR's `spec.secrets.ssl`, so chart and sentinel move together; `-ca-cert` is the operator's internal choice and can change under an operator bump with nothing in the chart to notice.
 - **It does not exist on every path that produces TLS.** When cert-manager is absent the operator falls back to its own self-signed material and writes the leaf, but no cert-manager CA Secret — so a sentinel over `-ca-cert` would sit at `Ready=False, Reason=SourceNotFound` for that entire configuration while TLS is working.
