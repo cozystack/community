@@ -238,6 +238,8 @@ The watermark is computed across **both** tiers. Scoping it to `pre-apply` alone
 
 A `failed` entry is terminal for the watermark's purposes and does not pin it. Since nothing is retried automatically (§7), pinning the watermark on a failure would stall retention on that cluster indefinitely for a migration nobody is coming back to. The failure stays visible instead, in its own entry, which is never compacted at any age.
 
+**Who owns it.** There is one ledger, and it belongs to whatever assembles the platform rather than to any package being assembled. Today that is the platform chart, where `templates/cozystack-version.yaml` creates the ConfigMap; if assembly later moves to `packages/core/installer` or whatever succeeds it, the ledger moves with it and nothing else in this proposal changes. Per-package ledgers are not adopted, and §9 is the reason: migrations stay platform-level, so there is no second owner to hand one to.
+
 **The ledger does not grow without bound.** Compaction runs only at the retention floor (§11), removing the individual keys the watermark already covers. Records that did not reach `ok` — a `warn` failure, a `revoked` decision — are never compacted, whatever their age, because those are the entries someone will go looking for.
 
 Two properties make a ConfigMap the right container:
@@ -503,7 +505,7 @@ Each phase is independently shippable.
 
 ## Open questions
 
-- §9 keeps every migration platform-level, which is right while everything ships from one repository. If packages genuinely split out, what unit owns a ledger is open — plausibly the bundle rather than the package, since a bundle has cross-package migrations by construction and a single package does not.
+- Whether packages ever split into separate repositories is undecided upstream of this proposal, and nothing here depends on the answer: one ledger owned by the assembler (§4) works either way. If they do split, the unit that owns a ledger is worth revisiting — plausibly the bundle rather than the package, since a bundle has cross-package migrations by construction and a single package does not.
 
 ## Alternatives considered
 
