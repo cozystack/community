@@ -118,6 +118,8 @@ flowchart TD
 
 `health-controller` is a sensor: it reads component-native sources and writes current facts with freshness deadlines. The lifecycle controller is an actor: it consumes release metadata, lifecycle intent, health facts, migration state, and resource status and may mutate the platform. They use separate Deployments, ServiceAccounts, and RBAC so a bug in an upgrade adapter cannot corrupt health reporting and a health collector never inherits platform-wide write access.
 
+The optional policy controller is a third Deployment with its own ServiceAccount and restricted RBAC. It selects candidates and submits policy-bound intent but cannot use the executor's credentials or supervised recovery permissions. It is not co-located with the privileged lifecycle reconciler.
+
 The CLI is not the control plane. It creates or reads lifecycle resources and watches their status. Closing the CLI, losing the SSH session, or running another client does not stop or fork an accepted operation.
 
 ### 2. Release contract
@@ -137,6 +139,17 @@ spec:
     fromVersions: [">=1.7.0 <1.8.0"]
     kubernetes: [">=1.31 <1.34"]
     talos: [">=1.10 <1.12"]
+  lifecycleController:
+    version: v0.2.0
+    image: ghcr.io/cozystack/lifecycle-controller@sha256:...
+    reads:
+      planProtocols: [v1alpha1]
+      operationAPIs: [lifecycle.cozystack.io/v1alpha1]
+      journalEncodings: [v1]
+      crdStorageVersions: [v1alpha1]
+    writes:
+      journalEncoding: v1
+      crdStorageVersion: v1alpha1
   breakingChanges:
     - id: remove-legacy-network-mode
       summary: Legacy network mode is no longer supported
@@ -148,10 +161,14 @@ spec:
       type: HealthGate
       policy: upgrade-default
       timeout: 5m
+      disruption: None
+      reversibility: NotApplicable
+      safePauseAfter: true
     - id: apply-platform
       type: ApplyRelease
       artifact: platform
       timeout: 45m
+      controllerUpdate: lifecycleController
       migrations:
         executionOwner: HelmPreUpgradeHook
         tier: pre-apply
@@ -162,21 +179,33 @@ spec:
     - id: wait-platform
       type: ReadinessGate
       timeout: 45m
+      disruption: None
+      reversibility: NotApplicable
+      safePauseAfter: true
     - id: postflight
       type: HealthGate
       policy: upgrade-postflight
       timeout: 10m
+      disruption: None
+      reversibility: NotApplicable
+      safePauseAfter: true
 ```
 
 Breaking changes are authored and reviewed with the release. Each has a stable ID, human summary, required action, applicability check, and acknowledgement policy. For a multi-release hop the manifest includes the union of changes applicable to every supported source path, not just the target release notes. Acknowledgement records acceptance of a disclosed consequence; it never satisfies a machine-checkable prerequisite such as removal of incompatible resources. Unknown applicability remains visible and blocks unattended execution.
 
-Step types and prerequisite checks form a versioned allowlist implemented by the lifecycle controller. The manifest contains data, never executable shell, templates, or arbitrary commands. Every step declares its timeout, allowed retry behavior, dependencies, potential disruption, reversibility, and safe pause boundaries; omitted optional fields take documented conservative defaults. Unknown step types, missing safety metadata, or unsupported protocol versions make the release unsupported rather than skipped. Irreversible does not mean non-idempotent: an irreversible executor still needs a safe replay contract or explicit manual recovery.
+Step types and prerequisite checks form a versioned allowlist implemented by the lifecycle controller. The manifest contains data, never executable shell, templates, or arbitrary commands. Every step must declare `timeout`, `disruption`, and `reversibility`; omission makes the plan `Invalid`. Read-only gates use `None` and `NotApplicable` explicitly. Optional `retry` defaults to no retry, `safePauseAfter` to `false`, and dependencies to the preceding step in the ordered sequence. Unknown step types or unsupported protocol versions make the release unsupported rather than skipped. Irreversible does not mean non-idempotent: an irreversible executor still needs a safe replay contract or explicit manual recovery.
+
+A safe pause boundary means the platform may remain there without the next step being dispatched, not merely that a Job has exited. Consecutive steps without such a boundary form one non-pausable segment. Every executable plan must end at a declared safe boundary. Before starting a segment, unattended execution reserves the bounded execution and stabilization budget of the entire segment within the maintenance window; suspension and policy changes take effect at its next safe boundary.
+
+An apply step replacing the lifecycle controller must set `controllerUpdate: lifecycleController`, referencing the signed manifest descriptor above. The planner binds the currently installed controller's verified descriptor and the target descriptor into a visible replacement substep. Both readers must support the accepted plan protocol, operation API, journal encoding, and CRD storage version, including any encoding the target may write while the old controller is still a recovery option. The first path does not migrate these formats during controller replacement. Missing descriptors, incompatible read/write sets, or artifact contents inconsistent with the declaration make the plan `Invalid`; version strings alone are not evidence of compatibility.
 
 The controller seals a canonical plan containing cluster identity (the lifecycle namespace UID), source and target digests, controller protocol, relevant configuration and inventory fingerprints, resolved artifacts, ordered steps and migration manifests, resolved gate policies, impact bounds, and required breaking-change IDs. The plan digest hashes those inputs with a versioned canonical encoding. Mutable policy names and tags are resolved before sealing. Volatile health observations are excluded: health is reported in the planning snapshot and evaluated again at execution time. No raw Secret content enters the plan; credentials are referenced, and relevant Secret UID/resourceVersion changes invalidate an unstarted plan.
 
 ### 2a. Resource coverage and impact
 
 The planner lists installed Packages, their selected variants and dependency closure, relevant application kinds and instances, configuration sources, migration state, and the nodes and components required by compatibility checks. Each executor declares which resource kinds and fields it consumes and may change. Paginated reads must complete; `Forbidden`, a missing required API, an unknown external package contract, or an inconsistent inventory produces `CoverageIncomplete` and prevents executable planning. Optional absent components must be proven absent, not inferred from an empty failed query.
+
+Coverage is defined by the platform-managed dependency closure and the resource selectors consumed or affected by release checks, not every object stored in Kubernetes. An unknown external package blocks only when it participates in that closure or its effects cannot be bounded for the transition. Unrelated tenant resources are reported as outside the impact report, not automatically rejected. Tenant ownership does not exempt resources from a migration or compatibility selector: for example, instances of a changed platform CRD must still be checked across tenant namespaces.
 
 The report separates exact proposed resource changes from controller-managed effects such as a HelmRelease rollout and from effects whose membership is only known at execution. A plan for dynamic resources binds a predicate and action to an approved scope, not an invented frozen list of future Pods. Unknown effects that could change compatibility, destructive scope, or a required manual action block execution; the first supported path may conservatively reject such packages. Render/dry-run output is supplementary and cannot prove the result of Helm lookups, admission, migrations, or another controller. `plan` must expose these limits rather than claim a byte-exact diff of every eventual object.
 
@@ -222,6 +251,10 @@ Plan phases are `Pending`, `Ready`, `Blocked`, `Invalid`, and `Expired`. A block
 
 Before an operation starts, the current release and relevant input fingerprints are revalidated under exclusive operation ownership. A mismatch expires the plan. At acceptance the controller durably copies the sealed plan and source baseline into the operation before the first side effect. Later reconciles and resume use that accepted snapshot and step-specific expectations rather than compare the partially upgraded cluster to the original source version. The namespace UID is a local cluster binding, not a globally unique identity across etcd restores; restoring a cloned cluster requires an explicit lifecycle recovery procedure before execution.
 
+The same recovery requirement applies to an in-place etcd restore: the journal and migration ledger can roll back while external data effects survive. The required interlock is operational, outside the restored etcd: the administrator restores into an isolated recovery environment where lifecycle and delegated writers cannot reach mutation targets, and keeps them fenced until reconciling external effects with restored records. A restored Deployment replica count, policy, or API flag is not this interlock because the snapshot may erase the flag or the entire operation. Each supported deployment path must document and test how the restore environment enforces and releases that isolation before controllers resume. This proposal does not claim automatic detection of arbitrary out-of-band restores.
+
+When an operation still exists, observed platform state ahead of or incompatible with its journal produces `Paused/ExecutionUnknown`. If the snapshot predates the operation, recovery must inventory and adopt or restore the actual state before enabling normal lifecycle execution; there is no missing operation to resume. Absence of detectable drift is not proof that a restore did not occur.
+
 Referenced plans cannot be deleted or garbage-collected; admission and a controller-managed finalizer enforce this without owner references that could cascade-delete platform resources. Completed operations retain their accepted plan independently. Audit retention and explicit deletion after retention apply to both records.
 
 ### 4. PlatformUpgrade API
@@ -255,23 +288,27 @@ status:
       finishedAt: "2026-09-04T09:10:08Z"
     - id: apply-platform
       phase: Running
-      executionRef: {} # HelmRelease UID and expected revision, including its hook.
+      executionRef: {} # Stable delegate UID, baseline, and desired artifact/input digest.
   conditions: []
 ```
 
-Upgrade phases are `Pending`, `Preflighting`, `Running`, `Paused`, `Succeeded`, and `Failed`. Creating the operation as an authorized identity is approval of its immutable plan UID, digest, acknowledgements, and optional policy UID; the self-declared string `approval: Approved` is not a security check. Mutable controls are `suspend`, monotonic `retryNonce`, and `policyGeneration` for explicit supervised reauthorization, each with admission validation and audited request identity. None can change the sealed plan. Step records carry stable reasons, timestamps, attempt IDs, persisted deadlines, execution references, and retry safety. Human messages supplement structured fields and are never the only carrier of a decision.
+Upgrade phases are `Pending`, `Preflighting`, `Running`, `Paused`, `Succeeded`, and `Failed`. Creating the operation as an authorized identity is approval of its immutable plan UID, digest, acknowledgements, and optional policy UID; the self-declared string `approval: Approved` is not a security check. Mutable controls are `suspend`, monotonic `retryNonce`, `policyGeneration` for explicit supervised reauthorization, and a one-way `stopRequest` for recovery, each with admission validation and audited request identity. None can change the sealed plan. Step records carry stable reasons, timestamps, attempt IDs, persisted deadlines, execution references, and retry safety. Human messages supplement structured fields and are never the only carrier of a decision.
 
 Before accepting an unstarted request the controller requires a current `Ready` plan, matching UID and digest, unchanged source baseline, exclusive operation ownership, all acknowledgements, and current authorization-policy constraints. It re-evaluates enforcing health and compatibility gates before the first mutation and the gates required by each subsequent step. Once accepted, recovery observes the current in-flight step before considering another mutation; it does not rerun a preflight that assumes the pre-upgrade topology and thereby block convergence of its own rollout.
 
-`spec.suspend: true` pauses before the next step boundary. It does not interrupt a migration or apply operation mid-write. Admission rejects deletion while a `PlatformUpgrade` is active, and a finalizer is a backstop against disappearance before a terminal state is recorded. An operator suspends first and resolves or resumes the operation; deletion is never presented as cancellation or rollback.
+`spec.suspend: true` pauses at the next declared safe boundary. It does not interrupt a migration or apply operation mid-write. Admission rejects deletion while a `PlatformUpgrade` owns execution, including `Succeeded` with background writers still active; its finalizer remains until ownership is safely released. An unaccepted request with no ownership claim or dispatched effects may be deleted. Deletion is serialized against claim acquisition using a controller-managed finalizer installed before attempting the claim; if a terminating request wins a concurrent claim it must release it without dispatch. An operator suspends first and resolves, resumes, or requests the supervised stop described below; deletion is never presented as cancellation or rollback.
 
 Only one installation or upgrade may own cluster mutation. The lifecycle controller claims a fixed, controller-owned operation record using an atomic create or resourceVersion-conditional update, storing the operation UID before dispatch. The record survives controller restarts, suspension, and Lease expiry; it is not reassigned on a timer. Concurrent requests may both pass admission, but only one can win this claim. Losers receive `OperationConflict` without any platform mutation.
 
-A separate Lease elects the controller leader; it does not fence an old process or stop a delegated Job ([client-go leader-election contract](https://pkg.go.dev/k8s.io/client-go/tools/leaderelection)). On leadership loss the reconciler cancels dispatch. Its successor resumes the same operation, observes deterministic execution identities, and uses conditional writes. Adapters must tolerate duplicate observation or dispatch of the same attempt and reject stale revision writes; executors unable to establish safe completion remain `Paused/ExecutionUnknown`. Ownership cannot be released until delegated Jobs and reconcilers are proven quiescent and all required outcomes are recorded. Unknown completion never permits a second upgrade.
+A separate Lease elects the controller leader; it does not fence an old process or stop a delegated Job ([client-go leader-election contract](https://pkg.go.dev/k8s.io/client-go/tools/leaderelection)). On leadership loss the reconciler cancels dispatch. Its successor resumes the same operation, observes deterministic execution identities, and uses conditional writes. Adapters must tolerate duplicate observation or dispatch of the same attempt and reject stale revision writes; executors unable to establish safe completion remain `Paused/ExecutionUnknown`. Normal ownership release requires proven quiescence and recorded outcomes. Supervised stop is the only exception for missing outcome evidence: after verified fencing, it may record that outcome explicitly as unknown and terminate as failure. Unknown writer activity never permits release; an unknown data outcome never permits a successor unless its own state prerequisites can be verified independently.
 
 ### 5. Execution and recovery
 
 Before dispatch, the lifecycle controller persists the attempt ID, original deadline, exact desired inputs, and deterministic execution reference. Every executor uses an idempotency key derived from the operation UID, plan digest, step ID, and attempt. A crash after a write but before success status must be resolved by observing that same execution, never by assuming it did not run. Step completion is persisted before starting the next step. This is at-least-once reconciliation, not an exactly-once execution claim.
+
+For a delegated executor, the pre-dispatch reference identifies the stable delegate object, its UID, baseline state, and desired artifact/input digest; it does not predict a Helm-assigned revision or a not-yet-created hook Job UID. The adapter correlates and records the resulting revision and Job UIDs before accepting their outcomes. It must durably copy result evidence into the attempt record before permitting retries or evidence cleanup. Missing execution objects without a recorded outcome mean `ExecutionUnknown`, not “never ran.” Successful ledger entries must be skipped on hook re-entry, and warning failures preserved without implicit retry. Hook deletion and TTL behavior must be tested against this evidence contract rather than assumed to retain Jobs indefinitely.
+
+The lifecycle attempt key must be mapped to the delegate's submission and recovery protocol; annotating an object with the key is not fencing. Before advancing attempts, the adapter must prevent a delayed old leader from submitting an earlier attempt. This requires conditional writes to a stable execution slot with a monotonic attempt fence checked at the mutation boundary, or an equivalent proven delegate protocol. A Lease or distinct Job names alone is insufficient. An adapter lacking that protocol remains unsupported; it cannot satisfy the contract by generating a fresh Job name for every retry.
 
 The first `ApplyRelease` adapter retains the execution ownership in [community#58](https://github.com/cozystack/community/pull/58): blocking migrations run in the platform Helm pre-upgrade hook, inside the apply step. The planner exposes the pinned pending migration sequence as substeps, but the lifecycle controller must not launch a second pre-apply runner. It observes hook Job state and the migration ledger. `on-error=abort` leaves no failure ledger entry, so the Job failure is required evidence; `on-error=warn` records `failed` and is not automatically rerun. A legacy retry loop must expose bounded attempts and quiescence before this adapter is enabled. Transferring hook ownership to another executor requires an explicit handoff that disables the old executor first.
 
@@ -288,15 +325,21 @@ Failure policy is declared by step type and release metadata:
 - An advisory gate records a warning and proceeds; the release manifest, not the client, decides which gates may be advisory by default.
 - Retryable failures enter `Paused`; an authorized increase of `retryNonce` creates one new attempt only after the old executor is quiescent and retry gates pass. Normal reconciliation and watch reconnection never reset a deadline or create a retry. `Failed` is terminal and cannot be resumed; it is used only after safe executor shutdown and recording partial effects. Recovery from terminal failure needs a new plan based on the observed mixed state, and is blocked if that transition is unsupported.
 - A failed irreversible step pauses for manual intervention and is never automatically rolled back.
-- An override may waive only a gate explicitly marked overrideable by the release. It requires a new plan with a structured waiver, reason, gate IDs, and separately authorized apply request. Mandatory compatibility, integrity, ownership, and input-coverage checks cannot be waived. The server records the authenticated actor and timestamp; a user-supplied actor string is never trusted. Unattended policy cannot create waivers.
+- An override may waive only a gate explicitly marked overrideable by the release. It requires a new plan with a structured waiver, reason, gate IDs, and separately authorized apply request. In the first implementation waivers are approved before acceptance, not added mid-operation. A blocked accepted operation must satisfy its existing gates or use supervised recovery; it cannot promise a waiver-based continuation. Mandatory compatibility, integrity, ownership, and input-coverage checks cannot be waived. The server records the authenticated actor and timestamp; a user-supplied actor string is never trusted. Unattended policy cannot create waivers.
 
 `resume` is not a separate execution path. It clears an operator suspension or increments `retryNonce` for a retryable paused step through the same reconciler. The server enforces which transition is legal; clearing `suspend` alone does not retry a failed attempt. A deadline expiring during a delegated write requests safe stop and records `Paused/ExecutionUnknown` until the executor's outcome is known, rather than marking the operation terminal and releasing ownership while it still runs.
+
+Supervised recovery also needs an exit when the current plan can no longer proceed, including a missing policy or an unsatisfied gate. A separately authorized recovery role may set a one-way `spec.stopRequest` containing a reason and evidence references; admission records the authenticated actor and disallows clearing or replacing the request. The controller prevents new segment dispatch, reaches a safe boundary or verifies adapter-specific shutdown/fencing, and snapshots known effects and any unresolved outcome. Only after verifying that no old executor can write again may it mark `Failed/StoppedForRecovery` and release ownership. A stop is not success, rollback, a waiver of quiescence, or permission to resume the old operation.
+
+If execution evidence has been lost, administrator attestation is retained as evidence but does not by itself prove quiescence. The supported adapter's recovery runbook must establish fencing and inventory actual effects; if that cannot be verified, ownership remains held with `ExecutionUnknown` and the runbook requires out-of-band intervention. Unknown data outcomes may remain explicitly unknown in the terminal record after writers have been fenced. A new operation then needs a new plan whose mixed-state prerequisites are verifiable; normal source-version planning cannot silently adopt it. Recovery from a claim acquired before acceptance also observes possible effects before releasing it; no recorded dispatch plus verified absence of delegated work permits a rejected unstarted request to release its claim.
 
 ### 6. Health gates
 
 The lifecycle controller reads `Health` objects from [community#64](https://github.com/cozystack/community/pull/64) and treats any object past `freshUntil` as `Unknown`, regardless of its stored `overall` value. A gate resolves its required scopes, components, nodes, and backup targets from approved inventory, then verifies coverage of that expected set. Missing objects, missing freshness fields, forbidden reads, and empty selectors with expected members are `Unknown`, never a vacuous pass. Optional absent components require positive inventory evidence of absence. Individual required facts are checked; an aggregate `overall` alone may hide an unknown target behind another component's degraded state.
 
 The plan reports the health snapshot used during planning, but approval never freezes health. Each gate declares maximum observation age and a deadline. Post-step gates require observations newer than the step's completion and a readiness result for the desired resource UID, generation, and artifact revision. A still-fresh green observation from before rollout cannot prove postflight success. Where Health lacks revision correlation, the executor first verifies the native resource's observed revision, then requires a newer Health observation. Admission rejects incompatible changes to protected inputs where feasible; this is still a bounded observation, not an atomic guarantee that physical health cannot change immediately after a check.
+
+Gate budgets must allow the selected provider to become ready and collect a post-step observation, including its declared refresh interval and collection timeout. An impossible budget is `Invalid`; a provider with no bounded observation contract cannot support an unattended segment. While awaiting a qualifying observation, the gate reports `ObservationPending` with health state `Unknown` and never passes. Provider unavailability, stale evidence, and observed degradation retain distinct reasons; native readiness of a replaced Health producer is checked before expecting its new observations.
 
 Checks not yet represented by `Health`, including existing pre-upgrade probes from [cozystack#3458](https://github.com/cozystack/cozystack/pull/3458), implement the same bounded gate result contract: stable ID, state, severity, observed resources, reason, message, freshness, and retryability. A release path explicitly selects the verified provider for each check; `Health` API absence on an older supported cluster is handled by a declared direct-check provider, never silently skipped. As health adapters mature, duplicate one-shot collectors are removed rather than queried twice.
 
@@ -332,13 +375,15 @@ spec:
 
 The policy controller resolves a candidate, creates an `UpgradePlan`, and creates a `PlatformUpgrade` only if the plan is ready and every policy constraint passes inside the maintenance window. Policy-created operations carry an immutable policy name and UID, the explicitly authorized `policyGeneration`, and the resolved candidate digest. The first version only accepts `acknowledgementRequired: Block`; it cannot be flipped to auto-approve. It never auto-acknowledges a breaking change, manual action, unknown step type, or forbidden irreversible step.
 
-A policy cannot weaken release-declared mandatory gates. It may make advisory checks enforcing, narrow the channel or version range, and disable automation. The execution controller independently revalidates the bound policy before acceptance and before every new disruptive step. A deleted, disabled, replaced, or generation-changed policy prevents further dispatch at the next safe boundary; the operation pauses with `PolicyChanged` and requires current authorization before continuing. This also applies if a queued operation outlives the window in which it was created.
+A policy cannot weaken release-declared mandatory gates. It may make advisory checks enforcing, narrow the channel or version range, and disable automation. The execution controller independently revalidates the bound policy before acceptance and before every new non-pausable segment. A deleted, disabled, replaced, or generation-changed policy prevents further dispatch at the next safe boundary; already accepted work may continue only as needed to reach that boundary, then pauses with `PolicyChanged` and requires current authorization before continuing. This also applies if a queued operation outlives the window in which it was created.
 
 An administrator with supervised approval rights may update `policyGeneration` to the exact current generation of the same policy UID after inspecting the remaining plan. Admission records that authorization, and the executor must satisfy both the sealed plan's gates and the newly approved policy. The unattended identity cannot make this update. A missing or replaced policy cannot be rebound in place; partial execution then requires the documented recovery path. Changing a policy never rewrites executed-step history or relaxes gates frozen into the accepted plan.
 
-The window is an execution constraint, not only a schedule for creating CRs. A step can start only if its declared bounded execution and stabilization budget fits before window end. If it overruns, the executor reaches the next declared safe boundary, reports the overrun, and dispatches no new disruption outside the window. Already-running writes are not killed to satisfy the clock; the documented policy favors reaching a safe state. Automatic window/health pauses may clear when their conditions recover, but failed attempts require an explicit retry; unattended mode does not repeatedly rerun a failing migration every window.
+The window is an execution constraint, not only a schedule for creating CRs. A non-pausable segment can start only if its full declared execution and stabilization budget fits before window end. If it overruns, the executor reaches the next declared safe boundary, reports the overrun, and dispatches no new segment outside the window. Already-running writes are not killed to satisfy the clock; the documented policy favors reaching a safe state. Automatic window/health pauses may clear when their conditions recover, but failed attempts require an explicit supervised retry; unattended mode does not repeatedly rerun a failing migration every window.
 
 Candidate selection is deterministic within a configured trusted channel and allowed version range. Policy UID plus source and target digests identify a candidate attempt, so reconciliation cannot create duplicates. Repeatedly blocked or failed candidates remain in policy status until a relevant input changes or an administrator explicitly retries.
+
+An input change may trigger a fresh preview but cannot authorize retry of a failed execution for the same candidate under a new operation name. That failure requires supervised retry or recovery. The unattended identity cannot increase `retryNonce`, change `suspend`, submit a stop request, or reauthorize `policyGeneration`; it can create only initial intent with default controls. Controller-owned automatic waiting conditions are separate from operator suspension and failed attempts.
 
 ### 8. Installation
 
@@ -352,9 +397,13 @@ After bootstrap, `install plan` creates an `InstallationPlan`. It uses the same 
 
 `install apply` creates a `PlatformInstallation` referencing the immutable plan and release digests and watches it. The controller performs prerequisite checks, installs the remaining core resources, records each step, and runs the same readiness and postflight health gates used for upgrades. Closing the CLI does not interrupt installation.
 
+`InstallationPlan` uses the plan phases above and seals `mode: Install` with verified fresh-state inventory instead of a source release. `PlatformInstallation` binds `planRef.name`, `planRef.uid`, and `planDigest`, and uses the same operation phases, controls, attempt journal, and supervised recovery checks as `PlatformUpgrade`. These are the minimum installation contracts; the complete installation schemas and tested bootstrap profiles are prerequisites for rollout phase 5, not part of the upgrade-first API rollout.
+
 Installation uses an explicit install step sequence, not the upgrade example with every pre-apply migration run against an empty cluster. It seeds migration state through the migration engine's fresh-install path, uses prerequisite probes for not-yet-installed components, and requires Health observations only after installing the producers. Installation and upgrade share operation ownership, approval validation, status protection, and recovery semantics.
 
 The bootstrap bundle contains no release-specific platform payload beyond the controller version needed to understand the requested release contract. Re-running the same pinned bootstrap is idempotent and cannot silently replace an existing controller or take ownership of an existing platform. A lifecycle-controller update is a declared step only when the current planner understands the complete plan and both controller versions can read the accepted operation, CRD storage version, and execution journal. The replacement resumes the same attempt. A target needing an unknown protocol requires a supported bridge release first; it cannot solve that by asking an incompatible controller to approve its own replacement. Recovery documents how to restore the pinned compatible controller when the replacement cannot start.
+
+These compatibility checks apply during planning even if controller replacement is embedded in an `ApplyRelease` artifact: it must appear as a declared substep with the old/new controller versions and journal compatibility recorded. An implicit replacement hidden in an apply artifact makes that path unsupported. A separate update step type is an implementation choice, not a way to exempt embedded replacements from validation.
 
 The first rollout may ship upgrade support before `PlatformInstallation`; this ordering does not change the API boundary or move platform convergence back into the client.
 
@@ -373,14 +422,34 @@ cozystackctl
 │   ├── plan
 │   ├── apply
 │   ├── status
-│   └── resume
+│   ├── resume
+│   └── stop
 ├── version
 └── completion
 ```
 
 `upgrade plan` creates or reuses an identical `UpgradePlan` and waits for `Ready`, `Blocked`, `Invalid`, or `Expired` within a timeout. `upgrade apply` creates `PlatformUpgrade` with the exact displayed UID and digest, acknowledged change IDs, and an explicit operation name. Repeating apply with the same name and identical immutable intent returns the existing operation; a different intent is `Conflict`, and a different name never bypasses operation ownership. `upgrade status` reads the API object; `resume` changes allowed intent fields and never runs steps locally.
 
+`Invalid` and `Expired` plans are terminal previews and are never reused by a new planning request. The CLI generates a new suffixed name and prints its UID and digest; it also creates a successor when a blocked sealed plan needs different inputs. An explicit request to reuse a terminal plan returns `NewPlanRequired`, without deleting retained audit records. `upgrade stop` submits the supervised stop request and watches its outcome; it is not a client-side unlock command.
+
 Human output summarizes decisions and current progress. `--output=json|yaml` emits API objects or a versioned projection to stdout, with progress and warnings on stderr. JSON watch output is newline-delimited. Stable API reasons and conditions, rather than CLI-parsed messages, define automation behavior.
+
+The initial reason contract below distinguishes re-observation from permission to retry an executor. “New plan” never releases an active operation's ownership; stop/recovery must complete first. Conditions may carry these reasons alongside the phase; they are not additional phases.
+
+| Reason | Object and phase | Permitted next action | Waivable |
+|---|---|---|---|
+| `CoverageIncomplete` | Plan `Blocked` | Complete coverage; new plan if sealed inputs change | No |
+| `UnsupportedRelease` | Plan `Invalid` | New plan for a supported contract/path | No |
+| `InputDrift` | Plan `Expired`; operation `Paused` | New plan before execution; reconcile drift or supervised stop after acceptance | No |
+| `OperationConflict` | Operation `Pending` | Wait for the current owner, then revalidate the plan | No |
+| `OwnershipConflict` | Operation `Paused` | Verified writer handoff/recovery | No |
+| `PolicyChanged` | Operation `Paused` | Supervised reauthorization of same policy UID, or stop/recovery | No |
+| `ExecutionUnknown` | Operation `Paused` | Observe existing execution or verified fencing/recovery; never blind retry | No |
+| `ObservationPending` | Operation `Preflighting`, `Running`, or `Paused` | Await qualifying evidence within the original deadline; explicit retry after failed attempt | No new waiver after acceptance; only one sealed into the accepted plan |
+| `StoppedForRecovery` | Operation `Failed` | New plan from verified state; never resume | No |
+| `BackgroundMigrationsPending` | Operation `Succeeded` condition | Observe background work; retain ownership while writes may overlap | No |
+| `NewPlanRequired` | Client/API rejection of terminal plan reuse | Create a successor plan with a new UID | No |
+| `BootstrapRequired` | Client result, lifecycle API absent | Explicit approved bootstrap, then planning | No |
 
 The CLI holds no background lock and stores no platform credentials outside kubeconfig. It uses Kubernetes RBAC and does not become a second implementation of planning or execution.
 
@@ -409,6 +478,7 @@ Rollback is not modeled as deleting an upgrade or replaying its steps backwards.
 - The health controller remains read-only and uses a different ServiceAccount from the lifecycle controller.
 - Lifecycle CRDs are restricted to the installation namespace, including controller watch scope and admission. A tenant's permission to create namespaced resources elsewhere cannot trigger platform work. Planner-only RBAC may create/read plans but cannot create operations, change policy, or write any lifecycle status or the operation-ownership record.
 - `PlatformUpgrade` admission validates immutable plan UID/digest, acknowledgements, and request identity on CREATE and every UPDATE. A dedicated unattended ServiceAccount may submit only operations bound to a policy it is allowed to use; it cannot omit the policy reference, use manual acknowledgements or waivers, mutate policies, or claim another creator through spec fields. The executor independently enforces policy constraints, including when invoked without the CLI. Policy administration and supervised approval are separate privileged roles.
+- Failed-attempt retries and suspension changes require supervised approval rights; stop requests require a separate recovery role. The unattended identity cannot exercise either role or bypass failed-candidate suppression with another operation name. Recovery requests cannot edit the attempt journal or directly clear operation ownership.
 - Admission derives approval actor and timestamp from the authenticated request and protects the stored record from caller updates; Kubernetes audit logging supplies the request trail. A GitOps apply records the GitOps ServiceAccount as actor, with commit provenance as supplementary data rather than asserted human identity. Webhook admission fails closed for lifecycle intent and controls, and is narrowly scoped so its outage does not deny ordinary platform reconciliation or the controller Deployment's recovery.
 - Release manifests and bootstrap bundles are resolved to immutable digests. The trust policy pins allowed registry/repository scopes and signing keys or issuer/subject identities independently of the artifact; a digest or an arbitrary valid signature alone is not authorization. Revocation is checked before new dispatch. Bundle and step artifacts must belong to the verified release closure; user-supplied URLs cannot cause privileged application of unrelated manifests. The initial trusted artifact and signer policy is a prerequisite for execution rollout.
 - Release manifests contain data and typed step declarations only; they cannot carry shell commands or arbitrary templates.
@@ -425,11 +495,11 @@ Rollback is not modeled as deleting an upgrade or replaying its steps backwards.
 - **Health data is stale or the health controller is down** → enforcing gates become `Unknown` and block; no stored green state is trusted past `freshUntil`.
 - **A component degrades between plan and apply** → the execution-time gate blocks before the first mutation.
 - **A component degrades between steps** → the next declared gate pauses the operation and records the observed conditions.
-- **A blocking migration fails** → the apply step exposes its hook Job failure even when no ledger entry was written; resume respects runner retry semantics and cannot launch another runner alongside the hook.
+- **A blocking migration fails** → the apply step exposes its recorded hook Job failure even when no ledger entry was written; lost evidence is `ExecutionUnknown`, not an invented failure result. Resume respects runner retry semantics and cannot launch another runner alongside the hook.
 - **An irreversible step fails after partial completion** → the operation pauses or fails with manual recovery instructions and never advertises automatic rollback.
 - **Two upgrades are submitted** → only one atomically claims operation ownership; the other receives `OperationConflict`, even if both passed admission or the leader Lease later expires.
-- **A timeout or leader change leaves a Job running** → preserve operation ownership and observe the same execution reference; no new upgrade or retry until completion is known.
-- **Deletion is requested for an active operation** → admission rejects it and the finalizer prevents disappearance until the operation reaches a terminal state; deletion never cancels or rolls back work.
+- **A timeout or leader change leaves a Job running** → preserve operation ownership and observe the same execution reference; normal retry requires a known outcome. Supervised stop may release ownership with an unknown data outcome only after verified fencing and recording terminal failure, as defined above.
+- **Deletion is requested for an operation owning execution** → admission rejects it and the finalizer prevents disappearance until ownership is safely released, including background work after synchronous success; deletion never cancels or rolls back work.
 - **An unattended candidate contains a breaking change requiring acknowledgement** → the policy reports the candidate as blocked and performs no mutation.
 - **The release manifest contains an unknown required step** → planning is `Invalid` and performs no mutation.
 - **Bootstrap is applied twice** → server-side apply is idempotent and the existing installation operation is reused or reported.
@@ -451,11 +521,15 @@ Rollback is not modeled as deleting an upgrade or replaying its steps backwards.
 - Installation tests include missing CNI/DNS prerequisites, no Health producer before install, and a lost version marker on a populated cluster. Supported bootstrap profiles and the explicit fresh-install ledger path must be exercised before enabling installation.
 - Security tests use a tenant namespace, a planner-only identity, and the unattended ServiceAccount to attempt direct status writes, plan mutation, policy removal from operation intent, forged approval identity, waivers, and policy edits. They also reject an artifact with a matching digest but untrusted signer/repository and verify that admission downtime cannot block unrelated platform recovery.
 - Redaction checks cover Secret-derived configuration, credential-bearing artifact URLs, error messages, events, logs, and every structured CLI result; only approved references and non-secret evidence may be retained.
+- Recovery tests remove delegated evidence, request stop from both supervised and unattended identities, and verify that an attestation alone never releases ownership. A fenced unknown outcome may terminate only as failure; the successor must verify mixed-state prerequisites. Restore exercises test isolation outside the restored etcd both when a journal regresses and when the snapshot predates the entire operation; writers cannot resume before the documented administrator recovery procedure completes.
+- Adapter fault tests delay an old leader's attempt submission until after a new attempt is persisted, and delete hook evidence before observation. Stale dispatch must be rejected and missing outcomes must remain unknown. Embedded controller updates must pass journal compatibility checks during planning.
+- Policy tests cover non-pausable segments that exceed a window, revocation inside a segment, provider refresh intervals longer than gate budgets, failed-candidate recreation under another name, and attempts to mutate retry/suspension controls with unattended credentials.
+- CLI/API tests create successors for terminal plans without deleting the originals and check reason/phase mappings. Coverage tests allow unrelated tenant objects while still checking tenant instances affected by platform migrations.
 
 ## Rollout
 
 1. **Release contract and read-only planning.** Publish immutable release metadata, define trusted artifacts/signers and complete impact coverage for the first supported source path, add `UpgradePlan`, and compare its output with existing manual upgrade expectations without allowing execution.
-2. **Supervised upgrades.** Add `PlatformUpgrade`, persistent operation ownership and leader election, health gates, a single migration executor, persisted attempts, and CLI plan/apply/status/resume commands. Enable only on clusters with a verified release-field ownership handoff and bounded legacy retry behavior; other clusters retain their existing upgrade path.
+2. **Supervised upgrades.** Add `PlatformUpgrade`, persistent operation ownership and leader election, health gates, a single migration executor, persisted attempts, and CLI plan/apply/status/resume/stop commands. Enable only on paths with a verified release-field ownership handoff, fenced delegate attempts, durable result evidence, bounded legacy retry behavior, and a tested terminal-failure recovery runbook. That runbook must cover lost evidence, partial apply, and isolated etcd restore, including authorized writer fencing and either verified mixed-state forward recovery or restoration to a known baseline. Otherwise execution stays disabled and the cluster retains its existing upgrade path; read-only planning may still ship.
 3. **Make the lifecycle path authoritative.** Route supported upgrades through the controller, retain compatibility tooling only as a client or emergency path, and document recovery boundaries.
 4. **Unattended policy.** Add `UpgradePolicy` after supervised upgrades demonstrate restart safety and idempotency across supported version paths.
 5. **Installation.** Ship the minimal bootstrap bundle and `PlatformInstallation`, then move post-bootstrap convergence into the same lifecycle engine.
