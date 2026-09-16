@@ -9,7 +9,7 @@
 
 Cozystack's backup subsystem (`backups.cozystack.io/v1alpha1`: `Plan`, `BackupJob`, `Backup`, `RestoreJob`, `BackupClass`) schedules and records backups but never removes them. Retention is delegated per strategy to the underlying operator, and only CNPG, MariaDB, and Velero expose any knob for it; ClickHouse, MongoDB, etcd, FoundationDB, and Job strategies get no age- or count-based cleanup at all, so their artifacts accumulate in object storage until a tenant deletes them by hand. There is no "keep the last N backups" control anywhere in the API.
 
-This proposal introduces a namespaced CRD, `BackupRetentionPolicy`, carrying three orthogonal knobs — `minCount` (a floor), `maxCount` (a ceiling), and `maxAge` (a TTL) — and makes the platform, not the application operator, the single authority that decides when a `Backup` is removed. A `Backup` joins a policy through one label; that label is stamped from a `retentionPolicyName` field shared by `Plan`, `BackupJob`, and `BackupClass`, the last acting as the namespace default. Enumeration and pruning of `Backup` objects live in a core controller, and physical reclamation of the object-store artifact is delegated to the strategy driver, exactly as the Velero path already turns a `Backup` deletion into a `DeleteBackupRequest`. This closes [cozystack/cozystack#3965](https://github.com/cozystack/cozystack/issues/3965).
+This proposal introduces a namespaced CRD, `BackupRetentionPolicy`, carrying three orthogonal knobs — `minCount` (a floor), `maxCount` (a ceiling), and `maxAge` (a TTL) — and makes the user's own `BackupRetentionPolicy` the single source of truth for retention: one visible, tenant-authored policy rather than each operator's hidden native TTL. Retention is opt-in — a `Backup` under no policy is never deleted, and `minCount` guarantees a floor. A `Backup` joins a policy through one label; that label is stamped from a `retentionPolicyName` field shared by `Plan`, `BackupJob`, and `BackupClass`, the last acting as the namespace default. Enumeration and pruning of `Backup` objects live in a core controller, and physical reclamation of the object-store artifact is delegated to the strategy driver, exactly as the Velero path already turns a `Backup` deletion into a `DeleteBackupRequest`. This closes [cozystack/cozystack#3965](https://github.com/cozystack/cozystack/issues/3965).
 
 ## Scope and related proposals
 
@@ -47,7 +47,7 @@ A tenant running an hourly `Plan` against Postgres has no way to say "keep the l
 - A declarative, strategy-agnostic retention control covering age (`maxAge`), a count ceiling (`maxCount`), and a count floor (`minCount`), usable independently or in combination.
 - Cleanup for strategies whose operators have no native retention (ClickHouse, MongoDB, etcd, FoundationDB), by having core enumerate and prune `Backup` objects and delegating physical deletion to the driver.
 - One policy attachable to both scheduled (`Plan`) and ad-hoc (`BackupJob`) backups, with a platform default carried on `BackupClass`.
-- The platform, not the application operator, owns the artifact lifecycle end to end.
+- The user's declared policy, not an operator's hidden native TTL, decides when an artifact is removed; retention is opt-in and nothing is deleted without a policy the tenant authored.
 - Migration of existing artifacts between policies without recreating them.
 
 ### Non-goals
@@ -96,7 +96,7 @@ Both `Backup` and `BackupRetentionPolicy` are namespaced, and matching is scoped
 
 ### Platform-owned cleanup contract
 
-The platform is the single authority that decides when a `Backup` is removed; it does not delegate expiry to an application operator's TTL or retention window. Deletion is driven through the `Backup` object, and the strategy driver reclaims both the record and the physical archive on the platform's behalf. Every driver that reclaims physically MUST honor:
+The user's `BackupRetentionPolicy` is the single source of truth for when a `Backup` is removed, enforced by one mechanism — the core sweep — rather than split between that policy and an application operator's hidden native TTL. Nothing is deleted that the tenant's policy did not ask for, and a `Backup` under no policy is never swept. Deletion is driven through the `Backup` object, and the strategy driver reclaims both the record and the physical archive. Every driver that reclaims physically MUST honor:
 
 1. **Single authority.** The operator's native retention (CNPG `Cluster.spec.backup.retentionPolicy`, MariaDB `maxRetention`) is unset, so the operator and the core sweep never race over the same archive.
 2. **Idempotency and finalizer-hold.** The `backups.cozystack.io/cleanup` finalizer holds the `Backup` until the driver confirms the archive is gone; a retried or duplicated deletion is a no-op.
@@ -177,7 +177,7 @@ kubectl label backup -n tenant-acme \
 
 ## Upgrade and rollback compatibility
 
-`retentionPolicyName` is optional on all three types, so existing clusters and manifests keep working; a `Backup` with no label is never swept, matching today's "never cleaned" behavior. Adopting platform-owned cleanup for a driver that had native retention (CNPG, MariaDB) requires unsetting that native retention as part of the same change, so the two authorities never overlap. Rollback is removing the policy objects and the field; already-deleted artifacts are not recoverable, so that direction is one-way, but no data is deleted merely by reverting the controller.
+`retentionPolicyName` is optional on all three types, so existing clusters and manifests keep working; a `Backup` with no label is never swept, matching today's "never cleaned" behavior. Adopting policy-driven cleanup for a driver that had native retention (CNPG, MariaDB) requires unsetting that native retention as part of the same change, so the two mechanisms never overlap. Rollback is removing the policy objects and the field; already-deleted artifacts are not recoverable, so that direction is one-way, but no data is deleted merely by reverting the controller.
 
 ## Security
 
