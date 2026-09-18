@@ -73,8 +73,11 @@ kinds live in `local.sdn.cozystack.io` (see *Positioning*).
   cozystack/cozystack#3164, cozystack/cozystack#3218.)
 - **Depended on by:** `design-proposals/endpoint-attachments` (community #45), which
   attaches one endpoint of an application to an external address. It consumes an
-  `IPAddressClaim` and the association annotation of §5; this proposal does not wait on
-  it and lands independently.
+  `IPAddressClaim` and the association annotation of §5, and its `EndpointAttachment`
+  kind lives in **this same `local.sdn.cozystack.io` family** — the exposure half beside
+  the allocation half, another CRD-served resident relying on the `local.` prefix's
+  quota guarantee (*Positioning*). This proposal does not wait on it and lands
+  independently.
 - **Deferred to a sibling:** the *datapath* for whole-IP 1:1 NAT (all ports in, and
   the workload egressing **as** that address) — today provided by
   [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables rules. That is a
