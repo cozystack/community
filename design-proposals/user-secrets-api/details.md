@@ -391,7 +391,7 @@ Classify bearer kubeconfigs, private keys, password hashes, key-derived annotati
 
 ## Testing
 
-This is a design acceptance plan. No live engine, migration, browser, or SIEM test is claimed as executed by this proposal. API-only tests may require a real API server, admission, RBAC, client, and collector; mocks do not replace those boundaries. Live tests use pinned engines/operators and actual authentication. Each phase runs the suites applicable to its agreed adapters and public surfaces: private-input writes and supplied-peer consumption start in phase 2, while generated-credential isolation, internal bootstrap dependencies, and delivery are phase 1 obligations. Existing private backup/OIDC reference paths do not depend on enabling the new input API.
+This is a design acceptance plan. No live engine, migration, browser, or SIEM test is claimed as executed by this proposal. API-only tests may require a real API server, admission, RBAC, client, and collector; mocks do not replace those boundaries. Live tests use pinned engines/operators and actual authentication. Each phase runs the suites applicable to its agreed adapters and public surfaces: private-input writes and supplied-peer consumption start in phase 2, while generated-credential isolation, internal bootstrap dependencies, delivery, and the tenant Kubernetes access classification are phase 1 obligations. Existing private backup/OIDC reference paths do not depend on enabling the new input API.
 
 | Suite | Layer and assertions |
 |---|---|
