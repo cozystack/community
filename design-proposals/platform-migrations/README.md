@@ -96,8 +96,8 @@ After the conversion, which is the shape to design against:
 packages/core/platform/images/migrations/migrations/
   lib/
   revoked
-  order.d/
-    00000-legacy                             # the converted integer set, in its original order
+  order.d/                                 # generated at build, not in git (§3)
+    00000-legacy                             # the converted integer set, from legacy-map
     00001-v1.6.0
     …
   pre-apply/
