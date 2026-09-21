@@ -160,7 +160,7 @@ There is no one fixed list. Each release's image holds a different set of migrat
 
 So the requirement lands on the fallback rule, not on the dependencies: **adding a migration must only ever extend the order at its end, and never insert into its middle.** Alphabetical order of names does not do that, since a new name can land anywhere in the alphabet. Ordering by date does not either — that is the July PR inserting ahead of August. A batch number does, because a newly added migration always receives the newest batch, which is by definition at the end.
 
-**The manifest.** Order lives in `order.d/`, one file per release, and it is **generated rather than committed**: a migration's batch is the earliest tag whose tree already contains its slug. Nothing in the source tree carries it, and no author and no release step writes a line of it. What ships in the image and in the packaged chart looks like this:
+**The manifest.** Order lives in `order.d/`, one file per release, and it is **generated rather than committed**: a migration's batch is the earliest tag whose tree already contains its slug. No commit carries it, and no author writes a line of it. What ships in the image and in the chart looks like this:
 
 ```
 order.d/00003-v1.7.0-rc.1
@@ -185,7 +185,7 @@ Bare slugs, one per line. Tier is not repeated — it is the directory the scrip
 2. A slug's batch is the first tag whose tree contains it. Slugs sharing a batch are sorted alphabetically, then reordered to satisfy any `requires` edges among them, keeping alphabetical order everywhere those edges say nothing.
 3. A slug present in an earlier tag's tree and absent from this one is emitted with `retired` (§11).
 4. Fail on a cycle, on a `requires` naming a slug that does not exist, and on a `requires` pointing at a *later* batch.
-5. Write `order.d/` into the migrations image and into the packaged chart. It is absent from the source tree and gitignored there, and CI rejects a PR that adds one.
+5. Write `order.d/` into the tree before the migrations image and the packages artifact are built, so both carry it. It is gitignored, absent from any commit, and CI rejects a PR that adds one.
 
 **Why generated and not committed.** A committed manifest needs a release-cut slot that lands on the branch the *next* cut is taken from, and no such slot exists. `tags.yaml` commits its release artifacts (`:205`), and the only push carrying them (`:297`-`:307`) targets `release-${GITHUB_REF#refs/tags/v}` — a per-version staging branch the step's own comment calls mutable and force-updates. Nothing in that file pushes to `main` or to `release-X.Y`; content reaches a line branch only through the stable promote PR. So `v1.7.0-rc.1` would seal a batch onto `release-1.7.0-rc.1`, a migration would then merge to `main`, and `v1.7.0-rc.2` cut from `main` would find no batch file, seal its own under the same number with a different set, and insert an entry into the middle of a batch already shipped in rc.1. A rule comparing batch files cannot catch it, because the earlier file is absent from the branch rather than different.
 
@@ -312,7 +312,7 @@ Legacy runs first. `background/` is not executed by the hook at all.
 
 **Pre-apply** stays the render-gated hook. The gate generalises from a scalar compare to a set difference: the chart already ships the whole migrations directory (there is no `.helmignore` in `packages/core/platform`), so `.Files.Glob "images/migrations/migrations/order.d/*"` yields the manifest at render, and the slug list falls out of it with no directory walk and no script reads. The Job is only created when the difference is non-empty. `templates/sources.yaml` already reads chart files this way, so the idiom is established here.
 
-Because the manifest is generated rather than committed, the packaged chart carries it and a chart rendered straight from a checkout does not. That case has to fail the render rather than quietly produce an empty pending set: when `pre-apply/` is non-empty and `order.d/` is not, the template calls `fail()`. It is the same fatal condition §6 gives the runner, for the same reason.
+Because the manifest is generated rather than committed, a chart built by the release carries it and one rendered straight from a checkout does not. That case has to fail the render rather than quietly produce an empty pending set: when `pre-apply/` is non-empty and `order.d/` is not, the template calls `fail()`. It is the same fatal condition §6 gives the runner, for the same reason.
 
 **A fresh install records, it does not run.** Today a new cluster runs zero migrations, and that is two behaviours acting together rather than one rule: `templates/cozystack-version.yaml` stamps `targetVersion` straight into the ConfigMap when `lookup` finds none, and `templates/migration-hook.yaml` computes `$shouldRunMigrationHook` only inside `{{- if $configMap }}`, so with no ConfigMap the hook does not render at all. (The bootstrap branch in `run-migrations.sh` is unreachable through Helm for the same reason.) A set difference has no equivalent of that: an absent ConfigMap is an empty ledger, so `pending` would be the entire `pre-apply/` set and the first slug migration to land would change what a fresh install does.
 
