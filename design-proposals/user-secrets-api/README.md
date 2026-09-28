@@ -3,7 +3,7 @@
 - **Title:** `Managed credential lifecycle: minted passwords, verifier-only storage, attributable history`
 - **Author(s):** `@myasnikovdaniil`
 - **Date:** `2026-09-28`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
@@ -158,24 +158,6 @@ An account grant names one account of one application, the operations it permits
 
 Minting returns the plaintext, so the authority to mint is the authority to read the password. A grant that previously allowed regeneration without disclosure has no equivalent here, which costs the tenant automation identity its ability to provision a working application unattended: it creates the accounts, and a human or an authorized external API consumer mints them afterwards. Whether that cost is acceptable, or whether a replace-without-disclosure operation should exist for automation, is an [open question](#open-questions). Internal service accounts are not tenant-facing at any tier.
 
-### Security
-
-The disclosure routes and what closes each, per class:
-
-| Route | Tenant accounts | Service accounts |
-|---|---|---|
-| Inline field in the application spec | Removed for PostgreSQL and MariaDB by [#4078](https://github.com/cozystack/cozystack/pull/4078); still present for ClickHouse and OpenSearch, and closed for them by their own conversion | Not applicable; never in the spec |
-| `tenantsecrets` projection | Verifier only, nothing to disclose | Not selected by any `ApplicationDefinition` |
-| Per-release raw grant to `use` tier and ancestor ServiceAccounts | Verifier only, nothing to disclose | Not granted, not in the dashboard resource map |
-| Helm release history | Chart stops rendering tenant plaintext. For ClickHouse the verifier does pass through release values, which is a verifier and not a password | **Open by design.** Plaintext stays in history for this class |
-| Operator-materialised configuration | ClickHouse writes the verifier into a ConfigMap in the tenant namespace; no tenant role grants `configmaps` | Not applicable |
-
-A verifier is not treated as protected material. It is not returned by discovery, not projected outward and not written into logs, because no consumer other than the engine needs it; its presence in a Secret or in release history is not a breach of the one-time contract. One caveat is carried explicitly: ClickHouse stores an unsalted single-round SHA-256, so a password a tenant chose can be recovered from it by dictionary attack. A password minted from the CSPRNG at the length this proposal requires cannot.
-
-The aggregated API server is a trusted component with fleet-wide Secret access. It already holds that access today. Per-namespace RoleBindings on one identity do not partition its compromise, and this design says so rather than claiming isolation.
-
-Audit evidence is append-only for tenant and API actors. This design does not promise tamper resistance against a compromised control-plane administrator.
-
 ### Coverage
 
 The table describes proposed phases, not existing capabilities. An absent adapter reports its capabilities as false and rejects the operation before touching an engine. A phase is complete only when all rows agreed for that phase pass.
@@ -197,6 +179,18 @@ The table describes proposed phases, not existing capabilities. An absent adapte
 | Virtual machine `cloudInit` | Not applicable | Out of scope, named | None | Free-form user data in the application spec, readable by anyone who can get the application. No schema check or reference field can catch a password inside it |
 | TLS private keys, CA keys, Talos and bootstrap secrets | Not applicable | Internal; issuance outside this API | No tenant mint or revoke | PKI and node-lifecycle maintainers keep their responsibilities |
 
+## User-facing changes
+
+A tenant creating an application no longer receives a working password with it. The accounts exist and cannot log in until someone mints them, which is one call per account from the dashboard, the CLI or an external API consumer. The mint response shows the password once and the platform cannot show it again.
+
+`<release>-credentials` stops carrying passwords for converted engines and carries verifiers instead, so a tenant reading that Secret directly finds nothing usable. For OpenSearch it holds a copy of the admin account today and will hold nothing after the split.
+
+`users.<name>.password` disappears from the values of converted applications. For PostgreSQL and MariaDB it is already gone; ClickHouse loses it with its conversion. A tenant who was setting a password there sets none and mints instead.
+
+Revocation appears as three separate actions rather than one: replace the password, deny the account a login, remove the account. Denying and re-allowing a login are Helm upgrades under the hood, so neither works while a release is suspended or failing.
+
+Operators get a per-account record they can read: who minted a credential, when, whether the engine applied it, and whether the account was ever exposed under the old repeatable-read behaviour.
+
 ## Upgrade and rollback compatibility
 
 A service is `Strict` when every credential-bearing field it has goes through this API, and `Legacy` while any of them still carries an inline value. Strict is the default for new installations per converted adapter; an existing installation gets a finite migration window per adapter, then an explicit mint before the service can report `Strict`. A deadline cannot precede the adapter it depends on. `strictOnly` is a platform-level setting that refuses to install a service reporting `Legacy` at all, rather than installing it with the label.
@@ -215,6 +209,40 @@ The ordering is what keeps a chart and the API from writing one object at the sa
 
 Rollback of a converted application to a pre-conversion chart revision does restore the old plaintext: the rendered Secret is in release history, `helm rollback` applies it, and MariaDB's operator will re-apply the password it finds. The old exposed password becomes live again. The previously-exposed marking survives, so the record still says the account is exposed, and the recovery is a mint.
 
+## Security
+
+The disclosure routes and what closes each, per class:
+
+| Route | Tenant accounts | Service accounts |
+|---|---|---|
+| Inline field in the application spec | Removed for PostgreSQL and MariaDB by [#4078](https://github.com/cozystack/cozystack/pull/4078); still present for ClickHouse and OpenSearch, and closed for them by their own conversion | Not applicable; never in the spec |
+| `tenantsecrets` projection | Verifier only, nothing to disclose | Not selected by any `ApplicationDefinition` |
+| Per-release raw grant to `use` tier and ancestor ServiceAccounts | Verifier only, nothing to disclose | Not granted, not in the dashboard resource map |
+| Helm release history | Chart stops rendering tenant plaintext. For ClickHouse the verifier does pass through release values, which is a verifier and not a password | **Open by design.** Plaintext stays in history for this class |
+| Operator-materialised configuration | ClickHouse writes the verifier into a ConfigMap in the tenant namespace; no tenant role grants `configmaps` | Not applicable |
+
+A verifier is not treated as protected material. It is not returned by discovery, not projected outward and not written into logs, because no consumer other than the engine needs it; its presence in a Secret or in release history is not a breach of the one-time contract. One caveat is carried explicitly: ClickHouse stores an unsalted single-round SHA-256, so a password a tenant chose can be recovered from it by dictionary attack. A password minted from the CSPRNG at the length this proposal requires cannot.
+
+The aggregated API server is a trusted component with fleet-wide Secret access. It already holds that access today. Per-namespace RoleBindings on one identity do not partition its compromise, and this design says so rather than claiming isolation.
+
+The mint response is the only channel that carries a password, so it is served with `Cache-Control: no-store`, never redirected, never retried by a proxy, and its body never reaches a request log or a trace.
+
+Audit evidence is append-only for tenant and API actors. This design does not promise tamper resistance against a compromised control-plane administrator.
+
+## Failure and edge cases
+
+- Crash between the record write and the material write → the record stays in `Applying`, the engine is unchanged, and the next mint recovers. No silent divergence.
+- A stalled caller resumes after another mint completed → its material write is refused because the record moved on. It writes nothing.
+- Mint against a suspended or failed release, for an engine that applies through Helm → accepted, recorded, reported pending. It applies when the release resumes.
+- Engine unreachable during a mint → `503`, the record stays in `Applying` rather than advancing, and the account is untouched.
+- Account minted but never applied by the operator → the record shows issuance without applied state; a caller that needs proof waits for it or mints again.
+- Verifier Secret deleted while the record survives → `MaterialMissing`, which is a prompt to mint, never evidence of a fresh install.
+- Mint against a denied account → the password changes and the deny stands. Only `allowLogin` lifts it.
+- Application deleted and recreated under the same name → a new incarnation with a new record; the closed record keeps the old account's exposure marking.
+- Restore from a backup → every account is marked exposed and re-minted before the destination is reachable, because a backup carries the passwords of its own age.
+- Rollback to a pre-conversion chart revision → the rendered Secret returns from release history with its old plaintext, and MariaDB's operator re-applies it. The exposure marking survives, and a mint is the recovery.
+- Two mints racing on one account → one wins on the expected-version precondition, the other is refused with a conflict naming the current version.
+
 ## Testing
 
 Adapter acceptance per engine: a minted password authenticates, the old one is rejected, grants are unchanged, and the applied state appears on the record. Revocation per state: login denied is denied, account removal is removed, and each survives the operator's next reconcile. Isolation: guessed names, forged labels, manipulated selectors, sibling and ancestor references, raw and projected reads. Migration: each stage on a populated cluster, the ownership transfer, and a rollback between stages. The detailed plan is in [details.md](./details.md#acceptance).
@@ -222,6 +250,20 @@ Adapter acceptance per engine: a minted password authenticates, the old one is r
 Attribution rests on the kube-apiserver audit log, so an installation whose distribution ships no audit policy cannot claim `Strict`. Talos ships one and Cozystack collects it; anything else is the installation's responsibility and is checked before strict mode is offered.
 
 No live engine, migration or browser test is claimed as executed by this proposal.
+
+## Rollout
+
+Ordered by what unblocks what, not by calendar. Each step is a release or a set of releases, and none of them starts before the one above it is in.
+
+1. **The API surface.** `Credential` with its mint, revoke and allowLogin calls, the per-account record, the account grant, and the audit checks that let an installation claim `Strict`. Nothing converts yet; every adapter reports its capabilities as false.
+2. **PostgreSQL.** The chart moves password and role attributes to `managed.roles`, gains the per-account `denyLogin` flag, and the init path is fixed to reassign owned objects outside the `postgres` database. Migration stages A, B and C for this engine.
+3. **MariaDB.** The native reference keeps applying, the Secret gains the watch label, and the lock behaviour and applied-state gap are settled by the acceptance suite before the capability is reported.
+4. **The service-account split.** MariaDB root, the ClickHouse backup account, the OpenSearch admin copy and Harbor's redis password move to the service Secret, and each one is rotated in the same change rather than merely hidden. This can run in parallel with step 3 and does not wait for an engine's conversion.
+5. **ClickHouse.** The chart takes the verifier through `valuesFrom`, and `users.<name>.password` leaves the values in its own change.
+6. **OpenSearch, repair first.** A tenant-declared user is made to reach the engine, which settles whether the writer is the operator or securityconfig. Only then does the class get a row that can convert.
+7. **The plaintext-by-necessity classes.** MongoDB, COSI, Harbor, Qdrant, Outline, Kafka and the static kubeconfig, each on its own schedule and each stating who holds the plaintext and why.
+
+Strict mode for an engine follows that engine's conversion and never precedes it. `strictOnly` becomes useful once enough of the first wave has landed that an installation can refuse the rest.
 
 ## Open questions
 
