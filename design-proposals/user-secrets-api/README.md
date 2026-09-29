@@ -1,298 +1,380 @@
-# Managed credential lifecycle
+# User secrets API: platform-generated credentials, minted and shown once
 
-- **Title:** `Managed credential lifecycle: minted passwords, verifier-only storage, attributable history`
+- **Title:** `User secrets API: platform-generated credentials minted on request, shown once, stored as verifiers`
 - **Author(s):** `@myasnikovdaniil`
 - **Date:** `2026-09-28`
 - **Status:** Review
 
 ## Overview
 
-A generated managed-service password is readable today as many times as anyone likes, through four independent routes, and hiding the reveal button changes none of them. This proposal replaces generation-at-render with a mint operation on the aggregated API: the platform generates the password from a CSPRNG, stores only what the engine needs to verify it, and returns the plaintext once, in the response body. Where an engine accepts a verifier the platform keeps no password at all. Where it cannot, the row says so and names the component that holds the plaintext.
+Cozystack generates the passwords of managed application accounts at Helm render time and keeps them in a `<release>-credentials` Secret that tenants can read again at any time. A deployment whose security policy requires that a generated credential is shown exactly once, at creation or regeneration, with regeneration as the only way back and every issuance audited, cannot be served by that model whatever the dashboard does.
 
-Phase 1 covers PostgreSQL, MariaDB and ClickHouse users, whose engines accept a verifier and for which a delivery path exists, plus the disclosure half of the OpenSearch admin account. OpenSearch tenant users are not in phase 1: a declared user does not reach the engine at all today, and repairing that comes before converting it. Classes that need plaintext by engine necessity are classified here and converted later. Tenant-supplied secrets are not in scope; they belong to [#82](https://github.com/cozystack/community/pull/82). The mechanism-level specification is in [details.md](./details.md); this document is the contract to review.
+This proposal moves generation into the Cozystack API. A `mint` call on a per-account `Credential` generates a password, stores only what the engine needs to check it, and returns the plaintext in the response body. Nothing is left to read a second time, and a lost response is answered by minting again, which replaces the password. For PostgreSQL, MariaDB and ClickHouse in the first wave, which store a password verifier, this follows from what is stored. The other engines get the same mint in later waves with the plaintext kept where only the platform can read it, and those that accept a verifier move to one afterwards, as separate work. The platform's own accounts, which share those Secrets today, stop being visible to tenants. Attribution comes from the kube-apiserver audit log that Cozystack already collects, and a small per-account record shows tenants where the live password came from, who changed it recently and whether the engine applied it.
+
+An application kind counts as converted once its chart works this way, and each kind converts on its own (§7). [`example.md`](./example.md) walks one PostgreSQL application through the whole cycle with the objects at each step.
 
 ## Scope and related proposals
 
-**Supersedes [cozystack/community#72](https://github.com/cozystack/community/pull/72).** Ownership of `<release>-credentials` and rotation mechanics cannot be decided in two proposals, so this one takes credential ownership, rotation execution, bootstrap and ownership migration. It builds on @scooby87's analysis and on the failure cases in [the original discussion](https://github.com/cozystack/community/issues/71).
-
-- [Tenant-supplied secrets](https://github.com/cozystack/community/pull/82) owns credentials the tenant brings, the store behind them and the reference syntax from [#37](https://github.com/cozystack/community/pull/37). The boundary between the two proposals is the source of the bytes. Whether a deployment permits a supplied value where the platform could generate one is policy, and this proposal decides it.
-- [PostgreSQL/MariaDB password cleanup](https://github.com/cozystack/cozystack/pull/4078) merged on 2026-09-25 and removed the inline password field for those two engines only. ClickHouse and OpenSearch still accept `users.<name>.password` in their values, so route one stays open for them and closing it needs its own change, named per adapter rather than assumed.
-- [API v1](https://github.com/cozystack/community/pull/73) must carry the removed-field changes in its schema transition, so an older client cannot silently drop a field and trigger generation.
-- [Unified TLS/PKI](../unified-tls-pki/README.md) keeps certificate issuance and trust management. This proposal classifies public trust and private key material and restricts disclosure.
-- [cozystack/cozystack#4164](https://github.com/cozystack/cozystack/issues/4164) is closed by the service-account split below for converted classes only. A class whose credentials Secret still holds plaintext keeps the ancestor grant the issue is about, so the issue closes adapter by adapter rather than on this proposal landing.
+- [Tenant-supplied secrets by reference](https://github.com/cozystack/community/pull/82) owns the secrets a tenant brings, and this proposal the ones the platform generates. No generated field gets a reference form here, and a later change that adds one keeps it off by default. There is no write path on `tenantsecrets` either: a field that needs a tenant-supplied value stays inline until the reference capability exists. The write-only `TenantSecret` of the [earlier revision](https://github.com/cozystack/community/pull/74) of this proposal is withdrawn in favour of #82.
+- It supersedes [managed database password rotation via a controller](https://github.com/cozystack/community/pull/72). Rotation here is the mint call and needs no controller.
+- It builds on [cozystack/cozystack#4078](https://github.com/cozystack/cozystack/pull/4078), merged on 2026-09-25, which removed `users[].password` from the postgres and mariadb charts and took the postgres password out of the init-script.
+- It closes [cozystack/cozystack#4164](https://github.com/cozystack/cozystack/issues/4164) for the credentials of converted kinds: the name grants that give every ancestor tenant's ServiceAccount a child's passwords go away.
+- It takes nothing from [Unified TLS and PKI](../unified-tls-pki/README.md). Under that proposal's rule no engine's key-bearing Secret is tenant-facing, and the trust anchor it delivers is public.
+- Kubernetes access credentials stay at their CA, and VM `cloudInit` is a named gap. Both are classified in §7 and not converted.
 
 ## Decisions
 
-<!-- Left empty in the initial PR, per ../README.md#decision-records. Records live under ./decisions/, numbered from 0001, and are linked here newest first once an implementation choice is settled or changes. -->
+<!-- Leave this empty in the initial PR; fill it in as implementation
+proceeds. Records live in this proposal's own directory, numbered from
+0001. Link each one here, newest first:
+
+- [0001. Short statement of what was decided](./decisions/0001-short-slug.md) — one clause on what it settled.
+
+Where implementation changed the design, the record is what explains why
+— this section is how a reader of the proposal finds that out.
+See ../README.md#decision-records. -->
 
 ## Context
 
-Baseline: [cozystack at 8799a4e4a](https://github.com/cozystack/cozystack/commit/8799a4e4a), before [#4078](https://github.com/cozystack/cozystack/pull/4078) merged. Proposals above that are still open are dependencies, not shipped behavior.
+Baseline: cozystack/cozystack at `29932ddbb` (2026-09-28). Paths are in that repository unless stated.
 
-- Applications are virtual views of HelmReleases; their spec becomes Helm values and is returned unredacted, so an inline password is readable by anyone who can read the application. An Application reports the backing HelmRelease's UID as its own, so no identifier distinguishes one incarnation of an account from another.
-- The `tenantsecrets` projection returns whole Secret `data`. A write through its registry stamps the outward-projection marker.
-- Every application chart grants `get/list/watch` on its credentials Secret by name to `use`-tier groups, the tenant ServiceAccount, and the ServiceAccounts of every ancestor tenant, through the `<release>-dashboard-resources` Role. Removing the projection alone leaves this route open, and the reverse.
-- Chart-rendered Secrets stay in Helm release history for `MaxHistory` revisions, so a chart-side regeneration cannot retire the old bytes. `lookup` plus random generation is render-time behavior, not an observed dependency.
-- The dashboard list transfers Secret data before the reveal button is pressed.
-- The same Secret holds tenant accounts and service accounts. MariaDB `root` sits next to every tenant user; the ClickHouse `backup` account is read from it by the backup CronJob and the backup sidecar; Harbor's `redis-password` is read from it by Flux through `valuesFrom` on every reconcile.
-- Cozystack collects the kube-apiserver audit log: fluent-bit tails `/var/log/audit/kube/*.log` into VictoriaLogs, and `monitoring-agents` is a default package. Talos ships a default policy of one catch-all `Metadata` rule. The aggregated API server runs with no audit flags of its own, so every record of a call to it comes from kube-apiserver. Other distributions ship no policy by default.
+The postgres, mariadb and clickhouse charts generate passwords at render time with `randAlphaNum 16`, keep them across reconciles with `lookup`, and store them in a chart-rendered `<release>-credentials` Secret (`packages/apps/postgres/templates/init-script.yaml:1-8,99-124`, `packages/apps/mariadb/templates/secret.yaml:88-122`, `packages/apps/clickhouse/templates/clickhouse.yaml:2,21-28`). Since cozystack/cozystack#4078 the postgres init-job reads the password from that Secret at run time (`init-script.yaml:187-195`) instead of carrying it in the init-script. Five routes lead to the password. Two keep a copy of it, two open the Secret that holds it, and one keeps its hashes:
+
+1. The application spec keeps a copy. cozystack/cozystack#4078 removed `users[].password` from postgres and mariadb, while ClickHouse and OpenSearch still take `users.<name>.password` (`packages/apps/clickhouse/values.yaml:97`, `packages/apps/opensearch/values.yaml:215`), which every subject that can get the application reads.
+2. `tenantsecrets` opens the Secret. The lineage webhook labels a Secret `internal.cozystack.io/tenantresource=true` when the owning application's ApplicationDefinition selects it (`internal/lineagecontrollerwebhook/webhook.go:182-191`), and `core.cozystack.io/tenantsecrets` serves the whole `data` of such a Secret (`pkg/registry/core/tenantsecret/rest.go:101-120`) to every tier from `use` up (`packages/system/cozystack-basics/templates/clusterroles.yaml:209-214`). All four database definitions select `<release>-credentials`. The webhook decides once, at first admission, and skips the object afterwards (`packages/system/lineage-controller-webhook/templates/mutatingwebhookconfiguration.yaml:43-46`), so editing a definition does not relabel existing Secrets.
+3. Name grants open the Secret. Each chart's `<release>-dashboard-resources` Role grants `get` on `<release>-credentials` (e.g. `packages/apps/postgres/templates/dashboard-resourcemap.yaml:16-22`) to the `use` groups and above and to the ServiceAccount of the tenant and every ancestor up to `tenant-root` (`packages/library/cozy-lib/templates/_rbac.tpl:84-96`). This is cozystack/cozystack#4164.
+4. Helm history keeps a copy. Every stored revision of the release carries the Secret's plaintext, up to `MaxHistory`, 5 by default (`pkg/registry/apps/application/rest.go:1685,1706`), and a `helm rollback` restores it.
+5. The ClickHouse operator keeps hashes in the `chi-<chi>-common-usersd` ConfigMap in the tenant namespace, on which no tier holds a verb.
+
+The platform is its own client through the same Secrets. MariaDB `root` shares `<release>-credentials` with tenant users (`secret.yaml:88-90`), and mariadb-operator logs in with it on every SQL reconcile. ClickHouse adds a `backup` account to every instance, backups enabled or not (`clickhouse.yaml:4-5`), and keeps its password there for the backup jobs. OpenSearch's `<release>-credentials` is a copy of its operator's admin account, and Harbor's carries the password of its internal Redis.
+
+The engines already store verifiers: SCRAM-SHA-256 in PostgreSQL, a `mysql_native_password` hash in MariaDB, SHA-256 in ClickHouse, whose chart renders nothing else into the CHI, and bcrypt in OpenSearch. None of them needs the plaintext once it is set.
+
+Audit exists outside the Cozystack API, which runs without audit flags (`packages/system/cozystack-api/templates/deployment.yaml:31-33`). On a Talos cluster running a 1.7.0-alpha.1 build, kube-apiserver recorded a request for a subresource of a `tenantsecrets` object that does not exist with the resource, namespace, name and subresource in `objectRef`, next to the user, groups, source IP, response code and authorization decision. monitoring-agents, a default package, ships that log and Kubernetes Events to VictoriaLogs (`packages/system/monitoring-agents/values.yaml:349-358,389-410`), kept for a month by default. The user it names is a person only with OIDC (off by default, `packages/core/platform/values.yaml:471-473`), under which the dashboard passes the user's ID token through (`packages/system/dashboard/templates/gatekeeper.yaml:72-75`). Without OIDC the dashboard signs in with a pasted token, in practice the token of the tenant ServiceAccount.
 
 ### The problem
 
-A viewer learns an inline password from application discovery. A user denied a second dashboard reveal fetches the same Secret through the raw grant. An audit record saying that a backend read a Secret cannot say which person asked. And the platform's own service accounts are exposed by the same grants as the tenant's, because they share one object.
-
-Rotation also has to handle disagreement between engine state and published state: a database can accept password B while the platform still advertises A if the writer fails before the change is observed. This is a failure the design must handle, not a claim that the sequence has been reproduced.
-
-These are separate failures. A successful rotation invalidates the old password even while historical bytes remain recoverable; erasing history and terminating sessions are further operations, not the same one.
+- A tenant creates a database and the platform generates its passwords. From then on every `use` member of the tenant and the ServiceAccount of every ancestor tenant can read them at any time, and nothing a tenant can see records who did.
+- A leaked password has no platform path to rotation. A change made by hand inside the database is undone on the next run of the init-job or the operator, and a rotation in the chart would keep the old value in Helm history.
+- The platform's own accounts (MariaDB `root`, the ClickHouse `backup` user, the OpenSearch admin) are shown to tenants like their own accounts. Tenants should never see them.
+- A deployment that must show a generated credential once cannot offer managed databases at all.
 
 ## Goals
 
-- Discover an authorized account, its endpoint, database, public trust, capabilities and lifecycle state without transferring protected material.
-- Mint and re-mint a password per account in one authorized call, preserve grants, and store only the engine's verifier wherever the engine accepts one.
-- Separate the three states a caller may mean by revocation: password replaced, login denied, account removed.
-- Keep a per-account record carrying account identity, issuance time, initiating identity, previously-exposed marking and the engine's applied state, readable by the tenant.
-- Split the platform's own service accounts out of tenant-facing Secrets, and state per class which component holds plaintext and why.
-- Report supported operations per service through API capabilities, backed by adapter acceptance tests; reject unsupported operations before mutating an engine.
+A converted kind is an application kind whose chart has moved to this design (§7).
+
+- For every account of a converted kind the platform generates the password, with one generator for all engines (§2), and no application field sets one.
+- The plaintext is returned once, in the response of the mint that generated it. Afterwards no Cozystack component or Kubernetes object holds it, except, for a kind that stores the plaintext (§7), its account Secret, which no tenant can read.
+- A mint replaces the previous password, which the engine rejects once it has applied the new one.
+- Every mint and revoke leaves a kube-apiserver audit event naming the caller, the time and the account, and the account's record shows the recent ones.
+- A minted value appears in no log, Event, condition, error message or audit record.
+- A tenant subject without the mint verb sees account metadata only, and no tenant subject can read a platform account's password in a converted kind.
 
 ### Non-goals
 
-The first release does not provide a secret store, tenant-supplied inputs, arbitrary secret sharing, scheduled rotation, dynamic database leases, delivery to VM guests or to other tenants' clusters, automatic restarts of arbitrary workloads, universal zero-downtime replacement, or automatic session termination. Grants and ACLs stay engine-specific, but a re-mint must preserve them.
-
-It does not erase recipients' copies, clean historical backups, protect runtime plaintext from host and control-plane administrators, or rotate every system identity. None of that permits protected bytes in new logs, broadly readable specs, or tenant-facing projections. Unsupported classes stay visible in the coverage table and are excluded from any compliance claim.
-
-Encryption at rest for etcd resources and snapshots, storage encryption, and encryption-key management are outside this proposal. Calling an internal Secret protected means access and disclosure are restricted; it does not mean this API encrypts stored bytes.
+- Secrets the tenant supplies, which are #82.
+- Delivering a minted credential into a tenant's Kubernetes cluster or VM. The caller stores it.
+- TLS issuance and trust anchors, and retiring the static admin kubeconfig of managed Kubernetes.
+- Closing connections that are already open when a password changes.
+- Proving before the response that the new password works (§3 says why).
+- Kafka users with topic ACLs, which the Kafka chart does not have yet (§7).
+- Moving the wave-2 engines from stored plaintext to verifiers, which follows as separate work per engine (§7).
+- Protection from management-cluster administrators, Flux or the operators, which hold every tenant's credentials today.
 
 ## Design
 
-### Proposed choices
+### 1. The account record
 
-These are the choices proposed for review, not claims of approval or of completed implementation. API names, wire shapes, HTTP mappings and numeric limits are provisional defaults, collected in [details.md](./details.md#operating-limits); changing them must preserve the failure semantics defined here.
-
-| Question | Proposed answer | Why |
-|---|---|---|
-| What is stored | The engine's verifier, wherever the engine accepts one. The plaintext exists in the mint response and nowhere else. | Nothing to collect twice, so one-time disclosure stops being an entitlement the server has to guard. [Storage](./details.md#identity-storage-and-writers). |
-| Who generates | The aggregated API server, for every class. | Render-time `lookup` puts bytes in release history and gives a different answer per chart. Sprig can compute some verifiers and not others, which is why this is not left per chart. |
-| Lost response | A lost response after a successful mint is answered by minting again. No replay, no acknowledgment window. | The API can allow at most one response carrying the plaintext; it cannot prove a person received it. |
-| Concurrency | One mint per account at a time. The record admits the caller with an expected-version precondition, and the write of the material is refused if the record has moved on since. | A mint is a destructive replace, so a stale caller must not be able to overwrite the winner's material after losing the race. |
-| Applied state | The API reports issuance. Whether the engine applied it is the adapter's observed condition, reported on the record. | Verification before publication is given up; see [the trade](#what-is-given-up). |
-| Read paths | Remove tenant-facing material from application representations, the legacy projection, raw dashboard grants and future chart renders. Split service accounts into their own Secret. | Every effective route must obey the policy. [Security](#security). |
-| Service accounts | Plaintext where a machine consumer needs it, in a Secret no tenant role is granted and no `ApplicationDefinition` selects. Charts keep rendering it. | The platform is its own client; a verifier cannot replace a value a component must present. |
-| Rights | Separate discovery, mint, revoke and history. Declaring an application's accounts carries no authority to mint them. | Minting returns the plaintext, so the authority to mint is the authority to read. [Authorization](#authorization). |
-| Audit | kube-apiserver Metadata-level audit for the call, plus a per-account record for what that log cannot carry. | The audit event names the principal on the request and the object, and never the body; it cannot say a password was applied or be read by a tenant. |
-| Coverage | Phase 1: the classes that are verifier-only end to end, engine and operator both. Everything else is classified in the table and converted later, per row. | An engine that accepts a verifier is not enough; something has to deliver it without a full chart render. |
-| Compatibility | Strict is the default for new installations per converted adapter. An unconverted service stays installable and reports `Legacy`. A deployment that sets `strictOnly` refuses to install one instead. | Previously exposed bytes cannot become undisclosed by changing a label. [Compatibility](#upgrade-and-rollback-compatibility). |
-
-### Model
-
-Two public surfaces in `core.cozystack.io`: a `Credential`, which is metadata and lifecycle state of one engine account, and a mint call on it. No credential material is served by any read.
+Each account of a converted application is one `Credential` in the tenant namespace, served by the Cozystack API in `core.cozystack.io/v1alpha1`:
 
 ```yaml
 apiVersion: core.cozystack.io/v1alpha1
 kind: Credential
 metadata:
-  name: cr-7c39
-  namespace: tenant-example
-spec:
-  application: {kind: Postgres, name: orders}
-  account: app
-  credentialClass: password
+  name: postgres-orders.web
+  namespace: tenant-acme
+  uid: 3f9c2e1a-5b7d-4c0e-9a61-0d2f8e4b7c35   # the account's identity
+  resourceVersion: "48213"
+spec:                                         # derived from the application, read-only
+  application: {apiGroup: apps.cozystack.io, kind: Postgres, name: orders}
+  user: web
 status:
-  phase: Usable
-  accountRef: {incarnation: 3}
-  issuance: {at: "2026-09-28T10:14:02Z", by: "alice@example.org", version: cv-91ae}
-  applied: {version: cv-91ae, observedAt: "2026-09-28T10:14:19Z"}
-  previouslyExposed: false
-  connection: {host: orders-rw.tenant-example.svc, port: 5432, username: app, database: orders, trustRef: orders.tenant-ca}
-  capabilities: {mint: true, denyLogin: true, removeAccount: true, terminateSessions: false}
+  password:                                   # where the live password came from
+    origin: Minted                            # NotIssued | Migrated | Minted | Revoked
+    at: "2026-10-02T09:14:07Z"
+    by: jane@example.org
+  history:                                    # the last ten operations, newest first
+  - {operation: Mint, at: "2026-10-02T09:14:07Z", by: jane@example.org}
+  - {operation: Migrate, at: "2026-09-30T02:11:40Z", by: "system:serviceaccount:cozy-system:cozystack-migration-hook"}
+  engine: {state: Applied, observedAt: "2026-10-02T09:14:09Z"}   # Applied | Pending | Failed | Unknown
 ```
 
-| Interface | Semantics |
-|---|---|
-| `GET/LIST/WATCH credentials` | Filtered metadata, lifecycle state and public connection data. No material, ever. |
-| `POST credentials/{name}/mint` | Generates a password, computes the engine's verifier, writes it where the adapter specifies, records issuance, and returns the plaintext in the response body. |
-| `POST credentials/{name}/revoke` | Takes the intended state: `DenyLogin` or `RemoveAccount`. Replacing the password without disclosure is `mint` with the response discarded, which the API does not offer as a separate verb. |
-| `POST credentials/{name}/allowLogin` | Reverses `DenyLogin` without minting. A denied account that is minted stays denied, because a new password is not a decision to let the account back in. |
+It is a view with no storage of its own. It lists the users the application declares in `users` and shows, for each, the record kept on its account Secret. The account Secret:
 
-The mint call is the only path that produces material. It requires an expected-version precondition, so a second caller racing the first is rejected rather than silently superseding it. Editing unrelated options, dry-run, rendering and GitOps reapply never mint. There is no counter in application values that triggers rotation, and declaring `users:` in an application creates the account without a usable password until someone mints it.
+- lives in the tenant namespace, named `<release>.<user>.account`, and only the Cozystack API writes it
+- holds `username` and, under `password`, the value the engine checks passwords against (§3)
+- keeps the record in its annotations
+- is owned by the application's HelmRelease and carries the label the engine's operator watches
 
-Behind the API, one record per account persists in a platform namespace, bound to the tenant namespace UID, the HelmRelease UID and a server-assigned incarnation. It carries identity, issuance time and initiating identity, the previously-exposed marking, and the adapter's observed applied state. It never carries material or a fingerprint of material. Wire details and error mapping are in [details.md](./details.md#public-api-and-request-semantics).
+The view never shows the Secret's data, no ApplicationDefinition selects the Secret, and no Role grants it.
 
-### What is given up
+`status.password.origin` says who can know the live password:
 
-The old contract promised that a new password is published only after the engine accepted it and the old one was proven rejected. A synchronous mint cannot promise that: the response returns before any engine has seen the value. The API reports issuance; the adapter reports applied state on the record afterwards, and a caller that needs proof waits for it.
+- `NotIssued`: the account was created with a random password that the API threw away at once. Nobody has ever received a password for it, and nobody can log in until someone mints.
+- `Migrated`: the account went through the conversion with the password tenants could read before it. That password still works and should be replaced by a mint.
+- `Minted`: the password was shown once, in the response to the mint that `by` made at `at`. Nobody else received it.
+- `Revoked`: `by` revoked the password at `at`. The live value is random and was thrown away, so nobody holds a working password until the next mint.
 
-The cost is real. A caller can hold a password that does not work yet, or never works because the engine never converged. The record makes that state visible rather than hiding it, and re-minting is the recovery. This is accepted deliberately, in exchange for never holding plaintext the platform could leak.
+`status.history` keeps the last ten operations (`Create`, `Migrate`, `Mint`, `Revoke`), so a tenant, who cannot read the audit log, sees who changed the password and when, while the audit log keeps every one. `status.engine` is described in §3.
 
-### Service accounts
+The identity of an account is its Secret's UID. It stays the same across reconciles, upgrades, in-place restores and the conversion. When the application is deleted and created again under the same name, it gets new Secrets, and a Secret left over from the deleted one is never reused.
 
-The platform is a client of the services it runs. The ClickHouse backup account, MariaDB root and Harbor's redis password are read by machine consumers on every reconcile or every backup run, so a verifier cannot replace them. The OpenSearch operator already reads its admin credential from a separate Secret; what sits in the tenant-facing one is a second copy of the same account, including a connection URI with the password in it, and that copy is what goes away.
+The Cozystack API keeps account Secrets in step with `users` whenever it creates or updates an application of a converted kind, whichever client sent the request (the dashboard, `kubectl`, an external API consumer):
 
-Those accounts move out of `<release>-credentials` into a service Secret per release that no tenant role is granted, that no `ApplicationDefinition` selector matches and that the dashboard resource map does not name. Charts keep rendering that Secret with `lookup` plus random generation, which is unchanged behavior and keeps bootstrap ordering as it is today. The consequence is stated rather than hidden: for this class the plaintext stays in Helm release history, so that route remains open for service accounts and closed for tenant accounts. Their rotation stays with the engine maintainers and is out of scope here.
+1. For each user in `users` without an account Secret, or with one left from a deleted application of the same name, it writes a new Secret with the verifier of a random password that it throws away, origin `NotIssued`. The user then exists in the database, and nobody can log in as it until someone mints.
+2. It writes the HelmRelease. On create, the Secrets from step 1 get the new HelmRelease as their owner right after.
+3. It deletes the account Secrets of users that are no longer in `users`.
 
-### Revocation
+Two users whose names map to the same object name are refused.
 
-Three states a caller may mean, kept apart because engines keep them apart:
+### 2. Mint and revoke
 
-- **Password replaced.** The old password stops working; the account remains and remains reachable. This is a mint whose response the caller discards.
-- **Login denied.** The account exists and cannot be used to authenticate: `login: false` on PostgreSQL, `ACCOUNT LOCK` on MariaDB, ACL `off` on Redis and Valkey. A denied account stays denied through a later mint; only `allowLogin` reverses it.
-- **Account removed.** The account is gone, and its declaration goes with it, because an account an application still declares is recreated on the next reconcile.
+Every password is 32 characters drawn uniformly from `[A-Za-z0-9]` by `crypto/rand`, for every engine. That gives about 190 bits of entropy, above the 128-bit security strength NIST SP 800-57 asks of keys used beyond 2030, so even the unsalted hashes ClickHouse and MariaDB store (§3) cannot be brute-forced, and the alphabet needs no escaping in SQL, connection URIs or shells. Today's charts draw 16 characters from the same alphabet.
 
-Where the deny lives decides whether it survives. An operator that reconciles an account from a declaration reasserts that declaration, so a deny written into the engine is undone on the operator's next pass, and a deny patched onto the live custom resource is undone by the next chart render. The deny has to reach the declaration itself, which for these engines means the application's own values: the API writes a per-account flag there and reasserts it from the record on every write it makes. The cost is that denying and re-allowing are `helm upgrade`s, so neither is available on a release that is suspended or already failed.
+```
+POST /apis/core.cozystack.io/v1alpha1/namespaces/tenant-acme/credentials/postgres-orders.web/mint
+{"apiVersion": "core.cozystack.io/v1alpha1", "kind": "CredentialRequest",
+ "spec": {"preconditions": {"resourceVersion": "48213"}}}
 
-None of the three terminates sessions already open. Where an engine offers a separate operation for that, the adapter may expose it as a capability; where it does not, `terminateSessions` reports false and the proposal makes no claim. Per-engine detail is in [details.md](./details.md#revocation-per-engine).
+201 Created
+{"apiVersion": "core.cozystack.io/v1alpha1", "kind": "CredentialRequest",
+ "status": {"username": "web", "password": "<shown once>", "issuedAt": "2026-10-02T09:14:07Z",
+            "engine": {"state": "Pending"}}}
+```
 
-### Authorization
+This is the pattern of Kubernetes `TokenRequest`: a `create` on a subresource of the object, with a request kind of its own as the body, answered by the same kind with the result in `status` and nothing stored. A mint does four things:
 
-Kubernetes RBAC is additive, so the aggregated API checks both the verb and a server-controlled account grant under the effective policy. Policy is a ceiling: platform restrictions apply first, ancestors may tighten, children cannot loosen.
+1. Generates a password.
+2. Computes what the engine stores: its verifier, or for a kind that stores the plaintext (§7) the plaintext itself.
+3. Writes that value and the updated record into the account Secret, in one update that fails if the Secret changed since the caller read it.
+4. Returns the plaintext in the response.
 
-An account grant names one account of one application, the operations it permits, and an expiry. A local administrator of the tenant that owns the application issues it; nobody can issue a grant wider than the authority they hold, and an ancestor's policy caps every grant below it. Revoking the grant is deleting it, and it does not reach back into a password already minted under it. The grant's storage and wire shape are in [details.md](./details.md#authorization-detail).
+The plaintext exists in the API server's memory for the length of the request and in the response. After a second mint the first password is dead: unlike a token, which is added next to the others, a password is replaced. A mint on a declared user whose Secret is missing recreates it with a new identity, and one on an undeclared user answers NotFound.
 
-| Effective authority | Metadata and connection data | Mint | Revoke | History |
-|---|---|---|---|---|
-| `view` | Authorized apps | No | No | Sanitized outcomes |
-| `use` | Authorized apps | No by default | No by default | Sanitized outcomes |
-| Local `admin` / `super-admin` | Local apps | Tenant-facing accounts | Tenant-facing accounts | Detailed local events |
-| Tenant automation identity | Local apps | No | No | Detailed local events |
-| Explicit account grant | Named account | If granted | If granted | Granted scope |
-| Workload identity | No | No | No | No |
+`revoke` takes the same body, writes into the account Secret the verifier of a new random password, throws that password away and returns nothing secret, so nobody holds a working password. It retires a leaked password when nobody should get a new one yet. Neither call lets the caller choose the password.
 
-Minting returns the plaintext, so the authority to mint is the authority to read the password. A grant that previously allowed regeneration without disclosure has no equivalent here, which costs the tenant automation identity its ability to provision a working application unattended: it creates the accounts, and a human or an authorized external API consumer mints them afterwards. Whether that cost is acceptable, or whether a replace-without-disclosure operation should exist for automation, is an [open question](#open-questions). Internal service accounts are not tenant-facing at any tier.
+A lost response (a closed tab, a dropped connection, a crash between the write and the answer) leaves a password nobody holds. The record shows the issuance and its initiator, and the way forward is another mint.
 
-### Coverage
+Two concurrent mints cannot both succeed: the conditional write lets one land, and the other gets `409 Conflict` without a password. A caller can also pass the `resourceVersion` it last read, and the dashboard always does. If someone minted in between, the caller gets a 409 showing the newer issuance instead of silently killing the password another person just received.
 
-The table describes proposed phases, not existing capabilities. An absent adapter reports its capabilities as false and rejects the operation before touching an engine. A phase is complete only when all rows agreed for that phase pass.
+### 3. Where the stored value goes
 
-| Service / account | Verifier | Phase and writer | Replacement evidence | Remaining dependency |
-|---|---|---|---|---|
-| PostgreSQL users | Yes, SCRAM-SHA-256 | 1; API mints, CNPG `managed.roles` applies | Fresh login with the new password, old login rejected, roles and grants unchanged | Chart moves password and role attributes to `managed.roles` and gains a per-account `denyLogin` flag; init path keeps existence, objects and orphan cleanup, and needs fixing to reassign owned objects outside the `postgres` database |
-| MariaDB users | Yes, `passwordHashSecretKeyRef` | 1; API mints, mariadb-operator applies | Fresh new and old login tests, grants unchanged | Requires the watch label on the Secret; operator behavior on missing input and user recreation must pass |
-| ClickHouse users | Yes, `password_sha256_hex` | 1; API mints into a values Secret, Helm renders it into the CHI | New and old authentication on every replica, grants unchanged | Chart takes the verifier from `valuesFrom` instead of computing it, and `users.<name>.password` leaves the values in its own change. Every mint is a Helm revision; the unsalted hash is a stated weakness for tenant-chosen passwords; the backup account moves to the service Secret |
-| OpenSearch tenant users | Engine yes through `internal_users.yml`; the operator's user surface takes no hash | Later, and blocked on a repair | New and old authentication, roles unchanged | A declared user never reaches the engine: the chart renders a labelled Secret nothing consumes and creates no `OpensearchUser`. That is a defect to fix before the class can be converted, and fixing it decides whether the writer is the operator, which means plaintext, or securityconfig, which means a verifier |
-| OpenSearch admin | Not applicable | 1, for the disclosure half only | The tenant no longer receives the credential, and the credential is rotated | The tenant-facing Secret holds a copy of the operator's admin account with a URI containing the password. Removing it does not un-disclose it, so the migration rotates it |
-| NATS, RabbitMQ, Redis, Valkey | Engine yes, our operator path no | Later, per adapter | Per-engine authentication tests | Each conversion decides whether to change the operator path or accept plaintext and say so |
-| MongoDB | No; the server computes SCRAM from plaintext | Later | New and old authentication, roles preserved | Plaintext by engine necessity. `dropUser` needs an executor |
-| Bucket keys, COSI | No; SigV4 signs with the secret itself | Later | Authorized storage action with the new pair, prior issuance rejected | Plaintext by engine necessity; disclosure is a policy on the interface, not a property of storage |
-| Harbor, Qdrant, Outline | No | Later | Per-engine | Plaintext by engine necessity. Harbor also needs an API caller for any post-bootstrap revocation |
-| Kafka | Engine yes, Strimzi `KafkaUser` no | Later | Protocol authentication plus topic ACL tests | No user surface exists in the chart today; that feature comes first |
-| Managed Kubernetes: OIDC kubeconfig | Not applicable | 1, classification only | Repeatable public discovery; cluster-admin follows the identity claim | Already conforming wherever OIDC is enabled |
-| Managed Kubernetes: static `super-admin` kubeconfig | Not applicable; a private key | Phase open | Fresh admin access with the replacement and verified loss of the old | Certificate reissue is not revocation. Retirement is either client-CA rotation or issuance under a `KubeconfigGenerator` identity that can be de-authorized |
-| Virtual machine `cloudInit` | Not applicable | Out of scope, named | None | Free-form user data in the application spec, readable by anyone who can get the application. No schema check or reference field can catch a password inside it |
-| TLS private keys, CA keys, Talos and bootstrap secrets | Not applicable | Internal; issuance outside this API | No tenant mint or revoke | PKI and node-lifecycle maintainers keep their responsibilities |
+CNPG wants one Secret per role, mariadb-operator a key reference per `User`, and the ClickHouse operator watches no Secrets, so each chart wires its engine to the account Secret in its own way:
+
+| Engine, vendored operator | Wiring | Stored value | `status.engine` is Applied when |
+|---|---|---|---|
+| PostgreSQL, CNPG 1.30.0 | `Cluster.spec.managed.roles[].passwordSecret`, Secret labelled `cnpg.io/reload: "true"` | `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` | CNPG reports the account Secret's `resourceVersion` as applied for the role |
+| MariaDB, mariadb-operator 25.10.2 | `User.spec.passwordHashSecretKeyRef`, Secret labelled `k8s.mariadb.com/watch` | `PASSWORD()` output, `*` and 40 hex digits | never: `Unknown` while the `User` is Ready, `Failed` when it is not |
+| ClickHouse, clickhouse-operator 0.25.2 | HelmRelease `valuesFrom`, Secret labelled `reconcile.fluxcd.io/watch: Enabled`, rendered by the chart as `password_sha256_hex` | unsalted SHA-256, hex | the release upgraded after the issuance and the CHI reconcile completed on every host |
+
+#### PostgreSQL
+
+Tenant accounts move under CNPG's declarative role management (`spec.managed.roles`) together with the per-database `<db>_admin` and `<db>_readonly` roles. The database roles come first in the list, because a new role receives its `inRoles` inside its own `CREATE ROLE`, so the roles it joins must exist already.
+
+The chart renders every role as the init-script creates it today, because CNPG reverts any attribute that differs, revokes parent roles missing from `inRoles` and drops a comment the spec leaves unset, while the init-script finds the roles to remove by those comments:
+
+- a database role gets `login: false`, `inherit: false` and the comment `role managed by helm`
+- an account gets `login: true`, its `replication` flag, the comment `user managed by helm`, `inRoles` from `databases.*.roles`, and `passwordSecret` naming the account Secret
+
+The init-script stops setting passwords and memberships, where it would be a second writer. It still creates the database roles, idempotently, because its own `ALTER DATABASE ... OWNER` needs them, and it keeps databases, ownership, privileges, extensions and the removal of undeclared users and roles.
+
+A changed account Secret reaches the engine without Helm: the operator watches Secrets with the reload label, and the instance manager on the primary runs `ALTER ROLE ... PASSWORD` with the verifier, which PostgreSQL stores as it is. The API has to produce the canonical form exactly, since CNPG hashes anything else again as plaintext and the login then fails with no error. With the account Secret missing, CNPG skips every change to that role, `login: false` included.
+
+#### MariaDB
+
+Each `User` swaps `passwordSecretKeyRef` for `passwordHashSecretKeyRef` pointing at the account Secret, which carries the `k8s.mariadb.com/watch` label cozystack/cozystack#4078 already put on `<release>-credentials`. With the label, a change to the Secret makes the operator re-run `ALTER USER`. Without it the change waits for the SQL requeue, ten hours by default. A `User` created without any credential reference is locked for good (`ACCOUNT LOCK PASSWORD EXPIRE`, never unlocked), so every `User` carries the hash reference from its first reconcile. The operator pastes the hash into SQL as it is, which is why only the API computes and writes it.
+
+#### ClickHouse
+
+ClickHouse has no route from a Secret to the engine without a Helm run, so a ClickHouse mint costs a release upgrade and waits while the release is suspended. The operator watches no Secrets, `valueFrom.secretKeyRef` needs a pod restart per change, and `k8s_secret_password_sha256_hex` aborts the reconcile from operator 0.27.4. The one path that applies live is a hash inline in the CHI: the operator rewrites the `chi-<chi>-common-usersd` ConfigMap without a restart, and ClickHouse re-reads `users.d` every two seconds.
+
+The chart already renders that hash. After conversion it takes it from values that the HelmRelease pulls from the account Secrets, through one `valuesFrom` entry per account. Both the API (`rest.go:1721-1726`) and the ApplicationDefinition reconciler (`internal/controller/applicationdefinition_helmreconciler.go:148-156`) pin `valuesFrom` to `cozystack-values` today, so both compute the new list with one function, and the reconciler writes it onto existing releases. The chart fails the render when a declared account has no verifier, because the operator would give such an account the password `default`, and it refuses tenant accounts named `backup`, `default` or `clickhouse_operator`.
+
+#### How the engine state is known
+
+The Cozystack API computes `status.engine` each time a Credential is read, from what the engine's operator reports. Neither the plaintext nor a connection to the database is involved. For PostgreSQL the check is exact per role. For ClickHouse it proves the configuration was written, not that every replica reloaded it. MariaDB reports nothing per account: `UserStatus` has only conditions, and a Secret change moves neither the `User`'s generation nor its `Ready` condition, so the API cannot tell when a new password took effect. Two other ways were considered:
+
+- Reading back what the engine stored and comparing it with the account Secret (`pg_authid` in PostgreSQL, `mysql.global_priv` in MariaDB). No plaintext is involved, but a platform component needs a privileged connection into every tenant database. It is the one way to give MariaDB a real signal (see Open questions).
+- Logging in with the new password before answering. The API would need network access to every tenant database and would hold the plaintext until the engine converges, which for ClickHouse takes a Helm upgrade. Rejected.
+
+### 4. Platform accounts
+
+The platform's own accounts inside an engine keep their plaintext where their consumer needs it. Every such account stays in the `<release>-credentials` it lives in today, the tenant accounts move out of that Secret, and the Secret stops being visible to tenants: no ApplicationDefinition selects it, no Role grants it, and the chart renders it with `internal.cozystack.io/tenantresource: "false"`. The same rule holds in every engine because MariaDB leaves no other choice: `rootPasswordSecretKeyRef` cannot change once set. These passwords stay chart-generated with `lookup` and keep their plaintext in Helm history, which only management-cluster administrators and platform components read.
+
+The conversion rotates every platform password tenants could read:
+
+| Account | Consumer | Rotation |
+|---|---|---|
+| MariaDB `root` | mariadb-operator, which logs in with it on every SQL reconcile | the migration runs `ALTER USER` on the primary with the current root password, then writes the new value into the Secret |
+| ClickHouse `backup` | the backup CronJob, and the backup sidecar through its environment | the migration writes a new value, and the chart upgrade that follows applies its hash and restarts the ClickHouse pods once for the sidecar |
+| OpenSearch admin | the operator reads `<release>-admin-credentials`, and `<release>-credentials` holds a copy | with the OpenSearch conversion, in wave 2 |
+| Harbor Redis | Flux, through `valuesFrom` | with the Harbor conversion, when its admin password moves out |
+
+Removing the grants and selector entries closes cozystack/cozystack#4164 for converted kinds.
+
+### 5. Who may do what
+
+| Subject | get, list, watch `credentials` | create `credentials/mint`, `credentials/revoke` |
+|---|---|---|
+| `view` | yes | no |
+| `use` | yes | no |
+| `admin`, `super-admin` | yes | yes |
+| tenant ServiceAccount (`cozy:tenant`) | yes | yes |
+
+Minting goes with the tiers that can change the application (`clusterroles.yaml:253-284`), because it changes a running service: every client holding the old password loses access. `use` members, who read `<release>-credentials` today, keep account metadata and connection details and lose the password. The tenant ServiceAccount already holds every verb on the tenant's applications, so automation that provisions an application can mint in the same run.
+
+Ancestors inherit, since the tier and ServiceAccount bindings in a tenant namespace include every ancestor (`packages/apps/tenant/templates/tenant.yaml:8-87`). A parent administrator can mint a child's credential, as it can delete the child's database today, but the access is now visible: the mint replaces the password, the child's record shows who issued it, and the audit event names the actor.
+
+Without OIDC the dashboard signs in with the tenant ServiceAccount token and the tiers collapse into the ServiceAccount, so a deployment that needs role-based disclosure and per-person attribution enables OIDC. An external API consumer maps its roles onto these tiers and, acting for a person, passes that person's OIDC token or uses Kubernetes impersonation, which the audit event records next to the caller.
+
+### 6. Audit and service history
+
+A mint is a `create` on `credentials/<name>/mint`, which kube-apiserver audits before proxying it to the Cozystack API, with the account in `objectRef` and the subresource telling a mint from a revoke. kube-apiserver does not record the body of a request it proxies to an aggregated API at any audit level, so the password cannot reach that log. That answers who, when and which account for every issuance, and Cozystack already ships the log to VictoriaLogs.
+
+The one server that could write the password down is the Cozystack API, if it got an audit policy, and any such policy must keep `credentials` below `RequestResponse`. Distributions that give kube-apiserver no audit policy record nothing, so the installation documentation gets one for them, with the log path monitoring-agents tails. An external SIEM, the log and alerting system a security team runs, has no way in today: the fluent-bit outputs of monitoring-agents are one fixed string (`packages/system/monitoring-agents/values.yaml:377-410`), and overriding it drops the VictoriaLogs outputs. monitoring-agents gets a value for additional outputs.
+
+A rotation is subscribed to on the audit log, in the SIEM or in a VMAlert rule group over VictoriaLogs that the operator adds, since Cozystack ships no log-based alert rules. Each mint and revoke also emits a Kubernetes Event on the application, naming the account and the initiator and never a value. Events are best-effort, because the client drops and merges repeated events about one object, and the API needs `create` on `events` for them. Only `tenant-root`, whose log store receives the cluster's audit log, can read that log, and every other tenant reads the record's history.
+
+### 7. Coverage
+
+A kind joins a wave once its whole path from mint to engine works, not once the engine could accept a verifier. Every wave uses the same `Credential` and mint. In wave 1 the account Secret holds only the verifier, and one-time disclosure follows from storage. In waves 2 and 3 the account Secret holds the plaintext that the engine or its operator reads. No tenant can read that Secret, so one-time disclosure holds on the tenant-facing interface, while platform components and management-cluster administrators can still read it.
+
+| Kind | Engine takes a verifier | What the tenant gets today | Wave |
+|---|---|---|---|
+| PostgreSQL | yes, SCRAM-SHA-256 | `<release>-credentials` | 1 |
+| MariaDB | yes, `mysql_native_password` hash | `<release>-credentials`, `root` included | 1 |
+| ClickHouse | yes, SHA-256 | `<release>-credentials`, `backup` included | 1 |
+| OpenSearch | yes, bcrypt in `internal_users.yml` | the admin only, since the per-user Secrets the chart renders reach no engine | 2, once users reach the engine |
+| NATS | yes, bcrypt in the server config | one Secret with every user, plaintext in the child release values | 2 |
+| RabbitMQ | yes, `password_hash` through the HTTP API | per-user Secrets and the administrator `-default-user`, and the topology operator imports a password only when it creates the user | 2 |
+| Redis, Valkey | yes, `#<sha256>` in ACL | `-auth`, one password shared with replication, the operator and the exporter | 2 |
+| MongoDB | no, the server computes SCRAM from the plaintext | `-credentials`, the operator's `databaseAdmin` system user | 3 |
+| Bucket | no, SigV4 signs with the secret | per-user keys generated by the COSI driver | 3 |
+| VPN (Outline) | no, Shadowsocks derives its key from the password | `ss://` links embedding each password | 3 |
+| Qdrant | no, the key is compared as is | the single admin API key, also Prometheus's bearer token | 3 |
+| Harbor | no, the admin is bootstrapped from plaintext | the admin and Redis passwords | 3 |
+| Monitoring | no, Alerta and a job consume the plaintext | `grafana-admin-password` | 3 |
+| Kafka | yes, SCRAM credentials | CA certificates only | none yet: no listener authenticates |
+| VM instance | cloud-init takes a crypt hash, but `cloudInit` is free-form text | plaintext in the spec, and the chart's own example is `password: ubuntu` (`packages/apps/vm-instance/values.yaml:111-115`) | out of scope |
+
+Wave 2 engines accept a verifier, but their operator or chart path takes plaintext today, so they convert with the plaintext in the account Secret, like wave 3. Moving each of them to a verifier, the way wave 1 works, is separate work after this proposal, one engine at a time. Wave 3 engines need the plaintext for good. OpenSearch first needs its users to reach the engine, which with plaintext means `OpensearchUser` objects that read the account Secret. Each wave-2 and wave-3 kind gets its own row in §3 at its conversion, shaped by what the table names: a RabbitMQ import that happens only at user creation, keys from the COSI driver, one Qdrant key shared with Prometheus.
+
+Kafka clients connect without credentials, since no listener declares authentication, the optional external LoadBalancer one included (`packages/apps/kafka/templates/kafka.yaml:32-46`). Users with topic ACLs are a Kafka chart feature, and once they exist they join a wave. Until a kind converts, a deployment whose policy requires one-time disclosure can withhold it: `bundles.disabledPackages` stops the platform rendering its package, and on a running cluster the Package also has to be deleted, because packages carry `helm.sh/resource-policy: keep`.
+
+Kubernetes access credentials hold no password and stay at their CA. A managed cluster's `-admin-kubeconfig` is a client certificate and key, its `-oidc-kubeconfig` carries neither, and retiring the static certificate is left open. The Talos workers' `<cluster>-talos-secrets` is not tenant-facing.
 
 ## User-facing changes
 
-A tenant creating an application no longer receives a working password with it. The accounts exist and cannot log in until someone mints them, which is one call per account from the dashboard, the CLI or an external API consumer. The mint response shows the password once and the platform cannot show it again.
-
-`<release>-credentials` stops carrying passwords for converted engines and carries verifiers instead, so a tenant reading that Secret directly finds nothing usable. For OpenSearch it holds a copy of the admin account today and will hold nothing after the split.
-
-`users.<name>.password` disappears from the values of converted applications. For PostgreSQL and MariaDB it is already gone; ClickHouse loses it with its conversion. A tenant who was setting a password there sets none and mints instead.
-
-Revocation appears as three separate actions rather than one: replace the password, deny the account a login, remove the account. Denying and re-allowing a login are Helm upgrades under the hood, so neither works while a release is suspended or failing.
-
-Operators get a per-account record they can read: who minted a credential, when, whether the engine applied it, and whether the account was ever exposed under the old repeatable-read behaviour.
+- The credential view of a converted application lists its accounts with the origin of the live password, the recent operations and the engine state, and offers Regenerate and Revoke to those who may mint. A password appears once, in the dialog that minted it, and creating an application with users, or adding one, chains a mint per new account.
+- `use` members stop seeing passwords (§5). Tenants stop seeing MariaDB `root`, the ClickHouse `backup` user and the OpenSearch admin, and administer MariaDB through accounts with the admin role on each database.
+- A password an account sets for itself inside PostgreSQL is reverted by CNPG.
+- API clients get `credentials` with `mint` and `revoke` in `core.cozystack.io/v1alpha1`, and `tenantsecrets` does not change.
+- Operators get a numbered migration per converting kind, an audit policy for distributions that ship none, and a monitoring-agents value for an extra output.
 
 ## Upgrade and rollback compatibility
 
-A service is `Strict` when every credential-bearing field it has goes through this API, and `Legacy` while any of them still carries an inline value. Strict is the default for new installations per converted adapter; an existing installation gets a finite migration window per adapter, then an explicit mint before the service can report `Strict`. A deadline cannot precede the adapter it depends on. `strictOnly` is a platform-level setting that refuses to install a service reporting `Legacy` at all, rather than installing it with the label.
+A kind converts in one release. The conversion is announced ahead of it, in release notes and on the kind's credential view, so users can store passwords they still need. The API serves, seeds and mints for a kind only from its converting release, so it never overwrites a password the old chart still applies.
 
-Until the reference capability from [#82](https://github.com/cozystack/community/pull/82) exists, a field that can only carry a tenant-supplied value keeps its inline form and the service reports `Legacy`. Whether that exception is scoped to the field or to the service is an [open question](#open-questions).
+The converting release ships the converted chart and a numbered platform migration. Migrations run as a pre-upgrade hook of the platform release, before any component chart changes version (`packages/core/platform/templates/migration-hook.yaml:27-60`), in every platform variant that installs managed applications. For each release of the kind the migration:
 
-Migration runs in three stages, as a one-shot platform migration rather than a resident controller.
+1. Writes the account Secrets with the verifiers of the passwords in `<release>-credentials`, origin `Migrated`, so clients keep working.
+2. Removes any leftover `users.*.password` from the HelmRelease values.
+3. Deletes the tenant keys from `<release>-credentials`, which a client-side apply would otherwise leave in its `data`, and deletes the Secret where no platform account remains, as in postgres.
+4. Rotates the platform passwords of §4.
 
-Stage A is preparation and changes no authentication. It annotates the tenant credentials Secret with `helm.sh/resource-policy: keep` so a later chart change cannot delete it, and it creates the service Secret with the service accounts copied into it. Both Secrets exist afterwards and nothing is removed, so a rollback at this point loses nothing.
+Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. The lineage webhook learns to keep an explicit `"false"`, or it would overwrite it on a release created while the old definition still selects the name. No field ownership moves, since the API takes over no object Helm owns.
 
-Stage B computes verifiers from the plaintext the platform already holds and writes them where each adapter specifies. Where the adapter's target is a new object, as it is for PostgreSQL, the object is created and nothing existing is touched. Where the adapter's target is the existing Secret, the verifier goes under a new key rather than over the plaintext one, because the old chart and the old operator still read the old key and would take a hash for a password.
+The migration degrades per release, never per fleet. A failing migration stops the whole platform upgrade, so a release it cannot convert (its Secret gone, two users mapping to one name, a user named `app` in postgres) is left out and reported in the migration log and with an Event on its HelmRelease. The converted chart refuses to render while a declared account has no account Secret, so that release stays at its previous revision with its old credentials working and exposed as before. Once an operator fixes the cause, the next write through the API converts it with the same code: for a release whose chart has not switched yet, the API derives the account Secret from the stored plaintext instead of seeding it.
 
-Stage C flips the readers and the writers in one release: the charts stop rendering tenant material and start pointing at the verifier, and the migration takes field ownership with the forced server-side apply the existing migrations use. Helm does not release `managedFields` ownership when a template stops rendering a field, so the transfer is performed rather than awaited. Every account converted in this stage is marked previously exposed until re-minted.
+No flag keeps passwords viewable. It would be a second credential path in every converted chart and a switch that turns the guarantee off for every tenant of an installation. An installation that needs the old behaviour for longer stays on the release before the conversion. Pre-conversion revisions keep the old plaintext in Helm history until `MaxHistory` drops them, and the origin stays `Migrated` until the first issuance or revocation makes that value useless.
 
-The ordering is what keeps a chart and the API from writing one object at the same time, and it is also what makes a rollback between stages harmless.
-
-Rollback of a converted application to a pre-conversion chart revision does restore the old plaintext: the rendered Secret is in release history, `helm rollback` applies it, and MariaDB's operator will re-apply the password it finds. The old exposed password becomes live again. The previously-exposed marking survives, so the record still says the account is exposed, and the recovery is a mint.
+Downgrading the platform past a conversion is not supported, and it is the one irreversible step: the previous charts generate a new password for every account and apply it over the minted one. A manual `helm rollback` of one release is undone at the next reconcile, because the HelmRelease still asks for the converted chart. Until then MariaDB applies the old passwords from the `<release>-credentials` the old revision recreates, and ClickHouse the verifiers of the older revision, even between two converted ones, so a revoked password logs in again. PostgreSQL keeps the minted passwords, since a rollback runs no post-upgrade hook and CNPG leaves roles dropped from its spec alone, but the old Role exposes the dead plaintext. In every case the answer is a mint once the release is back.
 
 ## Security
 
-The disclosure routes and what closes each, per class:
+Each read route, for converted kinds:
 
-| Route | Tenant accounts | Service accounts |
+| Route | Tenant accounts | Platform accounts |
 |---|---|---|
-| Inline field in the application spec | Removed for PostgreSQL and MariaDB by [#4078](https://github.com/cozystack/cozystack/pull/4078); still present for ClickHouse and OpenSearch, and closed for them by their own conversion | Not applicable; never in the spec |
-| `tenantsecrets` projection | Verifier only, nothing to disclose | Not selected by any `ApplicationDefinition` |
-| Per-release raw grant to `use` tier and ancestor ServiceAccounts | Verifier only, nothing to disclose | Not granted, not in the dashboard resource map |
-| Helm release history | Chart stops rendering tenant plaintext. For ClickHouse the verifier does pass through release values, which is a verifier and not a password | **Open by design.** Plaintext stays in history for this class |
-| Operator-materialised configuration | ClickHouse writes the verifier into a ConfigMap in the tenant namespace; no tenant role grants `configmaps` | Not applicable |
+| 1. Application spec | no password field (cozystack/cozystack#4078 for postgres and mariadb, the conversion for the others), and the migration removes leftovers | never in the spec |
+| 2. `tenantsecrets` | no definition selects an account Secret | `<release>-credentials` is rendered not tenant-visible |
+| 3. Name grants | none | none, which closes cozystack/cozystack#4164 for converted kinds |
+| 4. Helm history | no tenant password in a converted revision, and older revisions keep the pre-conversion value until `MaxHistory` drops them (hence the `Migrated` origin) | open by decision: chart-rendered plaintext, readable only by management-cluster administrators and platform components |
+| 5. Operator-materialised configuration | verifiers only | unchanged |
 
-A verifier is not treated as protected material. It is not returned by discovery, not projected outward and not written into logs, because no consumer other than the engine needs it; its presence in a Secret or in release history is not a breach of the one-time contract. One caveat is carried explicitly: ClickHouse stores an unsalted single-round SHA-256, so a password a tenant chose can be recovered from it by dictionary attack. A password minted from the CSPRNG at the length this proposal requires cannot.
+The mint response is the one place the plaintext exists by design. It crosses from kube-apiserver to the Cozystack API over TLS and back, and neither server logs or audits it (§6). In waves 2 and 3 the account Secret holds the plaintext as well, which tenants cannot read and platform components can.
 
-The aggregated API server is a trusted component with fleet-wide Secret access. It already holds that access today. Per-namespace RoleBindings on one identity do not partition its compromise, and this design says so rather than claiming isolation.
+The trust boundary does not move. The Cozystack API already holds `create`, `update`, `patch` and `delete` on Secrets in every namespace (`packages/system/cozystack-api/templates/rbac.yaml:18-20`), and Flux renders every tenant's password today, so generation in the API adds no authority over credentials. The API gains `create` on `events` and read access to the engine objects it reports on: CNPG `clusters`, mariadb-operator `users` and ClickHouse installations.
 
-The mint response is the only channel that carries a password, so it is served with `Cache-Control: no-store`, never redirected, never retried by a proxy, and its body never reaches a request log or a trace.
+Verifiers are shown to no one, although they are not treated as secrets. A verifier of a 32-character random password leaves no practical offline attack, which is the only reason ClickHouse's unsalted SHA-256 and MariaDB's double SHA-1 are good enough, and a migrated password keeps the `Migrated` origin anyway. mariadb-operator pastes the hash into SQL unescaped, which is safe because only the platform writes the account Secret. For ClickHouse the verifier arrives under a `_`-prefixed values key, which the Application API hides on read and refuses on write (`pkg/registry/apps/application/rest.go:1269-1304`).
 
-Audit evidence is append-only for tenant and API actors. This design does not promise tamper resistance against a compromised control-plane administrator.
+The mint body carries a precondition and no other tenant input. A Credential lives in its tenant namespace, kube-apiserver authorizes a mint by RBAC in that namespace, and the API resolves the account Secret within it. Without OIDC the tiers collapse into the tenant ServiceAccount (§5).
 
 ## Failure and edge cases
 
-- Crash between the record write and the material write → the record stays in `Applying`, the engine is unchanged, and the next mint recovers. No silent divergence.
-- A stalled caller resumes after another mint completed → its material write is refused because the record moved on. It writes nothing.
-- Mint against a suspended or failed release, for an engine that applies through Helm → accepted, recorded, reported pending. It applies when the release resumes.
-- Engine unreachable during a mint → `503`, the record stays in `Applying` rather than advancing, and the account is untouched.
-- Account minted but never applied by the operator → the record shows issuance without applied state; a caller that needs proof waits for it or mints again.
-- Verifier Secret deleted while the record survives → `MaterialMissing`, which is a prompt to mint, never evidence of a fresh install.
-- Mint against a denied account → the password changes and the deny stands. Only `allowLogin` lifts it.
-- Application deleted and recreated under the same name → a new incarnation with a new record; the closed record keeps the old account's exposure marking.
-- Restore from a backup → every account is marked exposed and re-minted before the destination is reachable, because a backup carries the passwords of its own age.
-- Rollback to a pre-conversion chart revision → the rendered Secret returns from release history with its old plaintext, and MariaDB's operator re-applies it. The exposure marking survives, and a mint is the recovery.
-- Two mints racing on one account → one wins on the expected-version precondition, the other is refused with a conflict naming the current version.
+- The engine's operator is down, or the database is not ready → the mint succeeds and `status.engine` stays Pending (Unknown for MariaDB), with the old password working until the engine applies the new one.
+- A ClickHouse release is suspended or failing → the mint is accepted and stays Pending until the release upgrades.
+- A user leaves `users` while a mint for it is in flight → NotFound or Conflict, and no password.
+- An account Secret deleted by hand, or a HelmRelease written around the API → the converted chart refuses to render and the release keeps its previous revision, the account shows Failed, and a mint recreates the Secret with a new password and a new identity.
+- A create that fails after the Secrets were written, or a delete with orphan propagation → Secrets no current HelmRelease owns, which the next create under that name replaces instead of reusing.
+- Deleting a converted application whose release is suspended → refused, because Flux skips the uninstall of a suspended release and would leave the database running with its last passwords after the account Secrets are gone.
+- A PostgreSQL name that makes CNPG's webhook reject the whole Cluster → refused at render, as `postgres` is today. That covers roles CNPG reserves (`streaming_replica`, anything starting with `pg_` or `cnpg_`), a database whose derived `<db>_admin` role would be reserved, an account named like a derived role, and a new account named `app`, the owner CNPG creates at initdb and whose password its instance manager resets from `<release>-app` on every start.
+- A restore in place → account Secrets and records stay, and the operators apply the current values over the restored catalog. For PostgreSQL CNPG does it once the restored primary is up, replacing the init-job run and the `credentials-pending` annotation of today's restore path.
+- A restore into a new application → new records and seeds, and the restored accounts need a mint, as they need new passwords today.
+- An application is deleted → its account Secrets go with its HelmRelease, and the audit trail remains.
+- The migration is interrupted → it is idempotent, and the next run converts what is left.
+- A `password` left in the values of a converted kind → dropped with an admission warning pointing at mint, extending the warning cozystack/cozystack#4078 added for postgres and mariadb.
 
 ## Testing
 
-Adapter acceptance per engine: a minted password authenticates, the old one is rejected, grants are unchanged, and the applied state appears on the record. Revocation per state: login denied is denied, account removal is removed, and each survives the operator's next reconcile. Isolation: guessed names, forged labels, manipulated selectors, sibling and ancestor references, raw and projected reads. Migration: each stage on a populated cluster, the ownership transfer, and a rollback between stages. The detailed plan is in [details.md](./details.md#acceptance).
-
-Attribution rests on the kube-apiserver audit log, so an installation whose distribution ships no audit policy cannot claim `Strict`. Talos ships one and Cozystack collects it; anything else is the installation's responsibility and is checked before strict mode is offered.
-
-No live engine, migration or browser test is claimed as executed by this proposal.
+- API unit tests: passwords are 32 characters from the stated alphabet and `crypto/rand`, every verifier checks out against a reference implementation (PostgreSQL's SCRAM, MariaDB's `PASSWORD()`, SHA-256) with the SCRAM form canonical, conflicts return no password, and a captured log and event recorder never see the plaintext. The API-change gate learns the subresource keys its storage-key pattern skips today.
+- Chart unit tests on each converted chart: no tenant password in any rendered object, the engine points at the account Secret, neither account Secrets nor `<release>-credentials` are granted or selected, the render fails for a declared account without an account Secret, and reserved or colliding names are refused.
+- Writes through `tenantsecrets`, whose code has no tests today: no tenant tier holds a write verb on it, and an update or delete through it on an account Secret or on `<release>-credentials` answers NotFound.
+- No foreign secret, end to end with a parent and two sibling tenants: `tenantsecrets` never lists an account Secret or `<release>-credentials`, a sibling can neither read nor mint a tenant's credentials, and a parent's mint shows in the child's record.
+- No second disclosure, end to end for each wave-1 engine: mint, log in, and find the password on no read path (the Credential, `tenantsecrets`, a direct `get` on the Secret, the application, Events, the audit log, the Helm history of the converted revision). Then mint again and see the first password fail, once `status.engine` says Applied for PostgreSQL and ClickHouse, and by polling a login for MariaDB.
+- Live checks on the pinned versions before the first conversion ships: CNPG `managed.roles` takes over a role the init-job created and re-applies a changed verifier, with the latency measured on an idle cluster, mariadb-operator re-applies `passwordHashSecretKeyRef` when a watched Secret changes, and ClickHouse picks up a verifier through `valuesFrom` without a restart.
+- The migration: clients keep logging in, accounts show origin `Migrated`, no `users.*.password` remains, `<release>-credentials` holds platform accounts only or is gone, rotated platform passwords work, and a broken release is reported and keeps its revision.
+- Audit: a mint appears in the kube-apiserver log with `objectRef.subresource: mint` and the Credential's name.
 
 ## Rollout
 
-Ordered by what unblocks what, not by calendar. Each step is a release or a set of releases, and none of them starts before the one above it is in.
-
-1. **The API surface.** `Credential` with its mint, revoke and allowLogin calls, the per-account record, the account grant, and the audit checks that let an installation claim `Strict`. Nothing converts yet; every adapter reports its capabilities as false.
-2. **PostgreSQL.** The chart moves password and role attributes to `managed.roles`, gains the per-account `denyLogin` flag, and the init path is fixed to reassign owned objects outside the `postgres` database. Migration stages A, B and C for this engine.
-3. **MariaDB.** The native reference keeps applying, the Secret gains the watch label, and the lock behaviour and applied-state gap are settled by the acceptance suite before the capability is reported.
-4. **The service-account split.** MariaDB root, the ClickHouse backup account, the OpenSearch admin copy and Harbor's redis password move to the service Secret, and each one is rotated in the same change rather than merely hidden. This can run in parallel with step 3 and does not wait for an engine's conversion.
-5. **ClickHouse.** The chart takes the verifier through `valuesFrom`, and `users.<name>.password` leaves the values in its own change.
-6. **OpenSearch, repair first.** A tenant-declared user is made to reach the engine, which settles whether the writer is the operator or securityconfig. Only then does the class get a row that can convert.
-7. **The plaintext-by-necessity classes.** MongoDB, COSI, Harbor, Qdrant, Outline, Kafka and the static kubeconfig, each on its own schedule and each stating who holds the plaintext and why.
-
-Strict mode for an engine follows that engine's conversion and never precedes it. `strictOnly` becomes useful once enough of the first wave has landed that an installation can refuse the rest.
+1. This proposal is accepted.
+2. Independent change: the lineage webhook keeps an explicit `tenantresource: "false"`.
+3. The Cozystack API gains `credentials`, `mint`, `revoke`, seeding and the adapters for PostgreSQL, MariaDB and ClickHouse, serving no kind yet, with the Event and its RBAC. The documentation gets the audit policies, and monitoring-agents the output value.
+4. Wave 1: PostgreSQL and MariaDB convert once the live checks in Testing pass, and ClickHouse with them or a release later after its own check.
+5. Wave 2: OpenSearch, NATS, RabbitMQ, Redis and Valkey, each with its §3 row and the plaintext in its account Secret.
+6. Wave 3: MongoDB, Bucket, VPN, Qdrant, Harbor and Monitoring, the same way. Kafka joins whichever wave is open once its chart has users.
+7. After this proposal, as separate tasks: each wave-2 engine moves from stored plaintext to a verifier.
 
 ## Open questions
 
-- **The write target differs per engine.** PostgreSQL takes a per-user basic-auth Secret because that is what CNPG watches; ClickHouse takes a values fragment because that is what reaches its operator. Neither is the single credentials Secret the review discussion assumed, so the mint API writes wherever the adapter says rather than to one well-known object, and the `ApplicationDefinition` selectors, the dashboard Role and the migration follow per adapter. Whether that per-engine spread is acceptable, or worth constraining, is a design call this proposal makes and the reviewers should confirm.
-- **Who owns OpenSearch users after the repair.** A declared tenant user reaching no engine is a defect, and this proposal records it rather than fixing it. Whoever does fix it chooses between the operator's `OpensearchUser`, which takes plaintext and makes the class plaintext-by-operator, and securityconfig, which takes a bcrypt hash and makes it verifier-only at the cost of bypassing the operator's user API. The two overwrite each other, so it is one or the other, and the choice decides which row OpenSearch eventually occupies.
-- **What a mint means on a release that cannot upgrade.** ClickHouse applies a mint through a Helm upgrade, and PostgreSQL's deny-login does the same. A suspended or failed release takes neither, so the operation is accepted, recorded and reported as pending. Whether pending is the right answer, or the call should be refused outright, is a product question rather than a mechanical one.
-- **`Legacy` granularity.** Per service today. A converted PostgreSQL whose backup credential still has no reference path would be `Legacy` as a whole, which understates what works. Per-field is new semantics and needs its own rules.
-- **Replace without disclosure.** Minting is disclosure, so the automation identity that provisions applications cannot produce a working one unattended. Whether a replace-without-return operation should exist for that identity, and what stops it from being used to hand a password to someone who may not read it, is unresolved.
-- **What retaining records costs.** Keeping the exposure history across a delete and recreate means records outlive the applications that created them, keyed by the account rather than by the release. They are closed rather than removed and expire a year later. That is unbounded growth in a namespace nobody looks at, traded for a recreated account not presenting itself as never exposed. The retention number is a guess and wants a real one.
-- **The API writing into application values.** Deny-login needs a per-account flag in the values, and application values have no field ownership: an update replaces them whole, and the tenant, the platform and the restore driver already write them. The API reasserting its flag from the record on every write is the mechanism the platform uses for its shard label, and it is a convention rather than an enforcement. Whether that is enough, or the platform needs real field ownership on application values, is bigger than this proposal.
-- **Initiating identity behind a backend.** The record names the principal on the request. When the dashboard or an external API consumer calls on a person's behalf, that principal is the backend unless a delegation transport carries the person's identity. That transport is not specified here.
-- **Session termination.** Left as a per-adapter capability. Whether any class should require it before claiming strict is unresolved.
+- Whether MariaDB gets a real engine state by reading the stored hash back through a privileged connection (§3), or stays `Unknown`.
 
 ## Alternatives considered
 
-**Keep generation in Helm or in a template helper.** Rendered material enters release history and `lookup` is not a dependency. Accepted deliberately for service accounts only, where the consumer is a machine and the Secret is not tenant-facing.
-
-**Keep one-time collection with an entitlement and a window.** It exists to guard plaintext the platform holds. With verifier-only storage there is nothing to collect a second time, so the entitlement, the window, the consumption state and the commitment protocol have no subject.
-
-**A durable journal with a transactional outbox and an exporter.** The apiserver's Metadata-level audit event names the initiator and the object and never the body, and Cozystack already collects it. What it cannot do is address a credential, be read by a tenant, or say the engine applied anything, and the per-account record covers those three.
-
-**Hide the dashboard button and keep raw reads.** The same principal uses another client; grants and a stated boundary are enforceable, client type is not.
-
-**Return values only from create, or allow replay until acknowledgment.** This is the shape adopted here, and the old objection to it had two halves. Asynchronous issuers do not fit a synchronous response, which is why COSI is not in phase 1. Unattended creation does not fit either, and that half stands: declaring an account no longer produces a working one, so a GitOps apply leaves accounts waiting for a mint. The cost is recorded rather than argued away, and whether to buy it back with a replace-without-return operation is an [open question](#open-questions). Replay is still refused, because it releases the same bytes twice.
-
-**Five kinds with operations, bindings and events.** Operations, bindings and an event kind exist to manage state that verifier-only storage removes. Delivery of credentials into a tenant's own cluster is a separate concern once a store exists, and is not replaced here.
-
-**Require Vault or KMS.** External custody does not remove delivering bytes to engines that consume plaintext, and for engines that consume a verifier the platform already holds nothing. The classes that need a store are named in the coverage table and go to [#82](https://github.com/cozystack/community/pull/82).
+- Keeping the plaintext and guarding a one-time collection window over it, with a durable journal of every access (the earlier revision of this proposal). All of it exists to guard stored plaintext, which verifiers remove.
+- Keeping generation in the chart, as today. The plaintext stays in Helm history for `MaxHistory` revisions, so a rotation cannot revoke and a `helm rollback` restores the old value. It stays only for platform accounts, whose history no tenant can read.
+- Moving every platform account into a new Secret. MariaDB's `root` reference cannot change once set, so one engine would stay behind in any case.
+- A stored `Credential` kind next to the account Secret. CNPG needs a Secret per role anyway, and a record on it cannot drift from the value it describes.
+- A subresource on the application, such as `postgreses/<name>/mint` with the user in the body. The audit event would name the application and not the account, and RBAC could not address one account.
+- Writing the verifier into the live `Cluster` or CHI. Postgres releases are applied client-side, so the patch vanishes at the next render, and a ClickHouse render that lands first gives the account the default password.
+- Postgres through the init-job with a forced upgrade per call, which runs the whole chart every time and does nothing on a suspended release.
+- ClickHouse through `valueFrom.secretKeyRef`, which restarts the pods on every change, or `k8s_secret_password_sha256_hex`, which operator 0.27.4 removes.
 
 ---
 
-<!-- Inspired by KubeVirt enhancement proposals and Kubernetes Enhancement Proposals (KEPs). -->
+<!--
+Inspired by KubeVirt enhancement proposals
+(https://github.com/kubevirt/enhancements) and Kubernetes Enhancement
+Proposals (KEPs).
+-->
