@@ -226,6 +226,19 @@ stringData:
 
 The release that converts PostgreSQL runs a migration before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, removes a `users.web.password` if one was left in the HelmRelease values, and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
 
+## When the migration leaves a release out
+
+A release the migration cannot convert is reported in the migration log and with an Event on its HelmRelease, and the cause decides what it does once the converted charts arrive.
+
+| Cause | What happens |
+|---|---|
+| Colliding users, or a postgres user named `app` | The converted chart refuses to render. The release keeps its previous revision, with old credentials working and exposed as before. |
+| A MariaDB release without `<release>-credentials` | The converted chart keeps the root guard of today's chart and fails the upgrade, so the release keeps its previous revision. |
+| ClickHouse account Secrets that do not exist | The HelmRelease names them in `valuesFrom`, Flux stops the release with `ValuesError`, and it keeps its previous revision. |
+| A PostgreSQL release whose Secret was gone | The converted chart renders. CNPG leaves a role without an account Secret untouched, so the old passwords keep working, and tenants can no longer read them. A tenant mints a new one. |
+
+Once an operator fixes the cause, the next write through the API converts the release: while `<release>-credentials` still holds the plaintext the API derives the account Secret from it, and otherwise it seeds one and a mint follows.
+
 ## How MariaDB and ClickHouse differ
 
 | Step | MariaDB | ClickHouse |
