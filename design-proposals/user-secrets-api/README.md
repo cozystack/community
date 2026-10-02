@@ -219,8 +219,8 @@ The conversion rotates every platform password tenants could read:
 
 | Account | Consumer | Rotation |
 |---|---|---|
-| MariaDB `root` | mariadb-operator, which logs in with it on every SQL reconcile | the migration stores the new value in a platform-only Secret, runs `ALTER USER` with the current root password, then writes it into `<release>-credentials`, and a retry tries both passwords |
-| ClickHouse `backup` | the backup CronJob, and the backup sidecar through its environment | the migration writes a new value and forces a release upgrade, which applies its hash and restarts the ClickHouse pods once for the sidecar |
+| MariaDB `root` | mariadb-operator, which logs in with it on every SQL reconcile | the converter stores the new value in a platform-only Secret, runs `ALTER USER` with the current root password, then writes it into `<release>-credentials`, and a retry tries both passwords |
+| ClickHouse `backup` | the backup CronJob, and the backup sidecar through its environment | the converter writes a new value and forces a release upgrade, which applies its hash and restarts the ClickHouse pods once for the sidecar |
 | OpenSearch admin | the operator reads `<release>-admin-credentials`, and `<release>-credentials` holds a copy | with the OpenSearch conversion, in wave 2 |
 | Harbor Redis | Flux, through `valuesFrom` | with the Harbor conversion, when its admin password moves out |
 
@@ -289,13 +289,11 @@ Kubernetes access credentials hold no password and stay at their CA. A managed c
 
 A kind converts in one release. The conversion is announced ahead of it, in release notes and on the kind's credential view, so users can store passwords they still need. The API serves, seeds and mints for a kind only from its converting release, so it never overwrites a password the old chart still applies.
 
-The converting release ships the converted chart and a numbered platform migration. Migrations run as a pre-upgrade hook of the platform release, before any component chart changes version (`packages/core/platform/templates/migration-hook.yaml:27-60`), in every platform variant that installs managed applications. For each release of the kind the migration:
+The converting release ships the converted chart and a numbered platform migration in two parts. The first is a pre-upgrade hook of the platform release, before any component chart changes version (`packages/core/platform/templates/migration-hook.yaml:27-60`), in every platform variant that installs managed applications. For each release of the kind it writes the account Secrets with the verifiers of the passwords in `<release>-credentials`, origin `Migrated`, so clients keep working. That is additive: nothing an old chart reads changes, so an old chart that renders before the switch breaks nothing.
 
-1. Writes the account Secrets with the verifiers of the passwords in `<release>-credentials`, origin `Migrated`, so clients keep working.
-2. Removes any leftover `users.*.password` from the HelmRelease values.
-3. Deletes the tenant keys from `<release>-credentials`, which a client-side apply would otherwise leave in its `data`, and deletes the Secret where no platform account remains, as in postgres.
+Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. For a Secret that exists already this label is the closure, because the webhook stamped it at first admission and skips the object since. For one created while a definition still selects the name, the lineage webhook learns to keep an explicit `"false"` instead of overwriting it, which is why Rollout step 2 ships first. No field ownership moves, since the API takes over no object Helm owns.
 
-Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. For a Secret that exists already this label is the closure, because the webhook stamped it at first admission and skips the object since. For one created while a definition still selects the name, the lineage webhook learns to keep an explicit `"false"` instead of overwriting it, which is why Rollout step 2 ships first. No field ownership moves, since the API takes over no object Helm owns. Only then, in a post-upgrade phase and release by release (Open questions), does the migration rotate the platform passwords of §4, because until the read routes close, tenants can read `<release>-credentials` and would read the new values.
+The second part is a converter, the code that a write through the API also runs. For a release that is Ready on the converted revision, so with the read routes closed, it removes any leftover `users.*.password` from the HelmRelease values, deletes the tenant keys from `<release>-credentials` (a client-side apply would otherwise leave them in its `data`) and the Secret itself where no platform account remains, as in postgres, and rotates the platform passwords of §4. It suspends the release while a value changes, so that no render writes the old one back, and forces the upgrade ClickHouse needs to apply a new `backup` hash. It is idempotent, records on the HelmRelease that it is done, and skips a left-out release until that release converts.
 
 The migration degrades per release, never per fleet. A failing migration stops the whole platform upgrade, so a release it cannot convert (its Secret gone, two users mapping to one name, a user named `app` in postgres) is left out and reported in the migration log and with an Event on its HelmRelease. A left-out release keeps its previous revision, old credentials working and exposed as before, except a PostgreSQL release whose Secret was gone: that takes the converted chart, its database keeps the old passwords, and tenants can no longer read them, so a tenant mints ([the cases](./example.md#when-the-migration-leaves-a-release-out)). Once an operator fixes the cause, the next write through the API converts the release with the same code: while `<release>-credentials` still holds the plaintext, the API derives the account Secret from it, and otherwise it seeds one and a mint follows.
 
@@ -309,7 +307,7 @@ Each read route, for converted kinds:
 
 | Route | Tenant accounts | Platform accounts |
 |---|---|---|
-| 1. Application spec | no password field (cozystack/cozystack#4078 for postgres and mariadb, the conversion for the others), and the migration removes leftovers | never in the spec |
+| 1. Application spec | no password field (cozystack/cozystack#4078 for postgres and mariadb, the conversion for the others), and the converter removes leftovers | never in the spec |
 | 2. `tenantsecrets` | no definition selects an account Secret | `<release>-credentials` is rendered not tenant-visible |
 | 3. Name grants | none | none, which closes cozystack/cozystack#4164 for converted kinds |
 | 4. Helm history | no tenant password in a converted revision, and older revisions keep the pre-conversion value until `MaxHistory` drops them (hence the `Migrated` origin) | open by decision: chart-rendered plaintext, readable only by management-cluster administrators and platform components |
@@ -337,7 +335,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 - A restore in place → account Secrets and records stay, and the operators apply the current values over the restored catalog. For PostgreSQL CNPG does it once the restored primary is up, replacing the init-job run and the `credentials-pending` annotation of today's restore path.
 - A restore into a new application → new records and seeds, and the restored accounts need a mint, as they need new passwords today.
 - An application is deleted → its account Secrets go with its HelmRelease, and the audit trail remains.
-- The migration is interrupted → it is idempotent, and the next run converts what is left.
+- The hook or the converter is interrupted → both are idempotent, and the next run finishes what is left.
 - A `password` left in the values of a converted kind → dropped with an admission warning pointing at mint, extending the warning cozystack/cozystack#4078 added for postgres and mariadb.
 
 ## Testing
@@ -349,7 +347,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 - No foreign secret, end to end with a parent and two sibling tenants: `tenantsecrets` never lists an account Secret or `<release>-credentials`, a sibling can neither read nor mint a tenant's credentials, and a parent's mint shows in the child's record.
 - No second disclosure, end to end for each wave-1 engine: mint, log in, and find the password on no read path (the Credential, `tenantsecrets`, a direct `get` on the Secret, the application, Events, the audit log, the Helm history of the converted revision). Then mint again and see the first password fail, once `status.engine` says Applied for PostgreSQL and ClickHouse, and by polling a login for MariaDB.
 - Live checks on the pinned versions ran on plain operator objects. [`verification.md`](./verification.md) lists what held, the audit run included. The same checks through the converted charts and the Cozystack API, with the audit run on `core.cozystack.io`, are still to run.
-- The migration: clients keep logging in, accounts show origin `Migrated`, no `users.*.password` remains, rotated platform passwords work, and no tenant route reads a converted release's `<release>-credentials`. A release it leaves out does what its cause says in [`example.md`](./example.md#when-the-migration-leaves-a-release-out).
+- The migration and the converter: clients keep logging in at every point, including while an old chart renders between the hook and the switch, accounts show origin `Migrated`, no `users.*.password` remains, a converter stopped between `ALTER USER` and the Secret write recovers on retry, rotated platform passwords work, and no tenant route reads a converted release's `<release>-credentials`. A release it leaves out does what its cause says in [`example.md`](./example.md#when-the-migration-leaves-a-release-out).
 - Audit: a mint appears in the kube-apiserver log with `objectRef.subresource: mint` and the Credential's name.
 
 ## Rollout
@@ -357,7 +355,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 1. This proposal is accepted.
 2. Independent change: the lineage webhook keeps an explicit `tenantresource: "false"` and still overwrites a chart-set `"true"`.
 3. The Cozystack API gains `credentials`, `mint`, `revoke`, seeding and the adapters for PostgreSQL, MariaDB and ClickHouse, serving no kind yet, with the Event and its RBAC. The documentation gets the audit policies, and monitoring-agents the output value.
-4. Wave 1: PostgreSQL and MariaDB convert once the checks left under Testing pass and the migration-ordering open question is settled, and ClickHouse with them or a release later.
+4. Wave 1: PostgreSQL and MariaDB convert once the checks left under Testing pass, and ClickHouse with them or a release later.
 5. Wave 2: OpenSearch, NATS, RabbitMQ, Redis and Valkey, each with its §3 row and the plaintext in its account Secret.
 6. Wave 3: MongoDB, Bucket, VPN, Qdrant, Harbor and Monitoring, the same way. Kafka joins whichever wave is open once its chart has users.
 7. After this proposal, as separate tasks: each wave-2 engine moves from stored plaintext to a verifier.
@@ -365,7 +363,6 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 ## Open questions
 
 - Whether MariaDB gets a real engine state by reading the stored hash back through a privileged connection (§3), or stays `Unknown`.
-- How the migration runs after the charts have switched. Rotating the platform passwords of §4 has to wait, per release, until its HelmRelease is Ready on the converted revision, keep it suspended while the value changes, force the upgrade that applies ClickHouse's new `backup` hash, skip left-out releases, and also reach a release converted later by an API write. Step 3 could run in that phase too, or the migration could suspend the kind's HelmReleases before step 2 until the switch, because an old chart that renders in between generates new random tenant passwords, which clients lose and tenants can read until the converted chart applies the `Migrated` verifiers.
 
 ## Alternatives considered
 

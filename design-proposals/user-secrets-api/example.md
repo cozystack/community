@@ -224,7 +224,7 @@ stringData:
   web: "<16 characters>"
 ```
 
-The release that converts PostgreSQL runs a migration before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, removes a `users.web.password` if one was left in the HelmRelease values, and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
+The release that converts PostgreSQL runs a hook before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, and touches nothing else. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. Once the release is Ready on the new chart, the converter removes a `users.web.password` if one was left in the HelmRelease values and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
 
 ## When the migration leaves a release out
 
