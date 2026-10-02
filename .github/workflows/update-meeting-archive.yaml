@@ -66,6 +66,6 @@ jobs:
           fi
           gh pr create \
             --title "docs(meetings): add newly published meeting recordings" \
-            --body "$(printf '%s\n\n%s\n' "$SUMMARY" "The Topics column is left empty on purpose — fill it in from the meeting notes before merging. Dates are derived from the publication date of the recording, snapped to the meeting's Thursday.")" \
+            --body "$(printf '%s\n\n%s\n' "$SUMMARY" "The Topics column is left empty on purpose — fill it in from the meeting notes before merging. Dates are read from the meeting date in the video title or description; any derived from the publication date instead are listed above for checking.")" \
             --head update-meeting-archive \
             --base main
