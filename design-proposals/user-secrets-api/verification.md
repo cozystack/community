@@ -20,14 +20,14 @@ Two `User` objects pointed `passwordHashSecretKeyRef` at their own Secrets holdi
 
 ## ClickHouse: clickhouse-operator 0.25.2 and ClickHouse 25.8
 
-The `password_sha256_hex` of a user in a `ClickHouseInstallation` was changed to the hash of another password. The new password worked after 32 s and the old one was rejected. The pod kept its UID and had no container restart, and the new hash was in the `chop-generated-users.xml` key of `chi-<chi>-common-usersd`. The installation still reported `InProgress` when the new password first worked. The path from an account Secret through `valuesFrom` and the chart to the installation was not run as a whole.
+The `password_sha256_hex` of a user in a `ClickHouseInstallation` was changed to the hash of another password, on 25.8.32.4 and on 24.9.2.42, the chart's default. The new password worked after 32 s on 25.8 and after 63 s on 24.9, and the old one was rejected. The pod kept its UID and had no container restart, and the new hash was in the `chop-generated-users.xml` key of `chi-<chi>-common-usersd`. The installation still reported `InProgress` when the new password first worked. The path from an account Secret through `valuesFrom` and the chart to the installation was not run as a whole.
 
 ## Flux: helm-controller 1.5.0
 
 A `HelmRelease` of a public chart carried `valuesFrom` entries on Secrets that did not exist yet.
 
 - Install failed with `ValuesError` and no release, installed once the Secret appeared at the next reconcile, and refused an upgrade after the Secret was deleted again, keeping its revision and replica count. Helm stored only the value that was read.
-- A `targetPath` accepts only letters, digits and `_-./\`, or `[n]`, so a user name with a comma cannot be the path: the CRD validation rejects it. The value is parsed as a Helm `--set` string, so a comma in the value fails the entry with `key "d" has no value`. A dot in the value is fine. Entries addressed by list position, `_accounts[0]`, worked, and a gap in the positions left a `null`.
+- A `targetPath` accepts only letters, digits and `_-./\`, or `[n]`, so a user name with a comma cannot be the path: the CRD validation rejects it. The value is parsed as a Helm `--set` string, so a comma in the value fails the entry with `key "d" has no value`. A dot in the value is fine. Entries addressed by list position, `_accounts[0]`, worked, but a gap in the positions left a `null`. Entries keyed by the SHA-256 of the user name, `_accounts.u<hex>`, worked for the names `a,b` and `c.d`, which appear in neither the path nor the value, and Helm stored a map from digest to hash.
 
 ## kube-apiserver audit: v1.34.0 and v1.37.0
 

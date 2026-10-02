@@ -230,7 +230,7 @@ The release that converts PostgreSQL runs a migration before any chart changes. 
 
 | Step | MariaDB | ClickHouse |
 |---|---|---|
-| 2, the account Secret | labelled `k8s.mariadb.com/watch`, `password` holds `PASSWORD()` output (`*` and 40 hex digits) | labelled `reconcile.fluxcd.io/watch: Enabled`, `password` holds the SHA-256 hex, and the HelmRelease gets a `valuesFrom` entry for the Secret, read by list position |
+| 2, the account Secret | labelled `k8s.mariadb.com/watch`, `password` holds `PASSWORD()` output (`*` and 40 hex digits) | labelled `reconcile.fluxcd.io/watch: Enabled`, `password` holds the SHA-256 hex, and the HelmRelease gets a `valuesFrom` entry for the Secret, keyed by a digest of the user name |
 | 3, the chart | the `User` points `passwordHashSecretKeyRef` at the account Secret | the chart renders `password_sha256_hex` into the CHI from the value that entry supplies |
 | 7, applying a new value | the operator re-runs `ALTER USER`, and the engine state stays `Unknown` | helm-controller upgrades the release, the operator rewrites `chi-<chi>-common-usersd`, and the state is Applied once the CHI reconcile completes on every host |
 | Conversion | `<release>-credentials` keeps `root`, which the migration rotates with `ALTER USER` | `<release>-credentials` keeps `backup`, which the migration rotates, restarting the ClickHouse pods once |
