@@ -131,11 +131,11 @@ The identity of an account is its Secret's UID. It stays the same across reconci
 
 The Cozystack API keeps account Secrets in step with `users` whenever it creates or updates an application of a converted kind, whichever client sent the request (the dashboard, `kubectl`, an external API consumer):
 
-1. For each user in `users` without an account Secret, or with one left from a deleted application of the same name, it writes a new Secret with the verifier of a random password that it throws away, origin `NotIssued`. The user then exists in the database, and nobody can log in as it until someone mints.
+1. For each user in `users` without an account Secret, or with one that is not theirs (left from a deleted application of the same name, or holding another `username`), it writes a new Secret with the verifier of a random password that it throws away, origin `NotIssued`. The user then exists in the database, and nobody can log in as it until someone mints.
 2. It writes the HelmRelease. On create, the Secrets from step 1 get the new HelmRelease as their owner right after.
 3. It deletes the account Secrets of users that are no longer in `users`.
 
-Two users whose names map to the same object name are refused.
+Two users whose names map to the same object name, or to one that is not a valid DNS name, are refused.
 
 ### 2. Mint and revoke
 
@@ -159,7 +159,7 @@ This is the pattern of Kubernetes `TokenRequest`: a `create` on a subresource of
 3. Writes that value and the updated record into the account Secret, in one update that fails if the Secret changed since the caller read it.
 4. Returns the plaintext in the response.
 
-The plaintext exists in the API server's memory for the length of the request and in the response. After a second mint the first password is dead: unlike a token, which is added next to the others, a password is replaced. A mint on a declared user whose Secret is missing recreates it with a new identity, and one on an undeclared user answers NotFound.
+The plaintext exists in the API server's memory for the length of the request and in the response. After a second mint the first password is dead: unlike a token, which is added next to the others, a password is replaced. A mint on a declared user whose Secret is missing recreates it with a new identity, one on an undeclared user answers NotFound, and one on a user whose name maps to another declared user's answers Conflict.
 
 `revoke` takes the same body, writes into the account Secret the verifier of a new random password, throws that password away and returns nothing secret, so nobody holds a working password. It retires a leaked password when nobody should get a new one yet. Neither call lets the caller choose the password.
 
@@ -198,7 +198,7 @@ Each `User` swaps `passwordSecretKeyRef` for `passwordHashSecretKeyRef` pointing
 
 ClickHouse has no route from a Secret to the engine without a Helm run, so a ClickHouse mint costs a release upgrade and waits while the release is suspended. The operator watches no Secrets, `valueFrom.secretKeyRef` needs a pod restart per change, and `k8s_secret_password_sha256_hex` aborts the reconcile from operator 0.27.4. The one path that applies live is a hash inline in the CHI: the operator rewrites the `chi-<chi>-common-usersd` ConfigMap without a restart, and ClickHouse re-reads `users.d` every two seconds.
 
-The chart already renders that hash. After conversion it takes it from values that the HelmRelease pulls from the account Secrets, through one `valuesFrom` entry per account. Both the API (`rest.go:1721-1726`) and the ApplicationDefinition reconciler (`internal/controller/applicationdefinition_helmreconciler.go:148-156`) pin `valuesFrom` to `cozystack-values` today, so both compute the new list with one function, and the reconciler writes it onto existing releases. Each entry reads the Secret's `password` into `_accounts.u<hex>`, where `<hex>` is the SHA-256 of the user name, and the chart looks each declared user up by the same digest. A user name fits neither the `targetPath` nor the value (a comma fails the entry), while a hex digest fits both and leaves no order to keep aligned. The chart's own check is on its values: it fails the render when a declared account has no verifier in them, as a HelmRelease written around the API leaves it, because the operator would give such an account the password `default`, and it refuses tenant accounts named `backup`, `default` or `clickhouse_operator`.
+The chart already renders that hash. After conversion it takes it from values that the HelmRelease pulls from the account Secrets, through one `valuesFrom` entry per account. Both the API (`rest.go:1721-1726`) and the ApplicationDefinition reconciler (`internal/controller/applicationdefinition_helmreconciler.go:148-156`) pin `valuesFrom` to `cozystack-values` today, so both compute the new list with one function, and the reconciler writes it onto existing releases. Each entry reads the Secret's `password` into `_accounts.u<hex>`, where `<hex>` is the SHA-256 of the user name as `users` lists it, and the chart looks each declared user up by the same digest. A user name fits neither the `targetPath` nor the value (a comma fails the entry), while a hex digest fits both and leaves no order to keep aligned. The chart's own check is on its values: it fails the render when a declared account has no verifier in them, as a HelmRelease written around the API leaves it, because the operator would give such an account the password `default`, and it refuses tenant accounts named `backup`, `default` or `clickhouse_operator`.
 
 #### A declared account without a Secret
 
@@ -220,7 +220,7 @@ The conversion rotates every platform password tenants could read:
 | Account | Consumer | Rotation |
 |---|---|---|
 | MariaDB `root` | mariadb-operator, which logs in with it on every SQL reconcile | the migration stores the new value in a platform-only Secret, runs `ALTER USER` with the current root password, then writes it into `<release>-credentials`, and a retry tries both passwords |
-| ClickHouse `backup` | the backup CronJob, and the backup sidecar through its environment | the migration writes a new value, and the chart upgrade that follows applies its hash and restarts the ClickHouse pods once for the sidecar |
+| ClickHouse `backup` | the backup CronJob, and the backup sidecar through its environment | the migration writes a new value and forces a release upgrade, which applies its hash and restarts the ClickHouse pods once for the sidecar |
 | OpenSearch admin | the operator reads `<release>-admin-credentials`, and `<release>-credentials` holds a copy | with the OpenSearch conversion, in wave 2 |
 | Harbor Redis | Flux, through `valuesFrom` | with the Harbor conversion, when its admin password moves out |
 
@@ -295,7 +295,7 @@ The converting release ships the converted chart and a numbered platform migrati
 2. Removes any leftover `users.*.password` from the HelmRelease values.
 3. Deletes the tenant keys from `<release>-credentials`, which a client-side apply would otherwise leave in its `data`, and deletes the Secret where no platform account remains, as in postgres.
 
-Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. For a Secret that exists already this label is the closure, because the webhook stamped it at first admission and skips the object since. For one created while a definition still selects the name, the lineage webhook learns to keep an explicit `"false"` instead of overwriting it, which is why Rollout step 2 ships first. No field ownership moves, since the API takes over no object Helm owns. Only then, in a post-upgrade phase, does the migration rotate the platform passwords of §4, because until the read routes close, tenants can read `<release>-credentials` and would read the new values.
+Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. For a Secret that exists already this label is the closure, because the webhook stamped it at first admission and skips the object since. For one created while a definition still selects the name, the lineage webhook learns to keep an explicit `"false"` instead of overwriting it, which is why Rollout step 2 ships first. No field ownership moves, since the API takes over no object Helm owns. Only then, in a post-upgrade phase and release by release (Open questions), does the migration rotate the platform passwords of §4, because until the read routes close, tenants can read `<release>-credentials` and would read the new values.
 
 The migration degrades per release, never per fleet. A failing migration stops the whole platform upgrade, so a release it cannot convert (its Secret gone, two users mapping to one name, a user named `app` in postgres) is left out and reported in the migration log and with an Event on its HelmRelease. A left-out release keeps its previous revision, old credentials working and exposed as before, except a PostgreSQL release whose Secret was gone: that takes the converted chart, its database keeps the old passwords, and tenants can no longer read them, so a tenant mints ([the cases](./example.md#when-the-migration-leaves-a-release-out)). Once an operator fixes the cause, the next write through the API converts the release with the same code: while `<release>-credentials` still holds the plaintext, the API derives the account Secret from it, and otherwise it seeds one and a mint follows.
 
@@ -365,7 +365,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 ## Open questions
 
 - Whether MariaDB gets a real engine state by reading the stored hash back through a privileged connection (§3), or stays `Unknown`.
-- How the migration runs after the charts have switched. The rotation of §4 already needs a post-upgrade phase, and step 3 could move there too, or the migration could suspend the kind's HelmReleases before step 2 until the switch. An old chart that renders between step 3 and the switch, as step 2's own edit makes it, generates new random tenant passwords, which clients lose and tenants can read until the converted chart applies the `Migrated` verifiers.
+- How the migration runs after the charts have switched. Rotating the platform passwords of §4 has to wait, per release, until its HelmRelease is Ready on the converted revision, keep it suspended while the value changes, force the upgrade that applies ClickHouse's new `backup` hash, skip left-out releases, and also reach a release converted later by an API write. Step 3 could run in that phase too, or the migration could suspend the kind's HelmReleases before step 2 until the switch, because an old chart that renders in between generates new random tenant passwords, which clients lose and tenants can read until the converted chart applies the `Migrated` verifiers.
 
 ## Alternatives considered
 
