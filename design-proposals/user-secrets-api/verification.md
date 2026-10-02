@@ -18,7 +18,7 @@ Two `User` objects pointed `passwordHashSecretKeyRef` at their own Secrets holdi
 - With the label, the new password worked within 3 s and the old one was rejected. Without it, the change was not applied within 180 s.
 - With the Secret missing, a new `User` was `Ready=False` with `error reading user password hash secret`, and no SQL user was created. For an existing user the reconcile stopped the same way: the account stayed unlocked and unexpired, the old password kept working, and a changed `maxUserConnections` was not applied.
 
-## ClickHouse: clickhouse-operator 0.25.2 and ClickHouse 25.8
+## ClickHouse: clickhouse-operator 0.25.2, ClickHouse 25.8 and 24.9
 
 The `password_sha256_hex` of a user in a `ClickHouseInstallation` was changed to the hash of another password, on 25.8.32.4 and on 24.9.2.42, the chart's default. The new password worked after 32 s on 25.8 and after 63 s on 24.9, and the old one was rejected. The pod kept its UID and had no container restart, and the new hash was in the `chop-generated-users.xml` key of `chi-<chi>-common-usersd`. The installation still reported `InProgress` when the new password first worked. The path from an account Secret through `valuesFrom` and the chart to the installation was not run as a whole.
 
