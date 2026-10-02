@@ -5,7 +5,7 @@
 - **Author(s):** `@kvaps`
 - **Date:** `2026-06-23`
 - **Status:** Accepted
-- **Revision (this PR):** Supersedes the preset-field revision (#27). ComputePlane is delivered as a Cozystack-owned **Tenant module** (`packages/extra/computeplane`) that, under the hood, deploys the ordinary `apps/kubernetes` chart with operator-fixed values, sourced through the existing PackageSource "source-only chart" mechanism (the same one NATS and SeaweedFS use — only the wrapped chart comes from `apps/` instead of `system/`). Like every Cozystack managed service, the module registers its **own `apps.cozystack.io` kind** (`ComputePlane`, via an `ApplicationDefinition` with `dashboard.module: true`) — its own API endpoint and input schema, served by `cozystack-api` and converted to a HelmRelease. So this is **not** the literal "no new kind" surface #27 aimed for; the honest positioning is: no new **CRD**, no new **controller / reconcile path**, and **no fields added to `kind: Kubernetes`** — the `ComputePlane` kind is a thin operator-owned wrapper over the unchanged `apps/kubernetes`. The tenant gets the *same* `kind: Kubernetes` cluster but owns none of its settings — only the knobs the operator exposes. The isolation mechanism (remote Flux apply onto Kamaji+KubeVirt, untrusted code behind a per-VM kernel boundary) is unchanged from the merged first revision; this revision is about the **delivery surface**.
+- **Supersedes:** the preset-field revision (#27) — the delivery surface and why the preset fields were set aside are recorded in [decision 0001](./decisions/0001-computeplane-ships-as-an-operator-owned-module.md).
 
 ## Overview
 
@@ -35,6 +35,10 @@ The capability is generic and intended to live in Cozystack core as a reusable p
 - **`design-proposals/cross-cluster-tenant-mesh`** (PR #7): the trust model for managed clusters (one-way host → tenant, no host kube-API). A *trusted* variant of the module could wire the cluster into that data-plane mesh; the default `sandbox` module deliberately does **not** — only narrow per-service egress (Design §5).
 - **`design-proposals/kubernetes-nodes-split`** / **`kubernetes-nodes-hybrid-clusters`** (PR #8/#9): the substrate is the existing managed-`kubernetes` app (Kamaji + CAPI/KubeVirt); node-provisioning changes apply transparently.
 - **Deferred:** billing/metering of cluster resource and API consumption; secret delivery of managed-service connection strings into sandbox workloads; the per-instance/label granularity of the visibility control (Design §6). (Cross-tenant *sharing* of a cluster is **not** deferred — it is rejected by design; see Non-goals.)
+
+## Decisions
+
+- [0001. ComputePlane ships as an operator-owned module, not as preset fields on `kind: Kubernetes`](./decisions/0001-computeplane-ships-as-an-operator-owned-module.md) — why the preset-field revision (#27) was set aside.
 
 ## Context
 

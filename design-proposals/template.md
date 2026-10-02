@@ -20,6 +20,18 @@ A reader who stops here should know what you're asking for and roughly why. -->
 Link them by repo path or URL. If this proposal must land before or after
 another, say so. Omit the section if there are no related proposals. -->
 
+## Decisions
+
+<!-- Leave this empty in the initial PR; fill it in as implementation
+proceeds. Records live in this proposal's own directory, numbered from
+0001. Link each one here, newest first:
+
+- [0001. Short statement of what was decided](./decisions/0001-short-slug.md) — one clause on what it settled.
+
+Where implementation changed the design, the record is what explains why
+— this section is how a reader of the proposal finds that out.
+See ../README.md#decision-records. -->
+
 ## Context
 
 <!-- Background a reader needs to evaluate the proposal.
