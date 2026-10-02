@@ -202,7 +202,7 @@ The chart already renders that hash. After conversion it takes it from values th
 
 #### A declared account without a Secret
 
-A chart cannot see at render time whether a Secret exists except through `lookup`, which the Flux digest does not see and which this proposal removes for tenant accounts. The engines refuse on their own, as run on the pinned versions ([`verification.md`](./verification.md)): CNPG leaves the role as it is and reports `cannotReconcile`, mariadb-operator sets the `User` to `Ready=False` and leaves the SQL user untouched, and Flux stops a ClickHouse release with `ValuesError`, which keeps its previous revision.
+A chart cannot see at render time whether a Secret exists except through `lookup`, which the Flux digest does not see and which this proposal removes for tenant accounts. The engines refuse on their own ([`verification.md`](./verification.md)): CNPG leaves the role as it is and reports `cannotReconcile`, mariadb-operator sets the `User` to `Ready=False` and leaves the SQL user untouched, and Flux stops a ClickHouse release with `ValuesError`, which keeps its previous revision.
 
 #### How the engine state is known
 
@@ -331,7 +331,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 - The engine's operator is down, or the database is not ready → the mint succeeds and `status.engine` stays Pending (Unknown for MariaDB), with the old password working until the engine applies the new one.
 - A ClickHouse release is suspended or failing → the mint is accepted and stays Pending until the release upgrades.
 - A user leaves `users` while a mint for it is in flight → NotFound or Conflict, and no password.
-- An account Secret deleted by hand → the engine keeps the account as it is (§3) and a ClickHouse release keeps its previous revision, until a mint recreates the Secret with a new password and identity. A ClickHouse user added or renamed around the API → the values check fails the render until the next write through the API rewrites the list. The account shows Failed in both.
+- An account Secret deleted by hand → the engine keeps the account as it is (§3) and a ClickHouse release keeps its previous revision, until a mint recreates the Secret with a new password and identity. A ClickHouse user added or renamed around the API → the values check fails the render until the next write through the API rewrites the list. The account shows Failed.
 - A create that fails after the Secrets were written, or a delete with orphan propagation → Secrets no current HelmRelease owns, which the next create under that name replaces instead of reusing.
 - Deleting a converted application whose release is suspended → refused, because Flux skips the uninstall of a suspended release and would leave the database running with its last passwords after the account Secrets are gone. This is new Application API behaviour and goes in the release note.
 - A PostgreSQL name that makes CNPG's webhook reject the whole Cluster → refused at render, as `postgres` is today. That covers roles CNPG reserves (`streaming_replica`, anything starting with `pg_` or `cnpg_`), a database whose derived `<db>_admin` role would be reserved, an account named like a derived role, and an account named `app`, the owner CNPG creates at initdb and whose password its instance manager resets from `<release>-app` on every start.
@@ -344,7 +344,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 ## Testing
 
 - API unit tests: passwords are 32 characters from the stated alphabet and `crypto/rand`, every verifier checks out against a reference implementation (PostgreSQL's SCRAM, MariaDB's `PASSWORD()`, SHA-256) with the SCRAM form canonical, conflicts return no password, and a captured log and event recorder never see the plaintext. The API-change gate learns the subresource keys its storage-key pattern skips today.
-- Chart unit tests on each converted chart: no tenant password in any rendered object, the engine points at the account Secret, neither account Secrets nor `<release>-credentials` are granted or selected, `<release>-credentials` renders `tenantresource: "false"` and no rendered Secret carries `"true"`, the ClickHouse render fails for a declared account with no verifier in its values, and reserved or colliding names are refused.
+- Chart unit tests on each converted chart: no tenant password in any rendered object, the engine points at the account Secret, neither account Secrets nor `<release>-credentials` are granted or selected, `<release>-credentials` renders `tenantresource: "false"` and no rendered Secret carries `"true"`, the ClickHouse render fails for a declared account with no verifier in its values, and reserved or colliding names are refused. API and reconciler build the same `valuesFrom` list.
 - Writes through `tenantsecrets`, whose code has no tests today: no tenant tier holds a write verb on it, and an update or delete through it on an account Secret or on `<release>-credentials` answers NotFound.
 - Lineage webhook: an explicit `"false"` is kept where a definition selects the Secret, and a chart-set `"true"` is overwritten.
 - No foreign secret, end to end with a parent and two sibling tenants: `tenantsecrets` never lists an account Secret or `<release>-credentials`, a sibling can neither read nor mint a tenant's credentials, and a parent's mint shows in the child's record.
@@ -358,7 +358,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 1. This proposal is accepted.
 2. Independent change: the lineage webhook keeps an explicit `tenantresource: "false"` and still overwrites a chart-set `"true"`.
 3. The Cozystack API gains `credentials`, `mint`, `revoke`, seeding and the adapters for PostgreSQL, MariaDB and ClickHouse, serving no kind yet, with the Event and its RBAC. The documentation gets the audit policies, and monitoring-agents the output value.
-4. Wave 1: PostgreSQL and MariaDB convert once the checks left under Testing pass and that open question is settled, and ClickHouse with them or a release later.
+4. Wave 1: PostgreSQL and MariaDB convert once the checks left under Testing pass and the migration-ordering open question is settled, and ClickHouse with them or a release later.
 5. Wave 2: OpenSearch, NATS, RabbitMQ, Redis and Valkey, each with its §3 row and the plaintext in its account Secret.
 6. Wave 3: MongoDB, Bucket, VPN, Qdrant, Harbor and Monitoring, the same way. Kafka joins whichever wave is open once its chart has users.
 7. After this proposal, as separate tasks: each wave-2 engine moves from stored plaintext to a verifier.
