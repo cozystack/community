@@ -224,7 +224,7 @@ stringData:
   web: "<16 characters>"
 ```
 
-The release that converts PostgreSQL runs a hook before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, and touches nothing else. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. Once the release is Ready on the new chart, the converter removes a `users.web.password` if one was left in the HelmRelease values and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
+The release that converts PostgreSQL runs a hook before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, and touches nothing else. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. Once the release is Ready on the new chart, the Job removes a `users.web.password` if one was left in the HelmRelease values and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
 
 ## When the migration leaves a release out
 
@@ -246,4 +246,4 @@ Once an operator fixes the cause, the next write through the API starts the conv
 | 2, the account Secret | labelled `k8s.mariadb.com/watch`, `password` holds `PASSWORD()` output (`*` and 40 hex digits) | labelled `reconcile.fluxcd.io/watch: Enabled`, `password` holds the SHA-256 hex, and the HelmRelease gets a `valuesFrom` entry for the Secret, keyed by a digest of the user name |
 | 3, the chart | the `User` points `passwordHashSecretKeyRef` at the account Secret | the chart renders `password_sha256_hex` into the CHI from the value that entry supplies |
 | 7, applying a new value | the operator re-runs `ALTER USER`, and the engine state stays `Unknown` | helm-controller upgrades the release, the operator rewrites `chi-<chi>-common-usersd`, and the state is Applied once the CHI reconcile completes on every host |
-| Conversion | `<release>-credentials` keeps `root`, which the converter rotates with `ALTER USER` | `<release>-credentials` keeps `backup`, which the converter rotates, restarting the ClickHouse pods once |
+| Conversion | `<release>-credentials` keeps `root`, which the Job rotates with `ALTER USER` | `<release>-credentials` keeps `backup`, which the Job rotates, restarting the ClickHouse pods once |
