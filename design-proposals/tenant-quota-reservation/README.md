@@ -7,25 +7,35 @@
 
 ## Overview
 
-A tenant quota is declared in instance-type units (`cpu: 8`, `memory: 16Gi`, the same units the tenant buys and the dashboard shows) but enforced in pod units, because the numbers are ultimately compared against `ResourceQuota.status.used`, which counts the requests and limits of virt-launcher and application pods. Those two scales do not match. A `u1.small` VM (1 vCPU / 4Gi guest) produces a virt-launcher pod that requests the guest memory **plus** KubeVirt's virtualization overhead, so a tenant whose 16Gi quota is fully allocated to declared VMs cannot start the last one. The gap is additive per VM, not proportional to the amount reserved, which is why the `--tenant-quota-buffer-percent` knob added alongside hierarchical quotas cannot be set correctly: the buffer a tenant needs ranges from roughly +6% to +183% depending only on how finely it slices its VMs.
+A tenant quota is declared in instance-type units (`cpu: 8`, `memory: 16Gi`, the units a tenant sizes its applications in) but enforced in pod units, because the numbers are ultimately compared against `ResourceQuota.status.used`, which counts the requests and limits of virt-launcher and application pods. Those two scales do not match. A `u1.small` VM (1 vCPU / 4Gi guest) produces a virt-launcher pod that requests the guest memory **plus** KubeVirt's virtualization overhead, so a tenant whose 16Gi quota is fully allocated to declared VMs cannot start the last one. The gap is additive per VM, not proportional to the amount reserved, which is why the `--tenant-quota-buffer-percent` knob added alongside hierarchical quotas cannot be set correctly: the buffer a tenant needs ranges from roughly +6% to +183% depending only on how finely it slices its VMs.
 
 There is a second and more basic problem behind the reported symptom: no quota gate stands in front of an ordinary application order at all. `validateTenantResourceQuotas` runs only for the `Tenant` kind, so creating a VM is checked against nothing until pod admission refuses it, minutes and several layers later.
 
-This proposal makes **reservation** the accounting authority. A tenant's consumption becomes the sum of the sizes declared in its `apps.cozystack.io` custom resources, evaluated at admission in the aggregated apiserver, using a declarative `spec.reservation` block carried by each `ApplicationDefinition`, and the gate is generalized to every kind so that an over-quota order is refused when it is made. The hierarchical pool arithmetic in `internal/controller/tenantquota` is kept exactly as it is — `ComputePools`, carve-outs, shared pools, overcommit reporting — and what changes is the vocabulary it is fed: both the usage it counts and the budget it counts against move from rendered pod-unit `ResourceQuota` objects to declared values. The per-pod **operational** limit is unaffected: it is already set by each operator from the same instance type, and tenants cannot bypass it because they have no `create` verb on pods.
+This proposal makes the **reservation** the accounting authority. What a tenant's pool has consumed becomes the sum of the reservations of the `apps.cozystack.io` applications in it, evaluated from their declared values when they are written, and the gate is generalized to every kind so that an order that does not fit the budget is refused when it is made. The hierarchical pool arithmetic in `internal/controller/tenantquota` is kept exactly as it is — `ComputePools`, carve-outs, shared pools, overcommit reporting — and what changes is the vocabulary it is fed: both what a pool has consumed and the budget it counts against move from rendered pod-unit `ResourceQuota` objects to declared values. The per-pod **operational** limit is unaffected: it is already set by each operator from the same instance type, and tenants cannot bypass it because they have no `create` verb on pods.
+
+### Terminology
+
+Three words carry the whole proposal and are used in exactly one sense each:
+
+- A **reservation** is the figure an application consumes: a class-keyed resource list computed from its declared values, before anything runs.
+- A **budget** is the limit a tenant was granted, declared in its `resourceQuotas`.
+- An application **consumes**, or **counts against**, a **pool**: the budget of the nearest ancestor tenant that declares one, shared with every other application in that pool's member namespaces.
+
+A change to the rule that computes a kind's reservation is a **re-evaluation**.
 
 ## Scope and related proposals
 
-This proposal touches the `ApplicationDefinition` shape and the tenant contract, so it intersects several in-flight designs. In every case the interaction is composition rather than conflict, but the ordering matters.
+This proposal is about quotas: what a declared application consumes from a tenant's budget, decided when the object is written. It touches the `ApplicationDefinition` shape and the tenant contract, so it intersects several in-flight designs. In every case the interaction is composition rather than conflict, but the ordering matters.
 
-- **[Out-of-tree app catalogs](https://github.com/cozystack/community/pull/43)** proposes splitting the managed-application catalog out of the core repository. This turns the "declarative, not Go" choice in [§2](#2-specreservation-on-applicationdefinition) from a preference into a requirement: a cost function implemented as a `switch` over kinds inside the aggregated apiserver cannot describe an application whose package lives in another repository. Reservation has to travel with the package.
-- **[Fold `extra` into `apps`](https://github.com/cozystack/community/pull/39)** makes tenant modules regular applications and moves their distinguishing traits into declarative capabilities on `ApplicationDefinition`. It sets the precedent this proposal follows, per-kind behavior expressed as data on the definition rather than as a directory or a code branch, and it resolves one of the [open questions](#open-questions) below: once `monitoring`, `ingress`, `etcd` and `seaweedfs` are applications, they carry their own `reservation` block and are charged like any other application, instead of being special-cased from the Tenant's boolean flags.
-- **`proposal/application-definition-versioning`** (branch on this repository, by `@kvaps`, not yet a PR) splits `ApplicationDefinition` into per-version `ApplicationSchema` objects and converts tenant-supplied values into a single **storage version** before persisting them into the HelmRelease. The two compose cleanly: reservation is evaluated against the storage form, so an application declares its reservation **once**, against the storage version, and served versions inherit it through the existing conversion. If that proposal lands first, `spec.reservation` moves to the storage-version `ApplicationSchema` with no change in semantics.
-- **[Public IPs as a first-class resource](https://github.com/cozystack/community/pull/35)** would make a public address a `PublicIPClaim` rather than an implicit consequence of `external: true`. The `objects:` block in [§2](#2-specreservation-on-applicationdefinition) is the interim form: when addresses become claimable objects, `services.loadbalancers` counting should follow the claims instead of the boolean.
-- **[`kubernetes-nodes-split`](../kubernetes-nodes-split/README.md)** (Accepted) has now landed in full. Phase 1 made `KubernetesNodes` a registered application kind with its own `ApplicationDefinition` (`packages/system/kubernetes-nodes-rd/cozyrds/kubernetes-nodes.yaml`), carrying `minReplicas`, `maxReplicas`, `instanceType`, `resources` and `diskSize` at the top level of its values. Phase 2 ([cozystack/cozystack#3315](https://github.com/cozystack/cozystack/pull/3315)) merged on 2026-08-26 and removed `spec.nodeGroups` from the `Kubernetes` CR, together with the implicit `md0` default. Worker-pool reservation is therefore a flat block on `KubernetesNodes` with nothing transitional about it, and no iteration over a parent's map is needed. The implicit default pool it retired did not disappear from the platform, though: it moved into the ComputePlane module, which is discussed in [§2](#2-specreservation-on-applicationdefinition).
-- **[Database Horizontal Autoscaler](../database-horizontal-autoscaling/README.md)** (Accepted) does **not** pass through this gate, and an earlier revision of this proposal said it did. The accepted DHA design is entirely stock: the application chart renders a KEDA `ScaledObject` whose `scaleTargetRef` is the CNPG `Cluster`, KEDA's managed HPA drives that CR's `scale` subresource, and the chart writes `spec.instances` as a **constant seed** — `max(replicas, effectiveMin)` — that the autoscaler never writes back to (`packages/apps/postgres/templates/scaledobject.yaml`, `templates/db.yaml`, `templates/_autoscaling.tpl`). The `Application`'s `replicas` value is untouched by any scaling decision, so no `Update` ever reaches admission. This is the same asymmetry this proposal already identifies for the cluster-autoscaler on worker pools, and it takes the same answer: **when `autoscaling.enabled` is set, the reservation is `autoscaling.maxReplicas`, not `replicas`.** See [§2](#2-specreservation-on-applicationdefinition) for the `ReservationItem` shape that requires.
+- **[Out-of-tree app catalogs](https://github.com/cozystack/community/pull/43)** proposes splitting the managed-application catalog out of the core repository. This turns the "declarative, not Go" choice in [§2](#2-consumption-declared-on-the-applicationdefinition) from a preference into a requirement: an evaluator implemented as a `switch` over kinds inside the aggregated apiserver cannot describe an application whose package lives in another repository. How a kind consumes has to travel with the package.
+- **[Fold `extra` into `apps`](https://github.com/cozystack/community/pull/39)** makes tenant modules regular applications and moves their distinguishing traits into declarative capabilities on `ApplicationDefinition`. It sets the precedent this proposal follows, per-kind behavior expressed as data on the definition rather than as a directory or a code branch. Tenant modules already consume through their own kinds today, since the tenant chart renders each one as a labelled application release; what #39 adds is a gate at the moment a module appears. [§5](#5-generalizing-the-gate-to-every-kind) states the fallback if #39 stalls.
+- **`proposal/application-definition-versioning`** (branch on this repository, by `@kvaps`, not yet a PR) splits `ApplicationDefinition` into per-version `ApplicationSchema` objects and converts tenant-supplied values into a single **storage version** before persisting them into the HelmRelease. The two compose cleanly: a reservation is evaluated against the storage form, so a kind declares its consumption **once**, against the storage version, and served versions inherit it through the existing conversion. If that proposal lands first, the declaration moves to the storage-version `ApplicationSchema` with no change in semantics.
+- **[Public IPs as a first-class resource](https://github.com/cozystack/community/pull/35)** would make a public address a `PublicIPClaim` rather than an implicit consequence of `external: true`. Counting `services.loadbalancers` from that boolean is the interim form: when addresses become claimable objects, the count should follow the claims instead.
+- **[`kubernetes-nodes-split`](../kubernetes-nodes-split/README.md)** (Accepted) has now landed in full. Phase 1 made `KubernetesNodes` a registered application kind with its own `ApplicationDefinition` (`packages/system/kubernetes-nodes-rd/cozyrds/kubernetes-nodes.yaml`), carrying `minReplicas`, `maxReplicas`, `instanceType`, `resources` and `diskSize` at the top level of its values. Phase 2 ([cozystack/cozystack#3315](https://github.com/cozystack/cozystack/pull/3315)) merged on 2026-08-26 and removed `spec.nodeGroups` from the `Kubernetes` CR, together with the implicit `md0` default. A worker pool's reservation is therefore read from the values of one flat kind, with nothing transitional about it and no iteration over a parent's map. The implicit default pool it retired did not disappear from the platform, though: it moved into the ComputePlane module, which is discussed in [§2](#2-consumption-declared-on-the-applicationdefinition).
+- **[Database Horizontal Autoscaler](../database-horizontal-autoscaling/README.md)** (Accepted) does **not** pass through this gate, and an earlier revision of this proposal said it did. The accepted DHA design is entirely stock: the application chart renders a KEDA `ScaledObject` whose `scaleTargetRef` is the CNPG `Cluster`, KEDA's managed HPA drives that CR's `scale` subresource, and the chart writes `spec.instances` as a **constant seed** — `max(replicas, effectiveMin)` — that the autoscaler never writes back to (`packages/apps/postgres/templates/scaledobject.yaml`, `templates/db.yaml`, `templates/_autoscaling.tpl`). The `Application`'s `replicas` value is untouched by any scaling decision, so no `Update` ever reaches admission. This is the same asymmetry this proposal already identifies for the cluster-autoscaler on worker pools, and it takes the same answer: **when `autoscaling.enabled` is set, the reservation is taken at `autoscaling.maxReplicas`, not `replicas`.** [§2](#2-consumption-declared-on-the-applicationdefinition) lists this among the things a kind's declaration must be able to express.
 
-  DHA also needs a matching amendment. Its §4 states that "quota is not re-implemented: the HPA scales the engine CR and pod creation passes through the tenant `ResourceQuota` admission, so an over-quota scale-up simply fails to create pods". Once the namespace `ResourceQuota` stops being the tenant contract ([§7](#7-retiring-the-namespace-resourcequota)) that sentence is no longer true, and the `Pending`-independent quota alert it asks the implementation to add ([cozystack/cozystack#3954](https://github.com/cozystack/cozystack/pull/3954)) loses the signal it was keyed on. Reserving the ceiling is what replaces it: the capacity is charged when autoscaling is enabled, so the scale-up cannot be refused at all.
-- Any new application kind, such as the one in [`compute-plane`](../compute-plane/README.md), needs a `reservation` block to participate in quotas. By design that is a data change in the package.
+  DHA also needs a matching amendment. Its §4 states that "quota is not re-implemented: the HPA scales the engine CR and pod creation passes through the tenant `ResourceQuota` admission, so an over-quota scale-up simply fails to create pods". Once the namespace `ResourceQuota` stops being the tenant contract ([§7](#7-retiring-the-namespace-resourcequota)) that sentence is no longer true, and the `Pending`-independent quota alert it asks the implementation to add ([cozystack/cozystack#3954](https://github.com/cozystack/cozystack/pull/3954)) loses the signal it was keyed on. Reserving the ceiling is what replaces it: the capacity counts against the pool as soon as autoscaling is enabled, so the scale-up cannot be refused at all.
+- Any new application kind, such as the one in [`compute-plane`](../compute-plane/README.md), needs to declare its consumption to participate in quotas. By design that is a data change in the package.
 - **Deferred to separate work:** the root cause of `ResourceQuota.status.used` going stale (a kube-controller-manager behavior, see [The problem](#the-problem)), drift alerting, and a remediation runbook for already-affected namespaces. This proposal removes that counter from the tenant-facing contract; it does not fix it.
 
 ## Context
@@ -90,7 +100,7 @@ Three failures. The first is the one that decides where the wall stands: there i
 
 **0. Nothing checks an application against a quota when it is ordered.** `validateTenantResourceQuotas` (`pkg/registry/apps/application/quota.go`) returns immediately unless `r.kindName` is `Tenant`, and its only call site in `REST.Create` sits inside `if r.kindName == "Tenant"`. Creating a `VMInstance`, a `Postgres` or a `KubernetesNodes` pool is therefore checked against no quota whatsoever; the first thing that says no is pod admission, several layers and several minutes later. Everything below decides *where* that wall stands — the overhead decides how far short of the declared figure it is, the stale counter can move it arbitrarily — but the missing gate is why it stands *behind* the order rather than in front of it. [§5](#5-generalizing-the-gate-to-every-kind) closes this, and it is the part of this proposal with the largest effect on what a tenant actually experiences: phases 1 to 3 alone turn a `CrashLoopBackOff` twenty minutes later into a refusal at the moment of the order, naming the pool and the size.
 
-**1. Additive virtualization overhead makes a correctly-sized quota unusable.** A virt-launcher pod requests the guest memory plus KubeVirt's computed overhead, which is a function of guest memory, vCPU count and attached devices: roughly 468Mi for a small single-vCPU guest, and larger with more vCPUs or devices. It is not a percentage of the guest. Because the tenant quota is set on the guest-side numbers the tenant was sold, any tenant that allocates its full quota is unable to start its workloads. Observed on tenant `fdmp` (2026-07-15), where `resourceQuotas.memory` had been set to exactly the guest RAM.
+**1. Additive virtualization overhead makes a correctly-sized quota unusable.** A virt-launcher pod requests the guest memory plus KubeVirt's computed overhead, which is a function of guest memory, vCPU count and attached devices: roughly 468Mi for a small single-vCPU guest, and larger with more vCPUs or devices. It is not a percentage of the guest. Because the tenant quota is set on the guest-side numbers the tenant declares, any tenant that allocates its full quota is unable to start its workloads. Observed on tenant `fdmp` (2026-07-15), where `resourceQuotas.memory` had been set to exactly the guest RAM.
 
 `--tenant-quota-buffer-percent` (`cmd/cozystack-controller/main.go`, applied by `ScaleResourceList`) inflates every pool budget by a fixed percentage to keep pre-existing workloads admissible. It cannot be set correctly, because the required inflation depends on VM granularity rather than on volume. For a 16Gi memory quota, taking ~468Mi of overhead per launcher:
 
@@ -108,26 +118,28 @@ And it never reached the case above. `BufferPercent` scales only `p.Available` o
 
 Before v1.6.0 the damage was bounded to workloads in the affected namespace. Now that `parentPoolUsage` reads the same counter from the admission path, a stale counter in **any** member namespace of a pool inflates the pool's apparent usage and can forbid the creation of a legitimate sub-tenant, with an error message that blames the parent's remaining quota. A platform-level bug in a leaf namespace has become an onboarding failure.
 
-There is also a diagnostic cost. The admission message names the quota, which points operators at "raise the quota", a workaround that over-allocates real capacity and hides the drift instead of surfacing it.
+The diagnosis suffers too. The admission message names the quota, which points operators at "raise the quota", a workaround that over-allocates real capacity and hides the drift instead of surfacing it.
 
 ## Goals
 
-- Adding an application consumes exactly the resources declared in its custom resource: a VM of instance type `u1.small` charges 1 CPU and 4Gi against the tenant's quota, whatever KubeVirt's launcher requests.
-- A tenant whose declared workloads sum to exactly its quota can start all of them.
+- Adding an application consumes exactly its reservation: a VM of instance type `u1.small` counts 1 CPU and 4Gi against its pool, whatever KubeVirt's launcher requests.
+- A tenant whose reservations sum to exactly its budget can start all of them.
 - Quota accounting reads no `ResourceQuota.status.used` anywhere, so counter drift cannot deny a tenant request.
-- Admission rejects a create or update that would exceed the pool budget, for **every** `apps.cozystack.io` kind, on both `Create` and `Update`, charging only the delta on update.
+- Admission rejects a create or update that would exceed the pool budget, for **every** `apps.cozystack.io` kind, on both `Create` and `Update`, counting only the delta on update.
 - Hierarchical pool semantics, meaning carve-outs, unbounded children sharing an ancestor's pool and overcommit reporting, are preserved unchanged; the existing `pool_test.go` assertions keep passing untouched.
-- A new application kind participates in quotas by shipping a `spec.reservation` block, with no Go change in the aggregated apiserver and no rebuild required for out-of-tree kinds.
+- A new application kind participates in quotas by declaring its consumption on its definition, with no Go change in the aggregated apiserver and no rebuild required for out-of-tree kinds.
 - `--tenant-quota-buffer-percent` is no longer needed for a correctly-sized tenant to work, and is deleted.
-- Each pool reports `reserved` against `budget` **on an API object** — the `Tenant` application's status — so the dashboard, billing and anything provisioning tenants can read headroom before ordering, rather than inferring it from quota objects or from events.
+- Each pool reports `reserved` against `budget` **on an API object** — the `Tenant` application's status — so a tenant, or anything provisioning tenants, can read a pool's headroom before ordering into it rather than inferring it from quota objects or from events.
 
 ### Non-goals
 
 - Fixing the kube-controller-manager counter staleness, or alerting on it. Both remain worth doing; neither is required for this design.
-- Usage-based quotas. Nothing here measures actual CPU or memory consumption, and nothing should: a reservation limit is a commercial contract, not a runtime governor.
+- Usage-based quotas. Nothing here measures actual CPU or memory consumption, and nothing should: a reservation is a claim on a budget made when the object is written, not a runtime governor.
+- Metering. Measuring consumption over time is a different concern, owned by whoever operates the platform; [§4](#4-reservation-as-the-usage-oracle) states the one point where it touches this design.
 - Evicting or resizing already-admitted workloads when a quota is lowered. Overcommit is reported, never enforced retroactively, matching today's behavior.
-- Node-level capacity planning. Virtualization overhead remains real and must still be provisioned; this proposal moves it out of the tenant's quota and into platform capacity planning, where it is a property of the fleet rather than of a contract.
+- Node-level capacity planning. Virtualization overhead remains real and must still be provisioned; this proposal moves it out of the tenant's quota and into platform capacity planning, where it is a property of the fleet rather than of a tenant's budget.
 - Replacing the per-pod requests and limits each operator sets. Those are the operational limit and they stay exactly as they are. The `LimitRange` also stays, but it stops being conditional on `resourceQuotas` — see [§7](#7-retiring-the-namespace-resourcequota).
+- Introducing quota keys. The keys are the platform's; this proposal defines how a kind consumes them. The instance-type classes in [§3](#3-environment-instance-types-and-presets) are the one place it has to name keys at all.
 
 ## Design
 
@@ -142,7 +154,7 @@ The **operational limit** answers "how much can this pod actually use?" It is de
 ```mermaid
 flowchart TD
     T[Tenant] -- "create VMInstance<br/>instanceType: u1.small" --> GATE{{"reservation gate<br/>aggregated apiserver"}}
-    GATE -- "pool has room?" --> AGG["reservation oracle<br/>sum of declared CR sizes"]
+    GATE -- "fits the pool's budget?" --> AGG["reservation oracle<br/>sum of the pool's reservations"]
     GATE -- reject --> T
     GATE -- accept --> HR[HelmRelease values]
     HR -- Flux --> OP[KubeVirt / CNPG / ...]
@@ -153,219 +165,34 @@ flowchart TD
     style AGG fill:#e8f4ff
 ```
 
-The left column is the tenant contract and only ever sees declared sizes. The right column is physical enforcement and legitimately sees overhead. The two never need to agree numerically, and the current design's central mistake is requiring them to.
+The left column is the tenant contract and only ever sees reservations. The right column is physical enforcement and legitimately sees overhead. The two never need to agree numerically, and the current design's central mistake is requiring them to.
 
 This split is only sound because a tenant cannot write the right column. As noted in [Context](#context), `cozy:tenant:admin` has no `create` on pods and no access to HelmReleases; the operator derives pod sizing from the declared instance type. The reservation is therefore not an honor-system estimate of what the tenant will consume, it is a structural bound on it.
 
-### 2. `spec.reservation` on `ApplicationDefinition`
+### 2. Consumption declared on the `ApplicationDefinition`
 
-Each application declares how to read its own size, next to the `openAPISchema` the definition already carries. The apiserver contains no per-kind knowledge.
+Each kind declares how its reservation is computed from its own values, on its `ApplicationDefinition`, next to the `openAPISchema` the definition already carries. The apiserver contains no per-kind knowledge.
 
 This is the same move [PR #39](https://github.com/cozystack/community/pull/39) makes for visibility, cardinality and sharing: behavior that varies per kind becomes data on the definition rather than a branch in Go. It is also what [PR #43](https://github.com/cozystack/community/pull/43) forces, since an out-of-tree catalog cannot ship a patch to the aggregated apiserver.
 
-```go
-// api/v1alpha1/applicationdefinitions_types.go
+**The contract is the evaluator's, not the declaration's shape.** An **evaluator** takes an application's defaulted values and a snapshot of the environment, and returns that application's reservation as a class-keyed resource list. It is:
 
-type ApplicationDefinitionSpec struct {
-    Application ApplicationDefinitionApplication `json:"application"`
-    Release     ApplicationDefinitionRelease    `json:"release"`
-    // Reservation declares how much this application charges against its
-    // tenant's quota, read from the application's own values. Absent means the
-    // kind reserves nothing.
-    // +optional
-    Reservation *ApplicationDefinitionReservation `json:"reservation,omitempty"`
-    // ... existing fields
-}
+- **deterministic** for a given values-and-environment pair;
+- **kind-agnostic** in Go: everything that differs between kinds is read from the definition;
+- **fail-closed** on anything it cannot resolve — an unknown instance type, a value of the wrong type, an expression that does not evaluate — returning an error rather than a smaller figure;
+- **importable** outside the apiserver ([§4](#4-reservation-as-the-usage-oracle)).
 
-type ApplicationDefinitionReservation struct {
-    // Items are compute/storage reservations, summed.
-    // +optional
-    Items []ReservationItem `json:"items,omitempty"`
-    // Objects are object-count reservations, keyed by ResourceQuota object-count
-    // name (e.g. "services.loadbalancers").
-    // +optional
-    Objects map[string]ReservationObject `json:"objects,omitempty"`
-}
+The **environment** is the set of cluster objects a kind's definition may reference. Instance types are already such objects; [§3](#3-environment-instance-types-and-presets) adds presets.
 
-type ReservationItem struct {
-    // Count is the multiplier applied to both the compute and the storage of
-    // this item. Absent means 1.
-    // +optional
-    Count *ReservationCount `json:"count,omitempty"`
+How a kind expresses its consumption on its definition is a definition-level concern this proposal does not fix. [Appendix A](#appendix-a-non-normative-sketch-of-a-declaration) sketches one shape. Whatever shape the implementation chooses has to be able to express what the in-tree kinds already need, which this design has established and which the tests in [Testing](#testing) pin:
 
-    // InstanceTypeFrom names a values path holding a
-    // VirtualMachineClusterInstancetype name, resolved from the cluster.
-    // PresetFrom names a values path holding a cozy-lib resource preset name.
-    // At most one may be set.
-    // +optional
-    InstanceTypeFrom string `json:"instanceTypeFrom,omitempty"`
-    // +optional
-    PresetFrom string `json:"presetFrom,omitempty"`
+- **A count that is a product of values.** ClickHouse runs `shards × replicas` server pods, plus its keepers sized by their own preset.
+- **A count whose ceiling is an autoscaler bound.** `KubernetesNodes` reserves `maxReplicas`, because the cluster-autoscaler scales the MachineDeployment without touching the CR; `Postgres` reserves `autoscaling.maxReplicas` when `autoscaling.enabled` is set, and `replicas` otherwise, for the DHA reason given in [Scope](#scope-and-related-proposals).
+- **The chart's own precedence between a named size and an explicit override**, which differs between chart families. cozy-lib fills a preset **per key**: `resources: {cpu: "1"}` on top of `t1.nano` renders 1 CPU and 128Mi, and the Postgres schema admits exactly that partial block. `vm-instance` instead treats `resources` as all-or-nothing against `instanceType`, and its `resources.cpu` is cores per socket, so a `{cpu: 4, sockets: 2, memory}` block is 8 vCPUs. No single precedence rule covers both, which is why the precedence is written per kind by the chart author who knows it rather than fixed here.
+- **An object count from a boolean.** `vm-instance` with `external: true` consumes one `services.loadbalancers`.
+- **An explicit exemption.** A kind that consumes nothing says so (see [§5](#5-generalizing-the-gate-to-every-kind)).
 
-    // ResourcesFrom names a values path holding an explicit sizing object that,
-    // when complete, takes precedence over the resolved instance type or preset.
-    // What "complete" means and how the object's fields combine into a vCPU
-    // count is NOT the same for every kind — see §3 — so ResourcesShape names
-    // which of the platform's sizing shapes this path carries.
-    // +optional
-    ResourcesFrom string `json:"resourcesFrom,omitempty"`
-    // ResourcesShape is one of "cpuMemory" (kubernetes-nodes: {cpu, memory},
-    // complete when both are set) or "cpuSocketsMemory" (vm-instance:
-    // {cpu, sockets, memory}, where the guest has cpu × sockets vCPUs and the
-    // block is complete only when all three are set). Required with
-    // ResourcesFrom.
-    // +optional
-    ResourcesShape string `json:"resourcesShape,omitempty"`
-
-    // StorageFrom names a values path holding a storage quantity, charged
-    // against the "storage" quota key.
-    // +optional
-    StorageFrom string `json:"storageFrom,omitempty"`
-}
-
-// ReservationCount resolves to a non-negative integer. It is a small recursive
-// expression rather than a single path because two in-tree shapes need more
-// than one: a replica count that is a product of two values (clickhouse's
-// shards × replicas), and a count whose real ceiling is an autoscaler bound
-// that only applies when autoscaling is on.
-type ReservationCount struct {
-    // Value is a literal. From reads an integer from a values path. Product
-    // multiplies its members. Max takes the largest of its members. Exactly one
-    // may be set.
-    // +optional
-    Value *int32 `json:"value,omitempty"`
-    // +optional
-    From string `json:"from,omitempty"`
-    // +optional
-    Product []ReservationCount `json:"product,omitempty"`
-    // +optional
-    Max []ReservationCount `json:"max,omitempty"`
-
-    // When gates this count on a boolean values path: when it is false the
-    // count resolves to zero. Inside Max that is how a conditional ceiling is
-    // written — an autoscaling bound that only counts while autoscaling is on.
-    // +optional
-    When string `json:"when,omitempty"`
-}
-
-type ReservationObject struct {
-    // +optional
-    Count *ReservationCount `json:"count,omitempty"`
-}
-```
-
-Applied to the shipped kinds:
-
-```yaml
-# packages/system/vm-instance-rd/cozyrds/vm-instance.yaml
-spec:
-  reservation:
-    items:
-      - instanceTypeFrom: instanceType
-        resourcesFrom: resources
-        resourcesShape: cpuSocketsMemory
-    objects:
-      services.loadbalancers:
-        count:
-          value: 1
-          when: external
-```
-
-```yaml
-# packages/system/vm-disk-rd/cozyrds/vm-disk.yaml
-spec:
-  reservation:
-    items:
-      - storageFrom: storage
-```
-
-```yaml
-# packages/system/postgres-rd/cozyrds/postgres.yaml
-# The count is the ceiling, not the seed: under autoscaling KEDA's HPA drives
-# the CNPG Cluster's scale subresource and never writes .replicas back, so a
-# count read from .replicas would charge the seed while the cluster ran up to
-# autoscaling.maxReplicas standbys. A `when`-gated member of max() contributes
-# zero while autoscaling is off, so the resting case still charges .replicas.
-spec:
-  reservation:
-    items:
-      - count:
-          max:
-            - from: replicas
-            - from: autoscaling.maxReplicas
-              when: autoscaling.enabled
-        presetFrom: resourcesPreset
-        resourcesFrom: resources
-        resourcesShape: cpuMemory
-        storageFrom: size
-```
-
-```yaml
-# packages/system/clickhouse-rd/cozyrds/clickhouse.yaml
-# Server pods are shards × replicas, which is why count is an expression and
-# not a path. The three keeper pods are charged separately because they are
-# sized by their own preset; the backup sidecar is not charged — see the
-# platform-overhead table below.
-spec:
-  reservation:
-    items:
-      - count:
-          product:
-            - from: shards
-            - from: replicas
-        presetFrom: resourcesPreset
-        resourcesFrom: resources
-        resourcesShape: cpuMemory
-        storageFrom: size
-      - count:
-          from: clickhouseKeeper.replicas
-        presetFrom: clickhouseKeeper.resourcesPreset
-        resourcesFrom: clickhouseKeeper.resources
-        resourcesShape: cpuMemory
-```
-
-```yaml
-# packages/system/kubernetes-nodes-rd/cozyrds/kubernetes-nodes.yaml
-# A worker pool is its own kind since kubernetes-nodes-split phase 2, so its
-# reservation is flat: no iteration and nothing chart-computed. count
-# multiplies both the compute and the storage of the item. maxReplicas, not
-# minReplicas: the cluster-autoscaler scales the MachineDeployment without
-# touching the CR, so no Update gate ever sees a scale-up.
-spec:
-  reservation:
-    items:
-      - count:
-          from: maxReplicas
-        instanceTypeFrom: instanceType
-        resourcesFrom: resources
-        resourcesShape: cpuMemory
-        storageFrom: diskSize
-```
-
-```yaml
-# packages/system/kubernetes-rd/cozyrds/kubernetes.yaml
-# Control plane only. spec.nodeGroups no longer exists on this kind (#3315),
-# so there is nothing to iterate and no implicit pool to miss.
-spec:
-  reservation:
-    items:
-      - presetFrom: controlPlane.apiServer.resourcesPreset
-        resourcesFrom: controlPlane.apiServer.resources
-        resourcesShape: cpuMemory
-      - presetFrom: controlPlane.controllerManager.resourcesPreset
-        resourcesFrom: controlPlane.controllerManager.resources
-        resourcesShape: cpuMemory
-      - presetFrom: controlPlane.scheduler.resourcesPreset
-        resourcesFrom: controlPlane.scheduler.resources
-        resourcesShape: cpuMemory
-      - presetFrom: controlPlane.konnectivity.server.resourcesPreset
-        resourcesFrom: controlPlane.konnectivity.server.resources
-        resourcesShape: cpuMemory
-```
-
-A kind without a `reservation` block reserves nothing, which keeps the change additive and lets the rollout proceed package by package.
-
-**The evaluator must default the values before it reads them.** This is a correctness precondition, not a detail. The aggregated apiserver applies the kind's structural-schema defaults on the **read** path only — `applySpecDefaults` is called from `ConvertHelmReleaseToApplicationWithMonitor`, and `REST.Create` stores the tenant's spec verbatim without defaulting it. The stored HelmRelease values therefore carry only the keys the tenant actually wrote. An evaluator that reads `hr.Spec.Values` raw would charge zero for `kubernetes-nodes.maxReplicas` (schema default 10) and resolve no instance type for `kubernetes-nodes.instanceType` (default `u1.medium`) on every pool created with defaults — a systematic under-charge far larger than any synthesized-workload hole. `Evaluate` must run against the defaulted form, and the object under admission must be defaulted before it is charged too, since the gate runs before conversion.
+**The evaluator must default the values before it reads them.** This is a correctness precondition, not a detail. The aggregated apiserver applies the kind's structural-schema defaults on the **read** path only — `applySpecDefaults` is called from `ConvertHelmReleaseToApplicationWithMonitor`, and `REST.Create` stores the tenant's spec verbatim without defaulting it. The stored HelmRelease values therefore carry only the keys the tenant actually wrote. An evaluator that read `hr.Spec.Values` raw would count zero for `kubernetes-nodes.maxReplicas` (schema default 10) and resolve no instance type for `kubernetes-nodes.instanceType` (default `u1.medium`) on every pool created with defaults — a systematic under-count far larger than any synthesized-workload hole. The evaluator runs against the defaulted form, and the object under admission is defaulted before it is evaluated too, since the gate runs before conversion.
 
 **What a values path still cannot see.** The evaluator reads values, so a workload a chart synthesizes at template time, without a values key naming it, is invisible to it. [#3315](https://github.com/cozystack/cozystack/pull/3315) closed the `kubernetes.nodeGroups` / implicit-`md0` instance of this, but the hole moved rather than closing: the ComputePlane module now materializes the same default `md0` pool itself at template time when `nodeGroups` is empty (`packages/extra/computeplane/templates/cluster.yaml`).
 
@@ -373,30 +200,29 @@ Its shape there is different, and better. ComputePlane renders each pool as its 
 
 The rule stated for future kinds therefore stands, and ComputePlane is where it should be applied: a chart that defaults a *sized* field in a template rather than in its values makes itself unquotable. Materializing `md0`'s full shape into ComputePlane's values is the fix, and it is a data change in that one chart.
 
-**What is deliberately not reserved.** An earlier revision of this text claimed exactly one values-invisible case existed in tree. That was wrong by a wide margin: sized workloads that no values path describes are the norm rather than the exception, and none of them are being added to the evaluator. What follows is therefore not a list of holes to close but the explicit statement of where the line is drawn — everything below is **platform overhead**, provisioned as fleet capacity in the same way virtualization overhead is, and not charged to the tenant.
+**What is deliberately not reserved.** An earlier revision of this text claimed exactly one values-invisible case existed in tree. That was wrong by a wide margin: sized workloads that no values path describes are the norm rather than the exception, and none of them are being added to any kind's reservation. What follows is therefore not a list of holes to close but the explicit statement of where the line is drawn — everything below is **platform overhead**, provisioned as fleet capacity in the same way virtualization overhead is, and not counted against the tenant's budget.
 
 | Kind | Not reserved | Why the line is here |
 |---|---|---|
-| `redis`, `valkey`, Harbor's redis | 3 sentinel pods, each sized with the **data preset** | Fixed operator topology, not a tenant-chosen shape. It is the largest single item in this table for a small database and the one most worth revisiting. |
+| `redis`, `valkey`, Harbor's redis | 3 sentinel pods | Fixed operator topology, not a tenant-chosen shape. Today the charts size each sentinel at the **data preset** (`packages/apps/redis/templates/redisfailover.yaml`), for no reason a sentinel needs, so three unreserved pods scale with the tenant's choice of preset. That is a chart defect: sized with a small fixed preset, the sentinels become fixed overhead like the CSI deployments below, and the principle holds without an exception. The chart change is part of phase 4. |
 | `clickhouse` | one backup sidecar per server pod | Sidecar, sized by the operator. |
 | `mongodb` (sharded) | config servers, mongos | Topology the chart derives; no values key names the counts. |
 | `kafka` | ZooKeeper pods, entity-operator pod | Same. |
 | `kubernetes` | cluster-autoscaler, cloud-controller and 4-container CSI deployments (125m/128Mi per container), plus a `talos-csr-signer` sidecar in every control-plane pod | Platform-authored control-plane machinery with fixed requests, identical for every tenant cluster. |
 | every managed database | operator-injected sidecars: CNPG's barman plugin, PSMDB's backup agent, NATS reloader and exporter, the FoundationDB sidecar | Injected by an operator after the CR is written; not derivable from values at all. |
-| `etcd`, `monitoring` (tenant modules) | VPA headroom — `packages/extra/etcd/templates/vpa.yaml` may raise a member to 5 CPU / 8Gi; the six VPAs in `packages/system/monitoring/templates/vpa.yaml` reach 4 CPU / 8Gi per component | A VPA ceiling is a runtime recommendation, not a reservation. Charging the ceiling would charge every tenant for headroom none of them reach at once. |
+| `etcd`, `monitoring` (tenant modules) | VPA headroom — `packages/extra/etcd/templates/vpa.yaml` may raise a member to 5 CPU / 8Gi; the six VPAs in `packages/system/monitoring/templates/vpa.yaml` reach 4 CPU / 8Gi per component | A VPA ceiling is a runtime recommendation, not a reservation. Reserving the ceiling would count, against every tenant, headroom none of them reach at once. |
 | `foundationdb` | stateless process count | The chart's own value is `-1`, "operator decides". There is nothing to read. |
+| storage-backed kinds | anything a chart rounds or adds beyond the declared size, such as a WAL volume | Storage is reserved at the **declared** size, by the same rule as launcher memory overhead: what the chart adds is platform margin. |
 
-The consequence for testing is the important part. A completeness test asserting that every kind *has* a `reservation` block proves nothing about whether the block is *adequate*. [Testing](#testing) therefore replaces it with a test that compares the evaluator's output against the rendered pod requests for each kind's default values, so the size of the overhead in this table is a number in CI rather than a surprise in production.
+The consequence for testing is the important part. A completeness test asserting that every kind *has* a declaration proves nothing about whether it is *adequate*. [Testing](#testing) therefore replaces it with a test that compares the evaluator's output against the rendered pod requests for each kind's default values, so the size of the overhead in this table is a number in CI rather than a surprise in production.
 
-### 3. Resolving instance types and presets
-
-Three size vocabularies exist and are resolved differently.
+### 3. Environment: instance types and presets
 
 #### KubeVirt instance types: scalars, keyed by class
 
-The resolver reads `VirtualMachineClusterInstancetype` from the API and takes `spec.cpu.guest` and `spec.memory.guest`. It charges **scalars**, not one quota key per type: a per-type `count/<type>` key would remove the resolution step, but it would also turn "8 CPU spendable on any shape" into a basket the tenant has to commit to in advance, and it would take the hierarchical arithmetic and the dashboards out of fungible units. `objects:` could not express it as written either, since its key is a literal and this one would have to come from a field value.
+An instance type resolves from the `VirtualMachineClusterInstancetype` in the environment, from its `spec.cpu.guest` and `spec.memory.guest`. It resolves to **scalars**, not one quota key per type: a per-type `count/<type>` key would remove the resolution step, but it would also turn "8 CPU spendable on any shape" into a basket the tenant has to commit to in advance, and it would take the hierarchical arithmetic out of fungible units.
 
-But one `cpu` key cannot hold every core. A shared vCPU under the allocation ratio and a pinned core on a CPU-manager node are not the same good, and neither are ordinary memory, pre-reserved hugepages and overcommitted memory. So the scalars are **keyed by class**, and the class is derived from the instance type's own spec, never from its name, so an operator-added type classifies itself:
+But one `cpu` key cannot hold every core. A shared vCPU under the allocation ratio and a pinned core on a CPU-manager node are not the same capacity, and neither are ordinary memory, pre-reserved hugepages and overcommitted memory. So the scalars are **keyed by class**, and the class is derived from the instance type's own spec, never from its name, so an operator-added type classifies itself:
 
 | Quota key | Derived from | Shipped types that land here |
 |---|---|---|
@@ -404,100 +230,46 @@ But one `cpu` key cannot hold every core. A shared vCPU under the allocation rat
 | `dedicated-cpu` | `spec.cpu.dedicatedCPUPlacement: true` | `d1`, `cx1`, `n1`, `rt1` |
 | `memory` | no `spec.memory.hugepages`, no `overcommitPercent` | `u1`, `d1` |
 | `hugepages-<size>` | `spec.memory.hugepages.pageSize` | `m1`, `cx1`, `n1`, `rt1` (2Mi and 1Gi variants of each) |
-| `memory` (overcommitted) | `spec.memory.overcommitPercent` | `o1` |
+| `overcommitted-memory` | `spec.memory.overcommitPercent` | `o1` |
 
-Two notes on that table, because an earlier sketch of it got both wrong by classifying on the series name. Hugepages are **not** a `cx1` property: `m1` is a shared-CPU series that nonetheless requests hugepages, and `n1` is a fourth dedicated series alongside `d1`/`cx1`/`rt1`. And `o1` sets `overcommitPercent: 50`, which means its launcher requests half the guest memory — the only case on the platform where the pod request is *smaller* than the reservation. Charging the guest figure for it is still right (it is what the tenant bought), but it is a distinct class because a cluster cannot sell the same physical page as both `o1` memory and `u1` memory.
+These class keys are the one place this proposal names quota keys, because an instance type has to land on some key and the classes differ in kind; their names are the platform's to fix, and nothing else is added. Two notes on the table, because an earlier sketch of it got both wrong by classifying on the series name. Hugepages are **not** a `cx1` property: `m1` is a shared-CPU series that nonetheless requests hugepages, and `n1` is a fourth dedicated series alongside `d1`/`cx1`/`rt1`. And `o1` sets `overcommitPercent: 50`, which means its launcher requests half the guest memory — the only case on the platform where the pod request is *smaller* than the reservation. Reserving the guest figure for it is still right, since it is what the tenant declared, and it gets its own key, as hugepages have, because a cluster cannot grant the same physical page as both `o1` memory and `u1` memory. A budget that does not mention `overcommitted-memory` grants none of it.
 
-**What is charged is what is stable and enumerable on the instance type.** For a dedicated type with `isolateEmulatorThread: true` — which every shipped dedicated type sets — the resolver charges `guest + 1` dedicated cores, plus any supplemental I/O thread count, reading the even-parity annotation if one is ever set. The catalog then lists the type that way: `cx1.2xlarge` is eight guest vCPUs on nine pinned cores. What KubeVirt computes at *runtime*, namely the launcher memory overhead, stays platform margin — that is the entire point of this proposal on the memory side.
+**What is reserved is what is stable and enumerable on the instance type.** For a dedicated type with `isolateEmulatorThread: true` — which every shipped dedicated type sets — the reservation is `guest + 1` dedicated cores, plus any supplemental I/O thread count, reading the even-parity annotation if one is ever set: `cx1.2xlarge` is eight guest vCPUs on nine pinned cores. The reason is capacity. A pinned core nobody else can be given has to come out of someone's budget, and since the figure is a property of the type, the catalog shows it, so a tenant can predict what an order will consume before making it. What KubeVirt computes at *runtime*, namely the launcher memory overhead, stays platform margin — that is the entire point of this proposal on the memory side.
 
-The asymmetry deserves naming rather than leaving for the next reviewer to find: cores charge their overhead and memory does not. The reason is that the emulator-thread core is a fixed, declared property of the instance type, knowable before anything runs, while the launcher's memory overhead is computed by virt-controller from guest memory, vCPU count and attached devices, and moves between KubeVirt releases. The first can live in a commercial contract; the second cannot.
+The asymmetry deserves naming rather than leaving for the next reviewer to find: cores include their overhead and memory does not. The emulator-thread core is a fixed, declared property of the instance type, knowable before anything runs; the launcher's memory overhead is computed by virt-controller from guest memory, vCPU count and attached devices, and moves between KubeVirt releases. Only the first is something a tenant can predict before ordering.
 
-**Catalog and charge must share one source.** Either `pkg/reservation` is the library the dashboard calls, or the instancetype chart writes the charged figures as labels on the object and the resolver reads them, falling back to spec-derived computation for operator-added types. Two independent renderings of "what does `cx1.2xlarge` cost" will diverge. Relatedly, instance types are **immutable by policy**: editing one silently changes every tenant's reserved sum with no write to any tenant's CR.
+**The catalog and the evaluator read the same figure.** What the instance-type catalog shows a tenant must be what the evaluator computes, so both come from the evaluator ([§4](#4-reservation-as-the-usage-oracle)); two independent renderings of "what does `cx1.2xlarge` consume" will diverge. Relatedly, instance types are **immutable by policy**: editing one silently re-evaluates every application that references it with no write to any tenant's CR. A changed type is shipped under a new name, or rolled out as a re-evaluation ([Security](#security)).
 
 #### cozy-lib resource presets
 
-These are a Helm-only table in `packages/library/cozy-lib/templates/_resourcepresets.tpl` (the `t1`/`c1`/`s1`/`u1`/`m1` series). Go cannot read a `.tpl`, and the aggregated apiserver does not ship the chart.
+Today the presets are a Helm-only table in `packages/library/cozy-lib/templates/_resourcepresets.tpl` (the `t1`/`c1`/`s1`/`u1`/`m1` series). Go cannot read a `.tpl`, and the aggregated apiserver does not ship the chart.
 
-The earlier plan was a Go copy plus a parity test that parses the `.tpl` at test time. That is the kind of test that passes on a stray comment and fails on whitespace, so it is replaced: **one side is generated from the other** at build time, so divergence is impossible rather than detected. The `.tpl` stays the human-facing source and the Go table is generated from it.
+*Implementation note, not a condition of this proposal:* presets should become environment objects too, shipped by the platform and looked up by cozy-lib at render time the way the VM charts already `lookup` instance types. The chart and the evaluator then read the same object, and no Go copy of the table exists to be generated, compared or kept in step. A preset object is immutable by the same policy as an instance type.
 
-Two details of that table:
+Two properties hold however presets are resolved:
 
-- **Ephemeral storage is charged.** Every preset carries `ephemeral-storage: 2Gi`, and the tenant quota vocabulary already has an `ephemeral-storage` key with an allocation ratio of 40. It is charged like any other scalar.
-- **The deprecated flat aliases are resolved, not rejected.** `nano`…`2xlarge` do not mean what their `t1.*` namesakes mean — `medium` is 1 CPU where `t1.medium` is 2 — and migration 39 converted the values that existed. But they are still live: `_resourcepresets.tpl` merges `$legacyAliases` into `$presets`, and every shipped kind's `values.schema.json` still enumerates them (`postgres`, `kubernetes`, `redis`, …). A resolver that rejected them would fail closed against a value the kind's own OpenAPI schema admits and the chart renders, which is a regression, not a tightening. So the resolver resolves them at their legacy figures and `warnLegacyPresets` keeps warning; rejecting them becomes correct only in the release that drops them from the enums.
-
-#### Explicit `resources` blocks
-
-`resourcesFrom` is where a single generic reading would silently under-charge, because the platform has **two different `resources` shapes** and they do not agree on what a CPU is:
-
-- `kubernetes-nodes.resources` is `{cpu, memory}`, complete when both are set, and the chart rejects one without the other at render time.
-- `vm-instance.resources` is `{cpu, sockets, memory}`, where `cpu` is *cores per socket*: the guest has `cpu × sockets` vCPUs. A block is complete only when all three are set, and `virtual-machine.domainResources` emits nothing at all from `cpu` alone.
-
-Reading `resources.cpu` for a `vm-instance` would therefore under-charge by the socket factor — a `{cpu: 4, sockets: 2}` VM is 8 vCPUs charged as 4. Hence `resourcesShape` on the item: the evaluator computes `cpu × sockets` for `cpuSocketsMemory` and `cpu` for `cpuMemory`.
-
-Precedence follows each chart exactly. For `kubernetes-nodes`, a complete block wins and the instancetype is omitted from the VM. For `vm-instance`, `virtual-machine.effectiveInstanceType` already does this on `main`: a block that supplies all three replaces the matcher, and a block that supplies *some* sizing next to an `instanceType` fails the render outright rather than rendering an ambiguous VM. The evaluator mirrors that: complete block → charge the block; no block → charge the type; partial block next to a type → the chart will refuse it, so the reservation never has to guess.
+- **Only budgeted keys are reserved.** Every preset also carries `ephemeral-storage: 2Gi`; no tenant quota bounds it today, so it is not part of any reservation, and this proposal does not add it.
+- **The deprecated flat aliases resolve, they are not rejected.** `nano`…`2xlarge` do not mean what their `t1.*` namesakes mean — `medium` is 1 CPU where `t1.medium` is 2 — and migration 39 converted the values that existed. But they are still live: `_resourcepresets.tpl` merges `$legacyAliases` into `$presets`, and seventeen shipped kinds' `values.schema.json` still enumerate them (`postgres`, `kubernetes`, `redis`, …). An evaluator that rejected them would fail closed against a value the kind's own OpenAPI schema admits and the chart renders, which is a regression, not a tightening. So they resolve at their legacy figures and `warnLegacyPresets` keeps warning; rejecting them becomes correct only in the release that drops them from the enums.
 
 Neither resolution applies allocation ratios and neither adds virtualization overhead. That is the whole point: the reservation is the guest-side number.
 
 ### 4. Reservation as the usage oracle
 
-`pkg/reservation` is a **standalone, importable package with stable key names**, not an internal detail of the apiserver. The same function is wanted outside admission — by the dashboard, by billing, and by whatever eventually replaces the pod-unit `Workload` records — and a package only the apiserver can call forecloses that.
+The evaluator is a **standalone, importable package** (`pkg/reservation`) with stable key names, not an internal detail of the apiserver. Metering, if and when the platform operator builds it, reads the same evaluator and adds time and operational state on top, so the two can never disagree about what an application is.
 
-```go
-// Resolver turns a size name into a class-keyed resource list (see §3).
-type Resolver interface {
-    InstanceType(ctx context.Context, name string) (corev1.ResourceList, error)
-    Preset(name string) (corev1.ResourceList, error)
-}
-
-// Definitions resolves an application to the reservation spec that prices it.
-// Keyed by the application's kind and group, which is exactly what the
-// ApplicationKindLabel/ApplicationGroupLabel pair on every HelmRelease carries,
-// so an out-of-tree kind resolves through the same path as an in-tree one.
-// Schema returns the structural schema used to default the values before they
-// are read (see §2); Reservation is taken from the storage version, so a kind
-// declares its reservation once and served versions inherit it through the
-// existing conversion.
-type Definitions interface {
-    For(ctx context.Context, group, kind string) (
-        res *v1alpha1.ApplicationDefinitionReservation,
-        schema *structuralschema.Structural,
-        err error,
-    )
-}
-
-// Evaluate applies a kind's reservation spec to one application's values.
-// values MUST already be defaulted against the kind's schema. Pure apart from
-// Resolver: no client, no cluster state.
-func Evaluate(
-    ctx context.Context,
-    spec *v1alpha1.ApplicationDefinitionReservation,
-    values map[string]any,
-    r Resolver,
-) (corev1.ResourceList, error)
-
-// Aggregator sums the reservations of every application in a set of namespaces.
-// "Application" means a HelmRelease carrying the ApplicationKindLabel and
-// ApplicationGroupLabel; an unlabelled namespace-scoped HelmRelease is not an
-// application and is not summed. Note this deliberately includes releases a
-// platform chart rendered with those labels — ComputePlane's per-pool
-// KubernetesNodes releases are the in-tree case (see §2) — since those consume
-// the tenant's capacity exactly as a natively created pool does.
-type Aggregator interface {
-    ForNamespaces(ctx context.Context, namespaces []string) (map[string]corev1.ResourceList, error)
-}
-```
+The pool's figure is the sum of the reservations of every application in its member namespaces, where "application" means a HelmRelease carrying the `ApplicationKindLabel` and `ApplicationGroupLabel`. An unlabelled namespace-scoped HelmRelease is not an application and is not summed. This deliberately includes releases a platform chart rendered with those labels — ComputePlane's per-pool `KubernetesNodes` releases and the tenant modules are the in-tree cases — since those consume the tenant's capacity exactly as a natively created application does. Each application's definition is found by that kind-and-group pair, so an out-of-tree kind resolves through the same path as an in-tree one, and its declaration is taken from the storage version.
 
 Two properties of that contract are worth stating explicitly, because both have a wrong answer that looks right:
 
-- **The HelmRelease *is* the stored application.** `REST.Create` converts the Application to a HelmRelease and that is the only persisted copy; there is no second record that is more authoritative. Reading labelled HelmReleases is therefore reading the committed state, not a rendered derivative — Flux lag affects when *pods* appear, never what was declared. What the read does need is the defaulting step of [§2](#2-specreservation-on-applicationdefinition), because the stored values are undefaulted.
-- **Both sides must move, not just usage.** `snapshot` does not only read usage from `status.used`; it also takes each tenant's declared **budget** from the chart-rendered `tenant-quota` object's `spec.hard`, in rendered key space with allocation ratios already applied — its doc comment says so, and that was a deliberate choice to avoid replicating the chart's ratio math. If `reserved` is summed in shorthand units and `budget` is left where it is, the controller compares two vocabularies. So `Declared` has to be read from the tenant's own `resourceQuotas` values, which is what the admission gate already does through `declaredQuotasFromHelmRelease`.
+- **The HelmRelease *is* the stored application.** `REST.Create` converts the Application to a HelmRelease and that is the only persisted copy; there is no second record that is more authoritative. Reading labelled HelmReleases is therefore reading the committed state, not a rendered derivative — Flux lag affects when *pods* appear, never what was declared. What the read does need is the defaulting step of [§2](#2-consumption-declared-on-the-applicationdefinition), because the stored values are undefaulted.
+- **Both sides must move, not just usage.** `snapshot` does not only read usage from `status.used`; it also takes each tenant's **budget** from the chart-rendered `tenant-quota` object's `spec.hard`, in rendered key space with allocation ratios already applied — its doc comment says so, and that was a deliberate choice to avoid replicating the chart's ratio math. If `reserved` is summed in shorthand units and `budget` is left where it is, the controller compares two vocabularies. So `Declared` has to be read from the tenant's own `resourceQuotas` values, which is what the admission gate already does through `declaredQuotasFromHelmRelease`.
 
 The call sites change source, not shape:
 
 | Call site | Today | After |
 |---|---|---|
-| `quota.go` `parentPoolUsage` | lists `ResourceQuota` per member namespace, sums `status.used`, keys via `renderedLimitKey` | lists labelled HelmReleases per member namespace, defaults and evaluates each, sums in shorthand keys |
-| `reconciler.go` `snapshot` (usage) | lists all `ResourceQuota`, builds `usedByNS` from `status.used` | builds `usedByNS` from the aggregator |
+| `quota.go` `parentPoolUsage` | lists `ResourceQuota` per member namespace, sums `status.used`, keys via `renderedLimitKey` | sums the reservations of the labelled HelmReleases per member namespace, in shorthand keys |
+| `reconciler.go` `snapshot` (usage) | lists all `ResourceQuota`, builds `usedByNS` from `status.used` | builds `usedByNS` from the same sum |
 | `reconciler.go` `snapshot` (budget) | reads `tenant-quota.spec.hard`, rendered keys, ratios applied | reads `resourceQuotas` from the tenant HelmRelease values, shorthand keys |
 
 `renderedLimitKey` and its `rawQuotaKeys` companion are deleted: with both sides in shorthand there is nothing to bridge.
@@ -511,9 +283,9 @@ The test consequence follows from the budget change and should be stated rather 
 This is the part of the proposal that changes what a tenant experiences most, because today there is no gate here at all — see failure 0 in [The problem](#the-problem). `validateTenantResourceQuotas` returns early unless `r.kindName` is `Tenant`, and its call site is itself inside `if r.kindName == "Tenant"`. It becomes two checks, and the call site loses its guard:
 
 1. **Quota declaration** (Tenant only, unchanged): a child's declared quota may not exceed the parent's remaining budget.
-2. **Reservation** (every kind): the reservation this write introduces, plus the pool's current reservation, may not exceed the pool's available budget.
+2. **Reservation** (every kind): the reservation this write introduces, plus what the pool already consumes, may not exceed the pool's budget.
 
-On `Update` only the delta is charged, computed as `Evaluate(new) − Evaluate(old)`, so a no-op edit to an application already over its pool's budget is not rejected, and shrinking is always allowed. Both run inside the existing `Create`/`Update` handlers, before `createValidation`, alongside the current name and internal-key validation.
+On `Update` only the delta counts, computed as the new reservation minus the old one, so a no-op edit to an application whose pool is already over budget is not rejected, and shrinking is always allowed. Both run inside the existing `Create`/`Update` handlers, before `createValidation`, alongside the current name and internal-key validation.
 
 The error names the pool and the size that was requested, so the message points at the reservation rather than at an opaque quota:
 
@@ -523,23 +295,29 @@ exceed the remaining "memory" budget of tenant pool "tenant-acme": 12Gi
 allowed, 6Gi already reserved by 3 applications, 10Gi requested
 ```
 
-**Refuse; never admit for later retry.** An over-quota create is rejected synchronously and is not admitted in any pending or queued form. Admit-and-retry would leave a HelmRelease that Flux keeps reconciling and pods that never start — which is the original failure moved up one level, not fixed. Retry semantics belong only to platform-originated writes, and for those the answer is to reserve the ceiling (§2, `count.max`) so the write never needs to fail in the first place.
+**Refuse; never admit for later retry.** An order that does not fit is rejected synchronously and is not admitted in any pending or queued form. Admit-and-retry would leave a HelmRelease that Flux keeps reconciling and pods that never start — which is the original failure moved up one level, not fixed. Retry semantics belong only to platform-originated writes, and for those the answer is to reserve the ceiling ([§2](#2-consumption-declared-on-the-applicationdefinition)) so the write never needs to fail in the first place.
 
-**Missing reservation blocks fail closed.** A kind whose `ApplicationDefinition` carries no `spec.reservation` reserves nothing, which for an out-of-tree catalog is a quota-escalation vector that no in-tree completeness test can reach. So "absent" is not a valid state once the gate is on: a kind must carry either a reservation block or an explicit `reservation: {exempt: true}` marker, and a definition with neither is refused at admission for that kind with an error naming the definition. The exemption is a reviewed, visible declaration rather than an omission that silently costs nothing.
+**Missing declarations fail closed.** A kind whose `ApplicationDefinition` declares no consumption would reserve nothing, which for an out-of-tree catalog is a quota-escalation vector that no in-tree completeness test can reach. So "absent" is not a valid state once the gate is on: a kind must either declare its consumption or declare an explicit exemption, and a definition with neither is refused at admission for that kind with an error naming the definition. The exemption is a reviewed, visible declaration rather than an omission that silently consumes nothing.
+
+**Tenant modules.** `monitoring`, `ingress`, `etcd` and `seaweedfs` are already rendered by the tenant chart as labelled application releases of their own kinds (`packages/apps/tenant/templates/*.yaml`, kinds `Monitoring`, `Ingress`, `Etcd`, `SeaweedFS`), in the tenant's own namespace. They therefore consume through their own definitions and are counted like ComputePlane's pools, with no Tenant-specific rule. What they lack is a gate: the write that brings a module into existence is a `Tenant` update flipping a flag, not an order for the module. [PR #39](https://github.com/cozystack/community/pull/39) turns that into an order through the apiserver, gated like any other. **If #39 stalls**, the gate on a `Tenant` create or update counts the modules its flags newly enable against the tenant's own pool, evaluating each module kind's declaration on its defaulted values. That is a check at the gate only: the pool's figure still comes from the module releases themselves once they exist, so nothing is counted twice. The rule is removed when #39 lands. Phase 4 cannot complete without one of the two.
 
 **Concurrency: the real bound, and what closes the common case.** The gate is a read-check-write with no transaction, reading HelmReleases from the informer cache (`r.c`). An earlier revision of this text claimed the overshoot was bounded by one application. It is not, and the mechanism is not exotic: a burst of *sequential* creates from a single client — a script, a Terraform apply, any provisioning flow — can all observe the pre-burst sum, because the cache has not caught up with the writes the same client just made. The overshoot is bounded by the number of writes that fit inside the cache lag, and an `Update` can carry a large delta on its own. Today the controller-written `tenant-quota-allocated` eventually clamps that; this proposal removes it.
 
-Transactional admission is not being reintroduced — that trade is discussed in [Alternatives](#alternatives-considered) and the honest semantics are best-effort. But the common case is cheap to close and phase 3 closes it: **serialize the check per pool root inside the apiserver, and re-read after the write.** A per-pool-root mutex makes concurrent writes to one pool sequential within a process, and re-reading the pool's reservation after the write (rather than trusting the pre-write snapshot) removes the cache-lag window that lets a single client's own writes go unseen. What remains uncovered is genuinely concurrent writes to one pool across apiserver replicas, which is a much narrower window than the one described above. The residual overshoot is reported by the controller and is never evicted, exactly as an `Overcommitted` pool is today.
+Transactional admission is not being reintroduced — that trade is discussed in [Alternatives](#alternatives-considered) and the honest semantics are best-effort. But the common case is cheap to close and phase 3 closes it: **serialize the check per pool root inside the apiserver, and re-read after the write.** A per-pool-root mutex makes concurrent writes to one pool sequential within a process, and re-reading the pool's figure after the write (rather than trusting the pre-write snapshot) removes the cache-lag window that lets a single client's own writes go unseen. What remains uncovered is genuinely concurrent writes to one pool across apiserver replicas — the chart ships two — which is a much narrower window than the one described above. The residual overshoot is reported by the controller and is never evicted, exactly as an `Overcommitted` pool is today. If that residual ever matters, the fallback is running the apiserver as a single replica, not a transactional counter.
 
 ### 6. What the controller becomes
 
 Feeding `usedByNS` in instance-type units while `EnforcedHard` still writes a `ResourceQuota` enforced against pods would reintroduce the same unit mismatch one level up: the clamp would be computed from reservations and applied to launcher requests. So the controller must stop being an enforcement point.
 
-It can. Once the gate covers every kind, pool sharing between unbounded siblings is already enforced at admission, because every application create in every member namespace is checked against the pool's reservation. `EnforcedHard`, `upsertAllocatedQuota`, `gcAllocatedQuotas` and the `tenant-quota-allocated` object become redundant and are removed.
+It can. Once the gate covers every kind, pool sharing between unbounded siblings is already enforced at admission, because every application create in every member namespace is checked against the pool's budget. `EnforcedHard`, `upsertAllocatedQuota`, `gcAllocatedQuotas` and the `tenant-quota-allocated` object become redundant and are removed.
 
-The controller becomes an observer. It publishes `reserved` against `budget` per pool, and keeps reporting `Overcommitted`, the one case no admission check can prevent, since it arises when a parent lowers its quota after children have already carved out slices.
+The controller becomes an observer. It publishes `reserved` against `budget` per pool, and keeps reporting `Overcommitted`, the one case no admission check can prevent, since it arises when a parent lowers its quota after children have already carved out slices, or when a re-evaluation raises what a pool consumes.
 
-**Where those numbers live.** Today `recordOvercommit` emits a Kubernetes `Event` on the namespace and nothing else, which nothing can read programmatically and which expires. `reserved` and `budget` are a **status on an API object**, and the natural home is the `Tenant` application's status: it is the object that owns the pool, it is already served by the aggregated API, and both the dashboard and anything provisioning tenants can then read a pool's headroom *before* ordering into it rather than discovering it in a rejection. `Overcommitted` becomes a condition there, with the event kept as a secondary signal.
+**Where those numbers live.** Today `recordOvercommit` emits a Kubernetes `Event` on the namespace and nothing else, which nothing can read programmatically and which expires. `reserved` and `budget` are a **status on an API object**, and the natural home is the `Tenant` application's status: it is the object that owns the pool, and it is already served by the aggregated API. An `Application` is a projection of a HelmRelease with no store of its own, so the figures are persisted on the HelmRelease and projected on read:
+
+- **The controller writes them as annotations on the `Tenant`'s HelmRelease** — `reserved`, `budget`, and the `Overcommitted` condition with its reason and timestamp — under a key outside the `apps.cozystack.io-` prefix. That prefix is how `REST` maps a tenant's own `Application` annotations onto the HelmRelease (`addPrefixedMap`/`filterPrefixedMap` in `pkg/registry/apps/application/rest.go`), so a key outside it can neither be written by the tenant nor leak back into the `Application`'s metadata.
+- **The apiserver projects them into `Tenant.status`** on every read, in the same block of `ConvertHelmReleaseToApplication` that already computes `status.namespace` and `status.externalIPsCount` for the `Tenant` kind. `Overcommitted` becomes a condition there, with the event kept as a secondary signal.
+- **`REST.Update` carries them over from the live object.** `Update` rebuilds the HelmRelease from the `Application` and would otherwise drop them on every tenant edit until the next reconcile. It already does exactly this for the flux shard label, for the same reason.
 
 **Coexistence is mutually exclusive, not additive.** During the flag-gated period `EnforcedHard` stays in place so the legacy path is not left without a runtime net — but only for the legacy path. Whenever the reservation oracle is active for a pool, the controller writes no `tenant-quota-allocated` object for that pool's members and garbage-collects any it previously wrote. The two must never be on together: `EnforcedHard` computed from reservations and applied as a pod-unit `ResourceQuota` clamp is precisely the unit mismatch this proposal exists to remove, reintroduced one level up.
 
@@ -547,14 +325,14 @@ The controller becomes an observer. It publishes `reserved` against `budget` per
 
 An earlier revision kept the chart-rendered `tenant-quota`, inflated by a wide factor, as a "deliberately slack guard". It was kept for two reasons that have nothing to do with the tenant contract: the `LimitRange` providing default container requests sits under the same `{{- if .Values.resourceQuotas }}` guard, and `AutoResourceLimitsGate` only sets limits on virt-launcher pods when the namespace has a quota constraining `limits.*`.
 
-Keeping it is the wrong answer, and the reason is structural rather than aesthetic. Once the gate covers every kind, **the only pods in a tenant namespace are platform-authored**: `cozy:tenant:admin:base` grants `delete` on pods and nothing else, no `create`, and no access to HelmReleases at all, so every pod in the namespace was put there by a chart or an operator. Platform-authored pods should be bounded by platform-authored ceilings — the presets and the VPA `maxAllowed` values that already exist — not by a per-tenant quota that happens to count them. Physical capacity is the scheduler's business; sellable capacity is the root tenant's budget, which the hierarchical arithmetic already forces every carve-out to sum to. The margin between those two is the platform's, and that is a cleaner statement of "overhead is capacity planning" than a slack factor on a quota object, which would leave a second, differently-denominated limit in the namespace for someone to trip over.
+Keeping it is the wrong answer, and the reason is structural rather than aesthetic. Once the gate covers every kind, **the only pods in a tenant namespace are platform-authored**: `cozy:tenant:admin:base` grants `delete` on pods and nothing else, no `create`, and no access to HelmReleases at all, so every pod in the namespace was put there by a chart or an operator. Platform-authored pods should be bounded by platform-authored ceilings — the presets and the VPA `maxAllowed` values that already exist — not by a per-tenant quota that happens to count them. Physical capacity is the scheduler's business; grantable capacity is the root tenant's budget, which the hierarchical arithmetic already forces every carve-out to sum to. The margin between those two is the platform's, and that is a cleaner statement of "overhead is capacity planning" than a slack factor on a quota object, which would leave a second, differently-denominated limit in the namespace for someone to trip over.
 
-A loose guard is also not harmless. `tenant-quota` is a real `ResourceQuota` enforced against `status.used`, so it keeps the stale-counter failure mode of [The problem](#the-problem) alive in the namespace, just with more headroom before it bites — and it would contradict the goal that a tenant charged exactly to its quota can start everything it declared.
+A loose guard is also not harmless. `tenant-quota` is a real `ResourceQuota` enforced against `status.used`, so it keeps the stale-counter failure mode of [The problem](#the-problem) alive in the namespace, just with more headroom before it bites — and it would contradict the goal that a tenant whose reservations sum to exactly its budget can start everything it declared.
 
 So **phase 5 deletes `tenant-quota`** and re-homes the two things that were riding on it:
 
 - **The `LimitRange` renders unconditionally.** It is doing real work independently of any quota: several platform-authored workloads ship with no resources at all and rely on its defaults — the `mariadb` and `clickhouse` backup CronJobs, the `vm-disk` pre-install PVC-resize hook Job. Today a tenant with no `resourceQuotas` already gets no defaults for those, which is a pre-existing inconsistency this change also fixes.
-- **Launcher limits are given up, deliberately.** With no quota constraining `limits.*` in the namespace, `AutoResourceLimitsGate` goes inert. On CPU this costs nothing: an 8 vCPU guest is eight QEMU threads and cannot exceed eight cores, and dedicated-CPU instance types already get requests equal to limits from KubeVirt for the CPU manager. What the gate actually adds is a **memory** limit on shared-CPU launchers, and losing it moves those pods from `Burstable`-with-a-limit to `Burstable`-without-one. That is an accepted trade, stated here rather than left implicit.
+- **Launcher limits are given up, deliberately.** With no quota constraining `limits.*` in the namespace, `AutoResourceLimitsGate` goes inert. On CPU nothing is lost: an 8 vCPU guest is eight QEMU threads and cannot exceed eight cores, and dedicated-CPU instance types already get requests equal to limits from KubeVirt for the CPU manager. What the gate actually adds is a **memory** limit on shared-CPU launchers, and losing it moves those pods from `Burstable`-with-a-limit to `Burstable`-without-one. That is an accepted trade, stated here rather than left implicit.
 
 **One interaction must be tested on a dev cluster before phase 5 ships.** With the gate inert, a shared-CPU launcher arrives with a multi-gigabyte memory *request* and no limit. The `LimitRange`'s container `default.memory: 128Mi` would then be applied as that pod's limit, and pod validation rejects a limit below the request — so every shared-CPU VM in the namespace would fail admission. Today this can never happen, precisely because the quota and the `LimitRange` are under the same conditional and the gate is therefore always armed wherever the `LimitRange` exists. Unconditional rendering breaks that coupling. The `LimitRange` needs either a container default that does not apply to launchers, or no memory limit default at all; which of those is correct is an implementation decision for phase 5, but it is a blocking one.
 
@@ -565,17 +343,17 @@ This also removes the last reason to keep the inflation factor in any form, whic
 - `tenant.spec.resourceQuotas` keeps its shape and its meaning. It becomes exact: `memory: 16Gi` means 16Gi of guest memory, and a tenant can use all of it.
 - Non-Tenant kinds gain admission errors they did not have. Previously an over-quota application was accepted and failed later as a rejected pod, surfacing as a `CrashLoopBackOff` or an unschedulable workload. Now the request is refused at the moment it is made, naming the pool and the size. This is a diagnostic improvement, but it is a new rejection surface for clients and tooling.
 - **Anything an autoscaler can raise without writing the CR reserves at its ceiling.** A `KubernetesNodes` pool with `maxReplicas: 10` reserves ten workers even while running zero, and a `Postgres` with `autoscaling.enabled` reserves `autoscaling.maxReplicas` instances even while resting at `replicas`. This is the conservative choice for capacity and it is a visible change for tenants who set wide bounds — but it is not merely conservative: in both cases the scaling actuator writes a scale subresource, never the application CR, so there is no write for an admission gate to catch and reserving the ceiling is the only correct answer.
-- **Halted VMs still reserve.** A `runStrategy: Halted` VM consumes its quota, because reservation is not usage. This is intentional and central to the model, and it differs from today, where a stopped VM frees its quota.
-- Tenant modules enabled by flag (`monitoring`, `ingress`, `etcd`, `seaweedfs`) reserve their components' sizes, excluding the VPA headroom listed under [§2](#2-specreservation-on-applicationdefinition).
+- **Halted VMs still reserve.** A `runStrategy: Halted` VM consumes its reservation, because a reservation is not usage. This is intentional and central to the model, and it differs from today, where a stopped VM frees its quota.
+- Tenant modules enabled by flag (`monitoring`, `ingress`, `etcd`, `seaweedfs`) consume their components' reservations, excluding the VPA headroom listed under [§2](#2-consumption-declared-on-the-applicationdefinition).
 - Each pool's `reserved` and `budget` appear on the `Tenant` application's status, readable before ordering.
 - `tenant-quota` is deleted from tenant namespaces in phase 5; the `LimitRange` stays and becomes unconditional. Shared-CPU virt-launcher pods lose their memory limit.
-- `ApplicationDefinition` gains `spec.reservation`, which matters to anyone shipping custom application kinds — and once the gate is on, a definition with neither a reservation block nor an explicit exemption is refused.
+- `ApplicationDefinition` gains a declaration of the kind's consumption, which matters to anyone shipping custom application kinds — and once the gate is on, a definition that declares neither its consumption nor an explicit exemption is refused.
 
 ## Upgrade and rollback compatibility
 
 The semantic change is opt-in, behind a flag on both `cozystack-api` and `cozystack-controller`. With the flag off, both oracles are compiled in and the legacy one is used, so behavior is bit-identical; the existing pool tests are the guard for that.
 
-The upgrade has one consequence that no migration can handle automatically. Operators who inflated a tenant's quota to work around the overhead, which is the documented workaround for the failure in [The problem](#the-problem), will find that inflation is now usable reservation, so those tenants gain real capacity. A migration cannot tell which part of a declared quota was headroom and which was the intended contract. This is therefore documented rather than automated, and the `reserved`/`budget` reporting is introduced in the same release so the gap is visible before the flag is flipped.
+The upgrade has one consequence that no migration can handle automatically. Operators who inflated a tenant's quota to work around the overhead, which is the documented workaround for the failure in [The problem](#the-problem), will find that inflation is now usable budget, so those tenants gain real capacity. A migration cannot tell which part of a declared quota was headroom and which was the intended budget. This is therefore documented rather than automated, and the `reserved`/`budget` reporting is introduced in the same release so the gap is visible before the flag is flipped.
 
 In the other direction, reserving at the autoscaling ceiling can make a write that used to succeed fail. This applies to two populations, not one: clusters with wide `KubernetesNodes` bounds, and any database with `autoscaling.enabled` whose `autoscaling.maxReplicas` is well above its resting `replicas`. Both should be checked against pool headroom before the flag is enabled, and the `reserved`/`budget` status shipped in the same release is what makes that checkable.
 
@@ -584,42 +362,46 @@ Rollback is turning the flag off, for every step except the last. Phase 5 is irr
 ## Security
 
 - **No new tenant-supplied input.** The reservation is computed from values that already pass the kind's OpenAPI schema. Tenants gain no new field.
-- **`spec.reservation` is platform-authored.** It lives on a cluster-scoped `ApplicationDefinition`, which tenants cannot write.
-- **A missing or wrong reservation block under-charges a tenant**, which is a quota-escalation vector: an application kind that reserves nothing is free. This is the main new risk, and an in-tree completeness test cannot mitigate it, because an out-of-tree catalog is exactly where an omitted block would appear. So the mitigation is structural: once the gate is on, a definition carrying neither a `reservation` block nor an explicit `reservation: {exempt: true}` marker is refused for that kind, so a zero charge is always a reviewed declaration rather than an omission. A *wrong* block remains possible, and the mitigation for that is the rendered-requests comparison test in [Testing](#testing), which makes each kind's uncharged overhead a number in CI.
-- **A stale evaluation must not become a free application.** When an already-stored sibling cannot be evaluated — a resolver failure, an instance type deleted out from under it — the pool's count must not silently drop by that application's charge, which would hand the next writer headroom that does not exist. The sibling retains its last successfully evaluated reservation, and the pool condition records that the figure is stale.
-- **The reservation contract must not change an existing application's charge retroactively.** `spec.reservation` lives on a platform-authored definition, so editing it, or editing a referenced preset or instance type, re-prices every stored application of that kind with no tenant write anywhere. Instance types are therefore immutable by policy ([§3](#3-resolving-instance-types-and-presets)), presets change only through the generated table, and a change to a kind's `reservation` block is treated as a migration with an explicit re-pricing step rather than as an ordinary package bump. This is the same class of problem `application-definition-versioning` handles for values, and if that proposal lands first the reservation block inherits its storage-version discipline for free.
+- **The declaration is platform-authored.** It lives on a cluster-scoped `ApplicationDefinition`, which tenants cannot write. The figures the controller persists live under an annotation key outside the prefix through which tenants' own annotations reach the HelmRelease ([§6](#6-what-the-controller-becomes)), so a tenant cannot write them either.
+- **A missing or wrong declaration under-counts a tenant**, which is a quota-escalation vector: an application kind that reserves nothing is free. This is the main new risk, and an in-tree completeness test cannot mitigate it, because an out-of-tree catalog is exactly where an omitted declaration would appear. So the mitigation is structural: once the gate is on, a definition that declares neither its consumption nor an explicit exemption is refused for that kind, so a zero reservation is always a reviewed declaration rather than an omission. A *wrong* declaration remains possible, and the mitigation for that is the rendered-requests comparison test in [Testing](#testing), which makes each kind's unreserved overhead a number in CI.
+- **A stale evaluation must not become a free application.** When an already-stored sibling cannot be evaluated — a resolver failure, an instance type deleted out from under it — the pool's figure must not silently drop by that application's reservation, which would hand the next writer headroom that does not exist. The sibling retains its last successfully evaluated reservation, and the pool condition records that the figure is stale.
+- **A re-evaluation is a migration, never a side effect.** A kind's declaration lives on a platform-authored definition, so editing it, or editing a referenced preset or instance type, re-evaluates every stored application of that kind with no tenant write anywhere. Instance types and presets are therefore immutable by policy ([§3](#3-environment-instance-types-and-presets)), and a change to a kind's declaration is shipped as a migration with an explicit re-evaluation step rather than as an ordinary package bump. A tenant the re-evaluation leaves over budget gets the answer a pool already gives a parent that lowers its quota: nothing is evicted, the pool reports `Overcommitted`, and no new order is admitted into it until the tenant shrinks or the operator raises the budget. The migration reports which tenants will go over **before** it applies, and that report is what the operator communicates from. This is the same class of problem `application-definition-versioning` handles for values, and if that proposal lands first the declaration inherits its storage-version discipline for free.
 - **The gate must fail closed on the object being written.** Today `siblingDeclaredQuotas` deliberately skips siblings whose values do not parse, with a warning, so that "a malformed sibling must not block an unrelated tenant write". That fail-open choice is right for a sibling and wrong for the object under admission: applied to reservation it would make an unparseable custom resource free. The proposed behavior is to reject when the object being written cannot be evaluated, and to warn plus set a pool condition when another object cannot be, so the under-count is surfaced instead of hidden.
 - **RBAC surface is unchanged.** The gate reads HelmReleases with the apiserver's existing service account, as it already does for siblings and pool usage.
 
 ## Failure and edge cases
 
-- Application kind whose definition has neither a `reservation` block nor an `exempt` marker → refused once the gate is on, rather than reserving nothing.
-- Stored values missing a key the reservation reads → the schema default is materialized first (see [§2](#2-specreservation-on-applicationdefinition)); an absent key with no default resolves to zero for that item only.
-- `instanceType` names a `VirtualMachineClusterInstancetype` that does not exist → rejected at admission with the resolver's error, instead of later by the chart's `lookup` failure in `templates/vm.yaml`.
-- Both `instanceType` and a **complete** `resources` block set → the evaluator charges `resources`. On `main` the `vm-instance` chart already agrees: `virtual-machine.effectiveInstanceType` omits the matcher once `resources` sizes the VM, so the rendered `VirtualMachine` no longer carries both. (An earlier revision of this text said the chart still rendered both and KubeVirt could not reconcile them; that was true of an older chart and is not true now.)
-- Both set, but the `resources` block is **partial** → the chart fails the render and names both sides, so no such application can exist to be charged. The evaluator does not need a rule for it.
-- `vm-instance` `resources` with `cpu` but no `sockets` → `domainResources` emits no `domain.cpu` at all, so the instance type sizes the VM; the evaluator charges the instance type, matching the chart.
-- **ComputePlane with no declared `nodeGroups`** → the module materializes an `md0` pool at template time as its own labelled `KubernetesNodes` HelmRelease, which the aggregator counts — but that release carries only `{roles, minReplicas: 0}`, so its size comes entirely from schema defaults. Correct only once the evaluator defaults its inputs; see [§2](#2-specreservation-on-applicationdefinition).
+- Application kind whose definition declares neither its consumption nor an exemption → refused once the gate is on, rather than reserving nothing.
+- Stored values missing a key the declaration reads → the schema default is materialized first (see [§2](#2-consumption-declared-on-the-applicationdefinition)); an absent key with no default contributes zero for that term only.
+- `instanceType` names a `VirtualMachineClusterInstancetype` that does not exist → rejected at admission with the evaluator's error, instead of later by the chart's `lookup` failure in `templates/vm.yaml`.
+- `vm-instance` with both `instanceType` and a **complete** `resources` block (`cpu`, `sockets` and `memory`) → the reservation is the block, `cpu × sockets` vCPUs. On `main` the chart agrees: `virtual-machine.effectiveInstanceType` omits the matcher once `resources` sizes the VM.
+- `vm-instance` with both set but a **partial** `resources` block → the chart fails the render and names both sides, so no such application can exist to be evaluated.
+- `vm-instance` `resources` with `cpu` but no `sockets` → `domainResources` emits no `domain.cpu` at all, so the instance type sizes the VM and is what is reserved, matching the chart.
+- A cozy-lib kind with a **partial** `resources` block on a preset (`resources: {cpu: "1"}` on `t1.nano`) → the reservation follows the chart's per-key fill: 1 CPU and the preset's 128Mi.
+- **ComputePlane with no declared `nodeGroups`** → the module materializes an `md0` pool at template time as its own labelled `KubernetesNodes` HelmRelease, which the aggregator counts — but that release carries only `{roles, minReplicas: 0}`, so its size comes entirely from schema defaults. Correct only once the evaluator defaults its inputs; see [§2](#2-consumption-declared-on-the-applicationdefinition).
 - Concurrent or rapid sequential creates into one pool → may overshoot by more than one application (see [§5](#5-generalizing-the-gate-to-every-kind)); per-pool-root serialization plus a post-write re-read closes the single-client case, the controller reports whatever remains, and nothing is evicted.
 - Parent lowers its quota below existing carve-outs → `Overcommitted` reports it, as today. No retroactive enforcement.
-- `vm-disk` resized upward → the `Update` path charges the delta; a downward resize releases it.
-- **Cluster-autoscaler scales a `KubernetesNodes` pool, or KEDA's HPA scales a CNPG `Cluster`** → neither writes the application CR, so no `Update` reaches the gate and none is rejected. Both are covered by having reserved the ceiling at declaration time, which is why the ceiling is what is charged.
+- A re-evaluation raises a pool above its budget → same answer: `Overcommitted`, nothing evicted, new orders refused until it fits; the migration's pre-apply report names the pool.
+- `vm-disk` resized upward → the `Update` path counts the delta; a downward resize releases it.
+- **Cluster-autoscaler scales a `KubernetesNodes` pool, or KEDA's HPA scales a CNPG `Cluster`** → neither writes the application CR, so no `Update` reaches the gate and none is rejected. Both are covered by having reserved the ceiling at declaration time, which is why the ceiling is what is reserved.
 - A human edit raising `maxReplicas` or `autoscaling.maxReplicas` past the pool budget → *that* is an `Update`, and it is rejected with the delta named. Raising the ceiling is where the capacity conversation happens.
 - Unparseable values on the object being written → rejected. On another object in the pool → warned, pool condition set, and that object keeps its last known reservation rather than dropping to zero.
 - Tenant with no declared quota → unbounded, draws from its nearest bounded ancestor's pool, unchanged from today.
 
 ## Testing
 
-- **Unit, evaluator per kind:** table-driven over each package's `values.yaml` defaults and its `examples/`, asserting the exact `ResourceList` for every in-tree kind. This is where per-kind correctness is pinned.
-- **Unit, overhead against rendered pods — the test that replaces the completeness test.** For each kind, render the chart with its default values and sum the resulting pod requests, then compare against the evaluator's output for the same values. The test does not assert equality: the difference *is* the platform overhead tabulated in [§2](#2-specreservation-on-applicationdefinition), and the assertion is against a checked-in expected figure per kind. A change that silently grows a kind's uncharged footprint — a new sidecar, a bumped sentinel preset — then fails CI and has to be acknowledged in the table. A test asserting merely that every kind *has* a `reservation` block would prove nothing about whether the block is adequate, which is why it is not the gate.
-- **Unit, defaulting:** an application whose stored values omit every optional key evaluates to the same `ResourceList` as one that writes the schema defaults explicitly. This is the regression guard for the read-path-only defaulting described in [§2](#2-specreservation-on-applicationdefinition), including a ComputePlane-shaped `KubernetesNodes` release carrying only `{roles, minReplicas}`.
-- **Unit, instance-type classification:** every type in `packages/system/kubevirt-instancetypes` classifies to the expected quota key from its spec alone, covering the cases a name-based rule gets wrong — `m1` (shared CPU, hugepages), `n1` (dedicated, hugepages), `o1` (`overcommitPercent`) — and a dedicated type with `isolateEmulatorThread` charges `guest + 1` cores.
-- **Unit, preset table:** the Go table is *generated* from `_resourcepresets.tpl` rather than compared against it, so the test is that the generator's output is committed and up to date (a `go generate` diff check), not a parser that can pass on a comment. Separately: every legacy flat alias resolves at its legacy figure rather than being rejected, since the shipped `values.schema.json` enums still accept them.
+- **Unit, evaluator per kind:** table-driven over each package's `values.yaml` defaults and its `examples/`, asserting the exact `ResourceList` for every in-tree kind. This is where per-kind correctness is pinned, including the cases [§2](#2-consumption-declared-on-the-applicationdefinition) lists: a `vm-instance` `{cpu: 4, sockets: 2}` block reserves 8 vCPUs; a `postgres` with `resources: {cpu: "1"}` on `t1.nano` reserves 1 CPU and 128Mi; `clickhouse` reserves `shards × replicas` server pods plus its keepers; `vm-instance` with `external: true` reserves one `services.loadbalancers`.
+- **Unit, overhead against rendered pods — the test that replaces the completeness test.** For each kind, render the chart with its default values and sum the resulting pod requests, then compare against the evaluator's output for the same values. The test does not assert equality: the difference *is* the platform overhead tabulated in [§2](#2-consumption-declared-on-the-applicationdefinition), and the assertion is against a checked-in expected figure per kind. A change that silently grows a kind's unreserved footprint — a new sidecar, a sentinel moved back onto the data preset — then fails CI and has to be acknowledged in the table. A test asserting merely that every kind *has* a declaration would prove nothing about whether it is adequate, which is why it is not the gate.
+- **Unit, defaulting:** an application whose stored values omit every optional key evaluates to the same `ResourceList` as one that writes the schema defaults explicitly. This is the regression guard for the read-path-only defaulting described in [§2](#2-consumption-declared-on-the-applicationdefinition), including a ComputePlane-shaped `KubernetesNodes` release carrying only `{roles, minReplicas}`.
+- **Unit, instance-type classification:** every type in `packages/system/kubevirt-instancetypes` classifies to the expected quota key from its spec alone, covering the cases a name-based rule gets wrong — `m1` (shared CPU, hugepages), `n1` (dedicated, hugepages), `o1` (`overcommitted-memory`) — and a dedicated type with `isolateEmulatorThread` reserves `guest + 1` cores.
+- **Unit, presets:** every preset the shipped schemas admit resolves, every legacy flat alias at its legacy figure rather than being rejected, and the evaluator resolves each one to the same figure the chart renders. If presets become environment objects ([§3](#3-environment-instance-types-and-presets)), that last assertion holds by construction, since both read the same object.
 - **Unit, pool arithmetic:** the existing `pool_test.go` must pass unmodified. Any diff there means pool semantics changed, which is out of scope. `reconciler_test.go` does change, because the budget source moves from the rendered `tenant-quota` to tenant values ([§4](#4-reservation-as-the-usage-oracle)).
-- **Unit, delta charging:** `Update` from `u1.small` to `u1.large` charges the difference; an unrelated edit charges nothing; a shrink is always accepted.
-- **Unit, autoscaling ceiling:** a `Postgres` with `autoscaling.enabled` charges `autoscaling.maxReplicas`; the same object with autoscaling off charges `replicas`; `clickhouse` charges `shards × replicas` plus its keepers.
+- **Unit, delta counting:** `Update` from `u1.small` to `u1.large` counts the difference; an unrelated edit counts nothing; a shrink is always accepted.
+- **Unit, autoscaling ceiling:** a `Postgres` with `autoscaling.enabled` reserves `autoscaling.maxReplicas`; the same object with autoscaling off reserves `replicas`.
+- **Unit, status persistence:** the pool annotations on a `Tenant`'s HelmRelease survive a tenant `Update` of that `Tenant`, are projected into `Tenant.status`, and an `Application` annotation crafted to collide with them lands under the `apps.cozystack.io-` prefix instead.
 - **Integration, admission boundary:** a pool with 8Gi accepts a 4Gi VM twice and rejects the third; the rejection names the pool and the instance type.
 - **Integration, fail-closed:** an application whose values do not evaluate is rejected, and one sibling that does not evaluate does not block an unrelated write.
+- **Integration, re-evaluation:** a migration that raises a kind's reservation reports the tenants it will push over budget before applying, and after applying those pools are `Overcommitted` and refuse new orders without evicting anything.
 - **e2e, the regression this proposal exists for:** a tenant whose memory quota exactly equals the sum of its VMs' guest memory starts every one of them. This fails today by construction.
 - **e2e, the gate that did not exist:** creating a `VMInstance` that exceeds the tenant's pool is refused by the API call itself, with the pool and the size in the error. Today that create succeeds and the VM never starts.
 - **e2e, phase 5 launcher admission:** with `tenant-quota` deleted and the `LimitRange` unconditional, a shared-CPU VM starts. This is the interaction described in [§7](#7-retiring-the-namespace-resourcequota) — a `default.memory` of 128Mi applied as a limit below a multi-gigabyte request would fail pod validation — and it gates the phase.
@@ -629,50 +411,52 @@ Rollback is turning the flag off, for every step except the last. Phase 5 is irr
 
 | Phase | Contents | Flag |
 |---|---|---|
-| 1 | `pkg/reservation` as a standalone importable package (resolver with class keys, evaluator, aggregator, generated preset table), plus schema defaulting of its inputs. No consumer | n/a |
-| 2 | `spec.reservation` on `ApplicationDefinition`; blocks for the IaaS kinds (`vm-instance`, `vm-disk`, `kubernetes`, `kubernetes-nodes`), which carry the whole overhead problem. ComputePlane's `md0` default materialized into its values | n/a |
-| 3 | Usage oracle and budget source switchable; gate generalized to kinds that have a block, with per-pool-root serialization and post-write re-read; `reserved`/`budget` on `Tenant` status | off by default |
-| 4 | Remaining kinds, package by package, until every kind carries a block or an explicit exemption; the rendered-requests overhead figures checked in per kind | on by default |
+| 1 | `pkg/reservation` as a standalone importable package — the evaluator, environment resolution with class keys, the aggregator — plus schema defaulting of its inputs. No consumer | n/a |
+| 2 | Consumption declared on `ApplicationDefinition`, for the IaaS kinds first (`vm-instance`, `vm-disk`, `kubernetes`, `kubernetes-nodes`), which carry the whole overhead problem. ComputePlane's `md0` default materialized into its values | n/a |
+| 3 | Usage oracle and budget source switchable; gate generalized to kinds that declare their consumption, with per-pool-root serialization and post-write re-read; `reserved`/`budget` persisted on the `Tenant`'s HelmRelease and projected into its status | off by default |
+| 4 | Remaining kinds, package by package, until every kind declares its consumption or an explicit exemption; redis, valkey and Harbor's redis sentinels moved to a small fixed preset; the tenant-module gate (via #39 or the fallback in [§5](#5-generalizing-the-gate-to-every-kind)); the rendered-requests overhead figures checked in per kind | on by default |
 | 5 | `tenant-quota` deleted and the `LimitRange` re-homed unconditionally; `EnforcedHard` / `tenant-quota-allocated` removed; `--tenant-quota-buffer-percent` deleted; flag removed | removed |
 
 Phases 1 to 3 form a self-contained, testable increment and are what implementation would start with — and they are already the bulk of the user-visible win, since they are what puts a gate in front of an ordinary application order for the first time. Phase 5 is only defensible once phase 4 is complete: removing the runtime net presupposes that every kind reserves, and it additionally depends on resolving the `LimitRange`/launcher-limit interaction in [§7](#7-retiring-the-namespace-resourcequota) on a dev cluster.
 
 ## Open questions
 
-Several questions this proposal opened have been closed in review and are recorded here as settled rather than open:
+Every question this proposal opened has been settled in review and is recorded here:
 
-- **`maxReplicas`, not `minReplicas`, for anything an autoscaler can raise without writing the CR.** Settled. The argument that decided it is that neither actuator writes the application CR — the cluster-autoscaler scales the MachineDeployment, KEDA's HPA scales the CNPG `Cluster`'s scale subresource — so there is no `Update` for a gate to see, and reserving the minimum would push the failure back to pod admission, which is what this proposal removes. It does charge idle tenants for headroom; that is the accepted cost.
-- **Instance types: resolve to scalars, keyed by class.** Settled, over the alternative of charging the type itself as a `count/<type>`-style key. The per-type key removes the resolution step and makes an unresolvable type impossible to under-charge, but it loses fungibility inside a class and cannot be expressed by `objects:` anyway, whose key is a literal. Class keys keep the pool arithmetic and the dashboards in fungible units while still failing closed on an unresolvable type. See [§3](#3-resolving-instance-types-and-presets).
-- **Preset table: generate, do not compare.** Settled. A parity test that parses the `.tpl` is fragile in both directions; generating the Go table from the chart makes divergence impossible rather than detected. The ConfigMap alternative is still recorded in [Alternatives](#alternatives-considered) but is not needed once the table is generated.
-- **The guard quota is dropped, not loosened.** Settled; see [§7](#7-retiring-the-namespace-resourcequota) for the reasoning and for the two things that had to be re-homed.
-- **Sized defaults belong in values.** Settled as a rule for all kinds, not just as a workaround for one. [#3315](https://github.com/cozystack/cozystack/pull/3315) retired the `kubernetes` instance, ComputePlane is where it now applies, and the same rule helps [`application-definition-versioning`](#scope-and-related-proposals), whose conversion is likewise a function of values.
+- **`maxReplicas`, not `minReplicas`, for anything an autoscaler can raise without writing the CR.** Neither actuator writes the application CR — the cluster-autoscaler scales the MachineDeployment, KEDA's HPA scales the CNPG `Cluster`'s scale subresource — so there is no `Update` for a gate to see, and reserving the minimum would push the failure back to pod admission, which is what this proposal removes. It counts idle headroom against the pool; that is the accepted trade.
+- **Instance types resolve to scalars, keyed by class**, over the alternative of a per-type `count/<type>`-style key, which loses fungibility inside a class. `o1` gets its own `overcommitted-memory` key, consistent with hugepages. See [§3](#3-environment-instance-types-and-presets).
+- **How a kind expresses its consumption is not fixed by this proposal.** The evaluator's contract is ([§2](#2-consumption-declared-on-the-applicationdefinition)); [Appendix A](#appendix-a-non-normative-sketch-of-a-declaration) sketches one shape.
+- **Presets** are resolved from the same source the chart renders from; making them platform-shipped environment objects is the implementation direction ([§3](#3-environment-instance-types-and-presets)).
+- **The guard quota is dropped, not loosened.** See [§7](#7-retiring-the-namespace-resourcequota) for the reasoning and for the two things that had to be re-homed.
+- **Sized defaults belong in values**, as a rule for all kinds. [#3315](https://github.com/cozystack/cozystack/pull/3315) retired the `kubernetes` instance, ComputePlane is where it now applies, and the same rule helps [`application-definition-versioning`](#scope-and-related-proposals), whose conversion is likewise a function of values.
+- **Redis and Valkey sentinels** are not reserved; their magnitude is a chart defect, fixed by sizing them with a small fixed preset ([§2](#2-consumption-declared-on-the-applicationdefinition)).
+- **A re-evaluation that leaves a tenant over budget** evicts nothing, reports `Overcommitted` and refuses new orders, and the migration reports the affected tenants before it applies ([Security](#security)).
+- **Storage is reserved at the declared size**, not the resulting PVC; what a chart adds is platform margin.
+- **Tenant modules consume** through their own kinds; their gate comes from #39, with a stated fallback if it stalls ([§5](#5-generalizing-the-gate-to-every-kind)).
+- **`Tenant` status persists** as annotations on the `Tenant`'s HelmRelease, projected on read ([§6](#6-what-the-controller-becomes)).
 
-What remains genuinely open:
-
-- **Should tenant module flags reserve?** This proposal says yes, since those components consume real capacity and the tenant asked for them. It does change the effective consumption of existing tenants at flag-flip time. [PR #39](https://github.com/cozystack/community/pull/39) makes this question disappear by turning the modules into applications with their own reservation blocks; if #39 lands first, the special case is never written.
-- **Should `storage` be charged from the declared `vm-disk` size or from the resulting PVC request?** They can differ when a chart rounds or adds a WAL volume.
-- **Should the redis/valkey sentinels be charged after all?** They are the largest single entry in the platform-overhead table in [§2](#2-specreservation-on-applicationdefinition): three pods at the data preset, which for a small `redis` is more than the data pods themselves. They are also perfectly expressible — a second item with `count: {value: 3}` and the same `presetFrom` — so the only reason not to charge them is the principle that fixed operator topology is platform overhead. That principle is right in general and possibly wrong at this magnitude.
-- **How is a change to a `reservation` block rolled out?** [Security](#security) says it is a migration with an explicit re-pricing step rather than an ordinary package bump, but what that step *does* to a tenant already over the new figure is not specified, and "evict nothing, report overcommit" may not be a sufficient answer when the platform, not the tenant, caused the change.
+The one decision still to make is an implementation one and blocks phase 5 only: whether the unconditional `LimitRange` drops its container memory-limit default or scopes it away from virt-launcher pods ([§7](#7-retiring-the-namespace-resourcequota)).
 
 ## Alternatives considered
 
 **Accounting basis.**
-Keep pod-level accounting and compute an exact overhead allowance per pool, instead of a global percentage. This fixes the additive-overhead arithmetic and is a much smaller change, but it keeps `status.used` on the admission path, so the stale-counter failure mode and the onboarding blockage survive. It also makes the tenant's commercial contract depend on virt-launcher internals, which change between KubeVirt releases. Rejected for that coupling more than for its size.
+Keep pod-level accounting and compute an exact overhead allowance per pool, instead of a global percentage. This fixes the additive-overhead arithmetic and is a much smaller change, but it keeps `status.used` on the admission path, so the stale-counter failure mode and the onboarding blockage survive. It also makes the tenant contract depend on virt-launcher internals, which change between KubeVirt releases. Rejected for that coupling more than for its size.
 Keep the global buffer percentage (status quo). Rejected: the required buffer varies by a factor of thirty with VM granularity, as tabulated in [The problem](#the-problem).
 
-**Location of the cost function.**
+**Location of the evaluator.**
 A Go `switch` over kinds in the aggregated apiserver. Rejected: every new application kind requires an apiserver change, and out-of-tree kinds cannot participate at all.
 Render the chart at admission and sum the resulting pod specs. Rejected: it needs a chart fetch and a full template render in the request path, and it yields overhead-laden numbers, reintroducing the problem this proposal removes.
-A `ValidatingAdmissionPolicy` in CEL. Rejected: CEL cannot aggregate across objects, so the pool's current reservation would have to be published into a resource for the policy to read, which is strictly more machinery than evaluating it directly.
+A `ValidatingAdmissionPolicy` in CEL. Rejected: CEL cannot aggregate across objects, so the pool's current figure would have to be published into a resource for the policy to read, which is strictly more machinery than evaluating it directly. (Using CEL to express *one application's* consumption, as [Appendix A](#appendix-a-non-normative-sketch-of-a-declaration) sketches, is a different question: there it is evaluated per object by the evaluator, and the aggregation stays in Go.)
+A typed declaration language on the definition, with one field per size vocabulary (`instanceTypeFrom`, `presetFrom`, `resourcesFrom` with a `resourcesShape`, and a recursive count expression). This was the previous revision's normative text. Rejected: it hardcoded three size vocabularies, each with a resolution rule and a precedence rule taken from one chart family, and it was already wrong for the other one — its rule that a complete block wins and otherwise the preset applies would have reserved `t1.nano`'s 250m for a Postgres pod that renders at 1 CPU, because cozy-lib fills a preset per key. `resourcesShape` had been added to patch one such mismatch and this was a second, the sign that the shape was wrong rather than incomplete.
 
-**Preset table.**
-Exported as a ConfigMap by the platform chart, keeping exactly one runtime copy of the table. Rejected now that the Go table is *generated* from `_resourcepresets.tpl` rather than hand-maintained beside it: generation already makes divergence impossible, and the ConfigMap would add a read dependency to the admission path to solve a problem that no longer exists.
-A hand-written Go table with a parity test that parses the `.tpl` at test time was the earlier proposal. Rejected: a test that parses a Helm template is fragile in both directions — it can pass on a stray comment and fail on whitespace — and detecting divergence is strictly worse than making it impossible.
+**Preset resolution.**
+A hand-written Go table with a parity test that parses `_resourcepresets.tpl` at test time. Rejected: a test that parses a Helm template is fragile in both directions — it can pass on a stray comment and fail on whitespace — and detecting divergence is strictly worse than making it impossible.
+A Go table generated from `_resourcepresets.tpl` at build time. Superseded rather than rejected outright: it makes the two copies agree, but they are still two copies, and the evaluator and the chart still read different things. Presets as platform-shipped environment objects, looked up by both ([§3](#3-environment-instance-types-and-presets)), leave one copy.
 
 **An existing quota engine: KubeVirt's Application Aware Quota.**
-[AAQ](https://github.com/kubevirt/application-aware-quota) attacks the same overhead symptom and was raised in review by @Barakmor1. Its `vmiCalcConfigName: VirtualResources` mode prices a launcher by the guest size declared on the `VirtualMachineInstance` rather than by the pod's requests, and its `overhead_calculator` reads the KubeVirt CR instead of hardcoding a figure that moves between releases. On that axis it is strictly better than `--tenant-quota-buffer-percent`, and if additive overhead were the only failure described here, adopting it would beat writing anything new.
+[AAQ](https://github.com/kubevirt/application-aware-quota) attacks the same overhead symptom and was raised in review by @Barakmor1. Its `vmiCalcConfigName: VirtualResources` mode counts a launcher by the guest size declared on the `VirtualMachineInstance` rather than by the pod's requests, and its `overhead_calculator` reads the KubeVirt CR instead of hardcoding a figure that moves between releases. On that axis it is strictly better than `--tenant-quota-buffer-percent`, and if additive overhead were the only failure described here, adopting it would beat writing anything new.
 
-It cannot carry the tenant contract, for three reasons its extension mechanism does not reach. The accounting unit is the pod: `AaqEvaluator.GroupResource()`, `Handles` and `Matches` all delegate to the upstream pod evaluator, and the sidecar interface is `PodUsageFunc(podToEvaluate *corev1.Pod, existingPods []*corev1.Pod)`. A sidecar can therefore price a pod from the custom resource that owns it, as the built-in `VirtLauncherCalculator` already does through the VMI informer, and a Cozystack sidecar reading `spec.reservation` would be a legitimate implementation of the cost function. But every entry point is a pod event — AAQ invokes sidecars during pod evaluation and gates pods with scheduling gates — and there is none for "a custom resource was created, changed or deleted". Two consequences follow, and they are the same defect seen from two sides. Nothing charges a workload whose pods do not exist yet, so a stopped VM would cost nothing, which is the opposite of a reservation. And nothing re-evaluates a workload whose *reservation changed without its pods changing*: a tenant shrinking a declared size, or deleting a custom resource whose pods are still terminating, leaves AAQ's recorded usage stale until some unrelated pod event happens to refresh it. A reservation model needs the custom-resource write itself to be the accounting event, which is exactly what admission in the aggregated apiserver already is.
+It cannot carry the tenant contract, for three reasons its extension mechanism does not reach. The accounting unit is the pod: `AaqEvaluator.GroupResource()`, `Handles` and `Matches` all delegate to the upstream pod evaluator, and the sidecar interface is `PodUsageFunc(podToEvaluate *corev1.Pod, existingPods []*corev1.Pod)`. A sidecar can therefore count a pod from the custom resource that owns it, as the built-in `VirtLauncherCalculator` already does through the VMI informer, and a Cozystack sidecar calling the evaluator would be a legitimate implementation of it. But every entry point is a pod event — AAQ invokes sidecars during pod evaluation and gates pods with scheduling gates — and there is none for "a custom resource was created, changed or deleted". Two consequences follow, and they are the same defect seen from two sides. Nothing counts a workload whose pods do not exist yet, so a stopped VM would consume nothing, which is the opposite of a reservation. And nothing re-evaluates a workload whose *reservation changed without its pods changing*: a tenant shrinking a declared size, or deleting a custom resource whose pods are still terminating, leaves AAQ's recorded usage stale until some unrelated pod event happens to refresh it. A reservation model needs the custom-resource write itself to be the accounting event, which is exactly what admission in the aggregated apiserver already is.
 
 Only schedulable resources reach that evaluation in the first place. `FilterNonScheduableResources` retains `pods`, `cpu`, `memory` and `ephemeral-storage` with their `requests.`/`limits.` forms, and the rq-controller strips everything else, `requests.storage` explicitly included, into a managed native `ResourceQuota`. A tenant's `storage` and `services.loadbalancers` would keep being counted from `status.used`, leaving that part of the quota on exactly the failure mode described in [The problem](#the-problem).
 
@@ -682,4 +466,64 @@ Rejected as a replacement, recorded as complementary. AAQ enforces with a schedu
 
 **Enforcement point.**
 Keep `EnforcedHard` and the allocated quota alongside reservation accounting. Rejected: it computes a clamp from reservations and applies it to pod requests, mixing the two units one level above where they are mixed today.
-A transactional reservation counter with optimistic concurrency, eliminating the concurrent-create overshoot entirely. Rejected, but on narrower grounds than an earlier revision claimed: that revision argued the overshoot was bounded by one application and therefore harmless, which is not true (see [§5](#5-generalizing-the-gate-to-every-kind)). The actual argument is that admission is best-effort by construction here — it is the same trade-off the OpenShift reconciler this design descends from accepts, and a transactional counter would need a new cluster-scoped object written on every application create, on the admission path — while the case that actually occurs, a single client's burst outrunning its own informer cache, is closed by per-pool-root serialization and a post-write re-read at a fraction of the cost. What remains uncovered is concurrent writes to one pool across apiserver replicas, reported rather than prevented.
+A transactional reservation counter with optimistic concurrency, eliminating the concurrent-create overshoot entirely. Rejected, but on narrower grounds than an earlier revision claimed: that revision argued the overshoot was bounded by one application and therefore harmless, which is not true (see [§5](#5-generalizing-the-gate-to-every-kind)). The actual argument is that admission is best-effort by construction here — it is the same trade-off the OpenShift reconciler this design descends from accepts, and a transactional counter would need a new cluster-scoped object written on every application create, on the admission path — while the case that actually occurs, a single client's burst outrunning its own informer cache, is closed by per-pool-root serialization and a post-write re-read, with no new object at all. What remains uncovered is concurrent writes to one pool across apiserver replicas, reported rather than prevented; if it ever matters, a single apiserver replica closes it.
+
+## Appendix A: non-normative sketch of a declaration
+
+Nothing in this appendix is part of the proposal. It shows one shape that satisfies the contract in [§2](#2-consumption-declared-on-the-applicationdefinition): a CEL expression per quota key on the definition, evaluated against the defaulted `values`, with a small library of environment functions. A new size vocabulary is then a new function rather than a new field, and the precedence between a named size and an override is written by the chart author, in the expression, rather than fixed by the platform.
+
+Environment functions in this sketch: `instanceType(name)` and `preset(name)` return a class-keyed map of quantities resolved from environment objects (absent class → zero), and `quantity(s)` parses a Kubernetes quantity.
+
+```yaml
+# packages/system/postgres-rd/cozyrds/postgres.yaml — sketch
+spec:
+  consumption:
+    let:
+      count: >-
+        values.autoscaling.enabled
+          ? max(values.replicas, values.autoscaling.maxReplicas)
+          : values.replicas
+    # cozy-lib fills the preset per key, so each key is overridden independently.
+    cpu: >-
+      count * (has(values.resources.cpu)
+        ? quantity(values.resources.cpu)
+        : preset(values.resourcesPreset).cpu)
+    memory: >-
+      count * (has(values.resources.memory)
+        ? quantity(values.resources.memory)
+        : preset(values.resourcesPreset).memory)
+    storage: count * quantity(values.size)
+```
+
+```yaml
+# packages/system/vm-instance-rd/cozyrds/vm-instance.yaml — sketch
+spec:
+  consumption:
+    let:
+      # vm-instance treats resources as all-or-nothing, and cpu is per socket.
+      sized: >-
+        has(values.resources.cpu) && has(values.resources.sockets)
+          && has(values.resources.memory)
+      it: instanceType(values.instanceType)
+    cpu: "sized ? int(values.resources.cpu) * int(values.resources.sockets) : it.cpu"
+    dedicated-cpu: "sized ? 0 : it['dedicated-cpu']"
+    memory: "sized ? quantity(values.resources.memory) : it.memory"
+    hugepages-2Mi: "sized ? 0 : it['hugepages-2Mi']"
+    hugepages-1Gi: "sized ? 0 : it['hugepages-1Gi']"
+    overcommitted-memory: "sized ? 0 : it['overcommitted-memory']"
+    services.loadbalancers: "values.external ? 1 : 0"
+```
+
+```yaml
+# a kind that consumes nothing says so
+spec:
+  consumption:
+    exempt: true
+```
+
+## Appendix B: implementation notes
+
+Also non-normative; recorded so the implementation does not have to rediscover them.
+
+- **Store the evaluated figure at write time.** The gate stores each application's evaluated reservation on its HelmRelease when it admits the write, under the same tenant-unwritable annotation scheme as the pool figures in [§6](#6-what-the-controller-becomes), and the pool sums stored figures rather than re-evaluating every sibling on every admission. That gives the stale-sibling rule in [Security](#security) a place to keep "the last successful evaluation", makes a re-evaluation an explicit migration over stored figures, and takes environment resolution off the admission path for everything but the object being written. Releases rendered by a platform chart rather than admitted through the apiserver (ComputePlane pools, tenant modules) carry no stored figure, so the controller evaluates and stores theirs.
+- **Cross-replica writes.** The apiserver chart ships two replicas, so per-pool serialization inside one process leaves cross-replica writes uncovered, as [§5](#5-generalizing-the-gate-to-every-kind) says. If that residual ever matters, the honest fallback is a single replica, not a transactional counter.
