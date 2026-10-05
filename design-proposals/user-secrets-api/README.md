@@ -202,7 +202,7 @@ The chart already renders that hash. After conversion it takes it from values th
 
 #### A declared account without a Secret
 
-A chart cannot see at render time whether a Secret exists except through `lookup`, which the Flux digest does not see and which this proposal removes for tenant accounts. The engines refuse on their own ([`verification.md`](./verification.md)): CNPG leaves the role as it is and reports `cannotReconcile`, mariadb-operator sets the `User` to `Ready=False` and leaves the SQL user untouched, and Flux stops a ClickHouse release with `ValuesError`, which keeps its previous revision.
+A chart cannot see at render time whether a Secret exists except through `lookup`, which the Flux digest does not see and which this proposal removes for tenant accounts. The engines refuse on their own: CNPG leaves the role as it is and reports `cannotReconcile`, mariadb-operator sets the `User` to `Ready=False` and leaves the SQL user untouched, and Flux stops a ClickHouse release with `ValuesError`, which keeps its previous revision.
 
 #### How the engine state is known
 
@@ -243,7 +243,7 @@ Without OIDC the dashboard signs in with the tenant ServiceAccount token and the
 
 ### 6. Audit and service history
 
-A mint is a `create` on `credentials/<name>/mint`, which kube-apiserver audits before proxying it to the Cozystack API, with the account in `objectRef` and the subresource telling a mint from a revoke. kube-apiserver records neither the body nor the response of a request it proxies to an aggregated API, at `Request` and at `RequestResponse` alike ([`verification.md`](./verification.md)), so the password cannot reach that log. That answers who, when and which account for every issuance, and Cozystack already ships the log to VictoriaLogs.
+A mint is a `create` on `credentials/<name>/mint`, which kube-apiserver audits before proxying it to the Cozystack API, with the account in `objectRef` and the subresource telling a mint from a revoke. kube-apiserver records neither the body nor the response of a request it proxies to an aggregated API, at `Request` and at `RequestResponse` alike (run on kube-apiserver 1.34 and 1.37, see Testing), so the password cannot reach that log. That answers who, when and which account for every issuance, and Cozystack already ships the log to VictoriaLogs.
 
 The one server that could write the password down is the Cozystack API, if it got an audit policy, and any such policy must keep `credentials` below `RequestResponse`. Distributions that give kube-apiserver no audit policy record nothing, so the installation documentation gets one for them, with the log path monitoring-agents tails. An external SIEM, the log and alerting system a security team runs, has no way in today: the fluent-bit outputs of monitoring-agents are one fixed string (`packages/system/monitoring-agents/values.yaml:377-410`), and overriding it drops the VictoriaLogs outputs. monitoring-agents gets a value for additional outputs.
 
@@ -346,7 +346,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 - Lineage webhook: an explicit `"false"` is kept where a definition selects the Secret, and a chart-set `"true"` is overwritten.
 - No foreign secret, end to end with a parent and two sibling tenants: `tenantsecrets` never lists an account Secret or `<release>-credentials`, a sibling can neither read nor mint a tenant's credentials, and a parent's mint shows in the child's record.
 - No second disclosure, end to end for each wave-1 engine: mint, log in, and find the password on no read path (the Credential, `tenantsecrets`, a direct `get` on the Secret, the application, Events, the audit log, the Helm history of the converted revision). Then mint again and see the first password fail, once `status.engine` says Applied for PostgreSQL and ClickHouse, and by polling a login for MariaDB.
-- Live checks on the pinned versions ran on plain operator objects. [`verification.md`](./verification.md) lists what held, the audit run included. The same checks through the converted charts and the Cozystack API, with the audit run on `core.cozystack.io`, are still to run.
+- Live checks on the pinned versions ran on plain operator objects: CNPG 1.30.0, mariadb-operator 25.10.2, clickhouse-operator 0.25.2 and helm-controller 1.5.0 behave as §3 and §4 state when an account Secret is missing or changes, and kube-apiserver 1.34 and 1.37 record no aggregated call body.
 - The migration and the converter: clients keep logging in at every point, including while an old chart renders between the hook and the switch, accounts show origin `Migrated`, no `users.*.password` remains, a converter stopped between `ALTER USER` and the Secret write recovers on retry, rotated platform passwords work, and no tenant route reads a converted release's `<release>-credentials`. A release it leaves out does what its cause says in [`example.md`](./example.md#when-the-migration-leaves-a-release-out).
 - Audit: a mint appears in the kube-apiserver log with `objectRef.subresource: mint` and the Credential's name.
 
