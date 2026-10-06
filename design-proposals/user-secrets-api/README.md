@@ -228,16 +228,18 @@ Removing the grants and selector entries closes cozystack/cozystack#4164 for con
 
 ### 5. Who may do what
 
-| Subject | get, list, watch `credentials` | create `credentials/mint`, `credentials/revoke` |
+| Subject | get, list `credentials` | create `credentials/mint`, `credentials/revoke` |
 |---|---|---|
 | `view` | yes | no |
 | `use` | yes | no |
 | `admin`, `super-admin` | yes | yes |
 | tenant ServiceAccount (`cozy:tenant`) | yes | yes |
 
-Minting goes with the tiers that can change the application (`clusterroles.yaml:253-284`), because it changes a running service: every client holding the old password loses access. `use` members, who read `<release>-credentials` today, keep account metadata and connection details and lose the password. The tenant ServiceAccount already holds every verb on the tenant's applications, so automation that provisions an application can mint in the same run.
+Minting goes with the tiers that can change the application (`clusterroles.yaml:253-284`), because it changes a running service: every client holding the old password loses access. `use` members, who read `<release>-credentials` today, keep account metadata and connection details and lose the password. The tenant ServiceAccount already holds every verb on the tenant's applications, so automation that provisions an application can mint in the same run and store the response itself, which the walkthrough shows together with Terraform ([headless provisioning](./example.md#headless-provisioning-and-terraform)).
 
 Ancestors inherit, since the tier and ServiceAccount bindings in a tenant namespace include every ancestor (`packages/apps/tenant/templates/tenant.yaml:8-87`). A parent administrator can mint a child's credential, as it can delete the child's database today, but the access is now visible: the mint replaces the password, the child's record shows who issued it, and the audit event names the actor.
+
+`mint` and `revoke` are separate subresources because the audit log holds no bodies and tells them apart only by subresource, and because a custom role can grant `revoke` alone to an incident responder. By default both go to `admin` and the tenant ServiceAccount. `credentials` has no `watch`: the view is built from the application, the account Secret and the engine's object, and a watch would have to merge the three, so a client reads `status.engine` with `get` after a mint. It is namespaced with no cluster-wide list, like `tenantsecrets`, and a list reads from the API's caches, one pass over the accounts of the namespace, at the cost of the informers for the engine objects (Security). Its `resourceVersion` is the account Secret's, and the only use is the precondition of a mint.
 
 Without OIDC the dashboard signs in with the tenant ServiceAccount token and the tiers collapse into the ServiceAccount, so a deployment that needs role-based disclosure and per-person attribution enables OIDC. An external API consumer maps its roles onto these tiers and, acting for a person, passes that person's OIDC token or uses Kubernetes impersonation, which the audit event records next to the caller.
 
@@ -252,6 +254,8 @@ A rotation is subscribed to on the audit log, in the SIEM or in a VMAlert rule g
 ### 7. Coverage
 
 A kind joins a wave once its whole path from mint to engine works, not once the engine could accept a verifier. Every wave uses the same `Credential` and mint. In wave 1 the account Secret holds only the verifier, and one-time disclosure follows from storage. In waves 2 and 3 the account Secret holds the plaintext that the engine or its operator reads. No tenant can read that Secret, so one-time disclosure holds on the tenant-facing interface, while platform components and management-cluster administrators can still read it.
+
+A kind gives the API two things. Its tenant accounts are the keys of `spec.users`, with the name rules of §1 and no `password` field. Any other account, a platform one or the single credential of a kind with no `users`, is declared in its ApplicationDefinition. An out-of-tree kind provides the same two things, and the API serves it once its chart artifact is the converted one.
 
 | Kind | Engine takes a verifier | What the tenant gets today | Wave |
 |---|---|---|---|
@@ -283,7 +287,7 @@ Kubernetes access credentials hold no password and stay at their CA. A managed c
 - `use` members stop seeing passwords (§5). Tenants stop seeing MariaDB `root`, the ClickHouse `backup` user and the OpenSearch admin, and administer MariaDB through accounts with the admin role on each database.
 - A password an account sets for itself inside PostgreSQL is reverted by CNPG.
 - API clients get `credentials` with `mint` and `revoke` in `core.cozystack.io/v1alpha1`, and `tenantsecrets` does not change.
-- Operators get a numbered migration per converting kind, an audit policy for distributions that ship none, and a monitoring-agents value for an extra output.
+- Operators get a numbered migration per converting kind, an audit policy for distributions that ship none, and a monitoring-agents value for an extra output. The migration's second part is a Job with cluster-admin and `pods/exec` that is not a Helm hook and can be rerun by hand, which the release note says.
 
 ## Upgrade and rollback compatibility
 
@@ -293,7 +297,7 @@ The converting release ships the converted chart and a numbered platform migrati
 
 Then the charts switch, and a surviving `<release>-credentials` is rendered with `internal.cozystack.io/tenantresource: "false"`. For a Secret that exists already this label is the closure, because the webhook stamped it at first admission and skips the object since. For one created while a definition still selects the name, the lineage webhook learns to keep an explicit `"false"` instead of overwriting it, which is why Rollout step 2 ships first. No field ownership moves, since the API takes over no object Helm owns.
 
-The second part is a Job that the platform release creates after the charts switch. It is not a Helm hook, so a long wait does not hold up the upgrade, and it can be run again by hand. For each release of a converting kind it waits until the HelmRelease is Ready on the converted revision, so with the read routes closed, and skips the release after a timeout. Then it removes any leftover `users.*.password` from the values, deletes the tenant keys from `<release>-credentials` (they stay in its `data` otherwise) and the Secret itself where no platform account remains, as in postgres, and rotates the platform passwords of §4. Rotation suspends the release for the change, so no render writes the old value back, and lifts only a suspension it set. ClickHouse also needs a forced upgrade to apply a new `backup` hash, and MariaDB's `root` a connection to the primary, which the Job has and the API lacks (§3). An annotation on `<release>-credentials` records a rotation, so a rerun does not rotate twice, and the rest of the Job is idempotent.
+The second part is a Job that the platform release creates after the charts switch. It is not a Helm hook, so a long wait does not hold up the upgrade, and it can be run again by hand. For each release of a converting kind it waits until the HelmRelease is Ready on the converted revision, so with the read routes closed, and skips the release after a timeout. Then it removes any leftover `users.*.password` from the values, deletes the tenant keys from `<release>-credentials` (they stay in its `data` otherwise) and the Secret itself where no platform account remains, as in postgres, and rotates the platform passwords of §4. Rotation suspends the release for the change, so no render writes the old value back, and lifts only a suspension it set. ClickHouse also needs a forced upgrade to apply a new `backup` hash, and MariaDB's `root` a connection to the primary, which the Job has and the API lacks (§3). An annotation on `<release>-credentials` records a rotation, so a rerun does not rotate twice, and the rest of the Job is idempotent. A release skipped on the timeout is listed in a ConfigMap in `cozy-system` with the time of the run, and the Job exits non-zero while that list is not empty, so one place shows what is left.
 
 The migration degrades per release, never per fleet. A failing migration stops the whole platform upgrade, so a release it cannot convert (its Secret gone, two users mapping to one name, a user named `app` in postgres) is left out and reported in the migration log and with an Event on its HelmRelease. A left-out release keeps its previous revision, old credentials working and exposed as before, except a PostgreSQL release whose Secret was gone: that takes the converted chart, its database keeps the old passwords, and tenants can no longer read them, so a tenant mints ([the cases](./example.md#when-the-migration-leaves-a-release-out)). Once an operator fixes the cause, the next write through the API starts the conversion: while `<release>-credentials` still holds the plaintext, the API derives the account Secret from it, and otherwise it seeds one and a mint follows; running the Job again finishes the release.
 
@@ -354,7 +358,7 @@ The mint body carries a precondition and no other tenant input. A Credential liv
 
 1. This proposal is accepted.
 2. Independent change: the lineage webhook keeps an explicit `tenantresource: "false"` and still overwrites a chart-set `"true"`.
-3. The Cozystack API gains `credentials`, `mint`, `revoke`, seeding and the adapters for PostgreSQL, MariaDB and ClickHouse, serving no kind yet, with the Event and its RBAC. The documentation gets the audit policies, and monitoring-agents the output value.
+3. The Cozystack API gains `credentials`, `mint`, `revoke`, seeding and the engine wiring of §3 for PostgreSQL, MariaDB and ClickHouse, serving no kind yet, with the Event and its RBAC. The documentation gets the audit policies, and monitoring-agents the output value.
 4. Wave 1: PostgreSQL and MariaDB convert once the checks left under Testing pass, and ClickHouse with them or a release later.
 5. Wave 2: OpenSearch, NATS, RabbitMQ, Redis and Valkey, each with its §3 row and the plaintext in its account Secret.
 6. Wave 3: MongoDB, Bucket, VPN, Qdrant, Harbor and Monitoring, the same way. Kafka joins whichever wave is open once its chart has users.

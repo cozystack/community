@@ -247,3 +247,9 @@ Once an operator fixes the cause, the next write through the API starts the conv
 | 3, the chart | the `User` points `passwordHashSecretKeyRef` at the account Secret | the chart renders `password_sha256_hex` into the CHI from the value that entry supplies |
 | 7, applying a new value | the operator re-runs `ALTER USER`, and the engine state stays `Unknown` | helm-controller upgrades the release, the operator rewrites `chi-<chi>-common-usersd`, and the state is Applied once the CHI reconcile completes on every host |
 | Conversion | `<release>-credentials` keeps `root`, which the Job rotates with `ALTER USER` | `<release>-credentials` keeps `backup`, which the Job rotates, restarting the ClickHouse pods once |
+
+## Headless provisioning and Terraform
+
+A pipeline with no human in it creates the application, and the accounts start as `NotIssued`. It mints from the tenant ServiceAccount, which holds the verb already, and stores the response where the workload reads it, a Secret of the tenant or its own password store. Storing is the caller's, so the platform guarantees that it holds no plaintext, not that the tenant keeps none. A GitOps helper or operator that mints and writes the result into the tenant's external password store can be built on this call, and is later work.
+
+A Terraform resource that wraps mint keeps the plaintext in state, as `aws_iam_access_key` does. That is the caller's choice and not for the strictest policies. `import` returns the metadata and no password, and a mint made elsewhere shows in `status.password.at` and `by`, which the provider reads as drift.
