@@ -27,6 +27,12 @@ The design deliberately reuses the pattern of the existing cozystack aggregation
 - **Storage-less query-in/result-out aggregation server (reuse the shape).** The external `billing.aenix.io` API server runs with `Etcd = nil`, exposes a single resource, implements only `Create`, and returns the computed report in the same object. It authorizes each call with an explicit `SubjectAccessReview` against `query.tenant`. We adopt this shape but fix one known gap: that server authorizes only the top-level tenant and then widens the selection to sub-tenants by regex without authorizing them. We authorize each namespace we read (see Design).
 - **Existing usage surface in the console (consumer).** The admin "Capacity" pages (`cozystack-ui`) already poll `metrics.k8s.io` for instantaneous node usage and render gauges; there is no time-series graph and no per-tenant, per-VM view. This API is what a per-VM graph would read from.
 
+## Decisions
+
+<!-- Filled in as implementation proceeds; records live under this
+proposal's decisions/ directory, numbered from 0001, linked newest first.
+Empty while the proposal is still intent. -->
+
 ## Context
 
 Today, the relevant pieces are:
@@ -160,13 +166,16 @@ Consumption means **measured usage**, not requests. The requested-resource data 
 
 ```mermaid
 flowchart TD
-  Q["MetricQuery for tenant T (namespace = T)"] --> L["read namespace.cozystack.io/monitoring on ns T<br/>(already names the monitoring-owner namespace)"]
-  L --> VSV["select vmselect in that namespace<br/>(ns T if it has monitoring, else inherited ancestor, default tenant-root)"]
+  Q["MetricQuery for tenant T (namespace = T)"] --> L["read namespace.cozystack.io/monitoring on ns T"]
+  L --> C{"label empty?"}
+  C -->|"no (names owner ns)"| VSV["select vmselect in that namespace"]
+  C -->|"yes (no dedicated stack)"| ROOT["fall back to tenant-root (default remote-write store)"]
   VSV --> INJ["inject namespace=T matcher (mandatory)"]
+  ROOT --> INJ
   INJ --> RUN["run query_range"]
 ```
 
-The server reads the `namespace.cozystack.io/monitoring` label on the tenant's own namespace. That label is set at tenant-render time to the namespace of the nearest ancestor that has monitoring enabled (the tenant itself when it has its own stack, `tenant-root` by default otherwise), so it already names the VMCluster that holds the tenant's data: the server selects that `vmselect` Service directly, with no ancestry walk. Which storage to hit for a given range (shortterm vs longterm) is an open question (see Open questions). The `namespace=<T>` matcher is injected unconditionally; it is redundant for an isolated per-tenant store but mandatory for the shared one, and always injecting it removes a "which store am I in" mistake.
+The server reads the `namespace.cozystack.io/monitoring` label on the tenant's own namespace. That label is set at tenant-render time to the namespace of the nearest ancestor that has monitoring enabled (the tenant itself when it has its own stack), and is the empty string when no ancestor enables monitoring, which is the default (`tenant.spec.monitoring` is `false` by default). So resolution is a direct read with no ancestry walk: a non-empty label names the VMCluster that holds the tenant's data and the server selects that `vmselect` Service; an empty label means the tenant has no dedicated stack and its series live in the platform default store `tenant-root` (the hardcoded `monitoring-agents` remote-write target), which the resolver uses as the fallback. Which storage to hit for a given range (shortterm vs longterm) is an open question (see Open questions). The `namespace=<T>` matcher is injected unconditionally; it is redundant for an isolated per-tenant store but mandatory for the shared one, and always injecting it removes a "which store am I in" mistake.
 
 ### 6. Statelessness and caching
 
@@ -218,7 +227,7 @@ It runs in the management cluster alongside `cozystack-api`.
 
 ## Testing
 
-- **Unit:** tenant-label injection builds the expected PromQL and cannot be overridden by client input; the resolver reads the inherited `namespace.cozystack.io/monitoring` label and selects the right vmselect; the metric catalog maps to the expected templates; range/step validation.
+- **Unit:** tenant-label injection builds the expected PromQL and cannot be overridden by client input; the resolver reads the inherited `namespace.cozystack.io/monitoring` label and selects the named vmselect, falling back to `tenant-root` when the label is empty; the metric catalog maps to the expected templates; range/step validation.
 - **Integration:** the `SubjectAccessReview` path allows `<tenant>-view` in the tenant namespace and denies a foreign tenant; `system:masters` / `cozystack-cluster-admin` bypass.
 - **e2e:** two tenants on a shared `tenant-root` store; tenant A's query returns only A's series and never B's; a parent reading a child succeeds, a sibling reading a sibling fails; a VM graph renders end to end in the dashboard.
 
