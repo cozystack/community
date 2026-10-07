@@ -3,7 +3,7 @@
 - **Title:** `Read-only aggregation API for tenant resource-consumption metrics`
 - **Author(s):** `@IvanHunters`
 - **Date:** `2026-10-07`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
