@@ -139,7 +139,7 @@ rules:
 
 Because this aggregates into `cozy:tenant:view`, and the tenant chart already binds `cozy:tenant:view` in each tenant namespace to the group `<tenant>-view` (and, through the `cozy-lib` level hierarchy view < use < admin < super-admin, to the higher groups and to ancestor tenants), every level and every ancestor gets the permission automatically. No new Keycloak group, no change to the tenant chart. Reading metrics is granted at `view`.
 
-**Layer 2 (data isolation).** The server takes the tenant from `metadata.namespace` (already authorized in layer 1) and **injects** the tenant label into the PromQL itself. The label is the per-series `namespace` label (the same dimension series already carry and that billing keys tenants on). Client-provided label matchers are not trusted; the only selectors that reach VictoriaMetrics are the ones the server builds. The isolation invariant, and the crux of this whole design, is that every series in a shared store is attributable to exactly one tenant namespace and that `namespace` label is server-controlled, never tenant-settable; phase 0 must confirm the preferred KubeVirt per-VMI metrics and every fallback source carry it with the resource's own namespace value. This is what makes a shared `tenant-root` VMCluster safe.
+**Layer 2 (data isolation).** The server takes the tenant from `metadata.namespace` (already authorized in layer 1) and **injects** the tenant label into the PromQL itself. The label is the per-series `namespace` label (the same dimension series already carry and that billing keys tenants on). Client-provided label matchers are not trusted; the only selectors that reach VictoriaMetrics are the ones the server builds. The isolation invariant, and the crux of this whole design, is that every series in a shared store is attributable to exactly one tenant namespace and that `namespace` label is attributed by the platform scrape path (the kubelet and cAdvisor, the platform agents), not by anything a tenant workload controls. Phase 0 must confirm this per metric source, because `honorLabels` differs across scrapes (cAdvisor keeps scraped labels, kube-state-metrics does not): for each source it must be shown that the `namespace` label carries the resource's own namespace and cannot be spoofed by the guest. This is what makes a shared `tenant-root` VMCluster safe.
 
 **Hierarchy (sub-tenants).** When a parent reads a child tenant, the request's namespace is the child's namespace, and layer 1 authorizes it directly: the `cozy-lib` bindings already place the parent's group into the child namespace, so "parent may read child" falls out of real RBAC rather than a regex. There is no separate `includeSubTenants` flag that widens the query past what RBAC checked.
 
@@ -158,7 +158,7 @@ Initial catalog (per `target.kind`):
 | `network-rx` / `network-tx` | bytes/s received / transmitted | KubeVirt per-VMI network metrics | none per-VM today (see Rollout) |
 | `disk-usage` | PVC used/requested bytes | KubeVirt / KSM | `kube_persistentvolumeclaim_resource_requests_storage_bytes{...}` |
 
-The exact KubeVirt metric names are **not pinned in this proposal**: they are a third-party contract and must be confirmed against the KubeVirt metrics reference during implementation, not guessed here. Per-VM network is the one category with no usable source today (see Rollout, phase 0).
+The exact KubeVirt metric names are **not pinned in this proposal**: they are a third-party contract and must be confirmed against the KubeVirt metrics reference during implementation, not guessed here. Two catalog entries have no measured per-VM source today and are phase-0 gaps (see Rollout): per-VM network has no usable source at all, and the `disk-usage` fallback reports allocated PVC capacity (`kube_persistentvolumeclaim_resource_requests_storage_bytes`), which is allocation, not the measured usage this catalog otherwise aims for.
 
 Consumption means **measured usage**, not requests. The requested-resource data in `workloads.cozystack.io` `status.resources` (container CPU/memory requests) is a separate concern and may later be offered as an overlay ("requested vs used"), but the graphs this proposal targets are actual usage.
 
@@ -245,6 +245,7 @@ It runs in the management cluster alongside `cozystack-api`.
 - Should allocation ("requested") be offered as an overlay next to usage in the same response, or kept entirely separate?
 - Exact KubeVirt metric names and their availability in the shipped KubeVirt version (to be pinned against the KubeVirt metrics reference in phase 0).
 - Confirm the guest-cluster (Kamaji) exclusion is acceptable, or scope a follow-up for guest-internal metrics.
+- Prerequisite to confirm: the Layer 1 group-based authz assumes the management apiserver has OIDC enabled with a flat `groups` claim and no `oidc-groups-prefix` (set out-of-band via talm, the same assumption the existing tenant RBAC already relies on). On a cluster that sets a group prefix, or one without OIDC (no groups claim), the Layer 1 SAR has no group to match; define the behavior there or state the prerequisite explicitly.
 
 ## Alternatives considered
 
