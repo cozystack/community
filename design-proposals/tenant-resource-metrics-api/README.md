@@ -23,7 +23,7 @@ The design deliberately reuses the pattern of the existing cozystack aggregation
 ## Prior art
 
 - **cozystack aggregation API (reuse the mechanism).** `cozystack-api` (`packages/system/cozystack-api`) is already a Kubernetes aggregated API server for `apps.cozystack.io` / `core.cozystack.io` / `sdn.cozystack.io`, using delegated authentication and authorization (`RecommendedOptions`, `auth-delegator` / `auth-reader`). For `apps.cozystack.io` the authorization is ordinary Kubernetes RBAC evaluated by the kube-apiserver. This proposal adds a new aggregated API server following the same shape.
-- **Server-side tenant filtering (reuse the pattern).** The `tenantnamespaces` resource in `cozystack-api` is readable by all `system:authenticated` users and filters the result server-side by walking the RoleBindings in each namespace, with a bypass for `system:masters` and `cozystack-cluster-admin`. This proposal uses the same "does the caller have any binding in the tenant namespace" logic for authorization and tenant resolution.
+- **Server-side tenant filtering (reuse the pattern).** The `tenantnamespaces` resource in `cozystack-api` is readable by all `system:authenticated` users and filters the result server-side by walking the RoleBindings in each namespace, with a bypass for `system:masters` and `cozystack-cluster-admin`. From it this proposal borrows the `system:masters` / `cozystack-cluster-admin` bypass and the namespace-scoping philosophy. For authorization itself it does not use the "any binding present" walk; it uses the delegated-RBAC model (a verb-specific `SubjectAccessReview`, like `apps.cozystack.io`), which is strictly more specific (see Design, Layer 1).
 - **Storage-less query-in/result-out aggregation server (reuse the shape).** The external `billing.aenix.io` API server runs with `Etcd = nil`, exposes a single resource, implements only `Create`, and returns the computed report in the same object. It authorizes each call with an explicit `SubjectAccessReview` against `query.tenant`. We adopt this shape but fix one known gap: that server authorizes only the top-level tenant and then widens the selection to sub-tenants by regex without authorizing them. We authorize each namespace we read (see Design).
 - **Existing usage surface in the console (consumer).** The admin "Capacity" pages (`cozystack-ui`) already poll `metrics.k8s.io` for instantaneous node usage and render gauges; there is no time-series graph and no per-tenant, per-VM view. This API is what a per-VM graph would read from.
 
@@ -133,7 +133,7 @@ rules:
 
 Because this aggregates into `cozy:tenant:view`, and the tenant chart already binds `cozy:tenant:view` in each tenant namespace to the group `<tenant>-view` (and, through the `cozy-lib` level hierarchy view < use < admin < super-admin, to the higher groups and to ancestor tenants), every level and every ancestor gets the permission automatically. No new Keycloak group, no change to the tenant chart. Reading metrics is granted at `view`.
 
-**Layer 2 (data isolation).** The server takes the tenant from `metadata.namespace` (already authorized in layer 1) and **injects** the tenant label into the PromQL itself. Client-provided label matchers are not trusted; the only selectors that reach VictoriaMetrics are the ones the server builds. This is what makes a shared `tenant-root` VMCluster safe.
+**Layer 2 (data isolation).** The server takes the tenant from `metadata.namespace` (already authorized in layer 1) and **injects** the tenant label into the PromQL itself. The label is the per-series `namespace` label (the same dimension series already carry and that billing keys tenants on). Client-provided label matchers are not trusted; the only selectors that reach VictoriaMetrics are the ones the server builds. The isolation invariant, and the crux of this whole design, is that every series in a shared store is attributable to exactly one tenant namespace and that `namespace` label is server-controlled, never tenant-settable; phase 0 must confirm the preferred KubeVirt per-VMI metrics and every fallback source carry it with the resource's own namespace value. This is what makes a shared `tenant-root` VMCluster safe.
 
 **Hierarchy (sub-tenants).** When a parent reads a child tenant, the request's namespace is the child's namespace, and layer 1 authorizes it directly: the `cozy-lib` bindings already place the parent's group into the child namespace, so "parent may read child" falls out of real RBAC rather than a regex. There is no separate `includeSubTenants` flag that widens the query past what RBAC checked.
 
@@ -160,16 +160,13 @@ Consumption means **measured usage**, not requests. The requested-resource data 
 
 ```mermaid
 flowchart TD
-  Q["MetricQuery for tenant T"] --> C{"T has own monitoring?"}
-  C -->|yes| OWN["vmselect in ns T (only T data)"]
-  C -->|no| P["walk ancestors to the first with monitoring<br/>(default: tenant-root)"]
-  P --> ROOT["shared vmselect (many tenants)"]
-  ROOT --> INJ["inject tenant label (mandatory)"]
-  OWN --> RUN["run query_range"]
-  INJ --> RUN
+  Q["MetricQuery for tenant T (namespace = T)"] --> L["read namespace.cozystack.io/monitoring on ns T<br/>(already names the monitoring-owner namespace)"]
+  L --> VSV["select vmselect in that namespace<br/>(ns T if it has monitoring, else inherited ancestor, default tenant-root)"]
+  VSV --> INJ["inject namespace=T matcher (mandatory)"]
+  INJ --> RUN["run query_range"]
 ```
 
-The server reads the `namespace.cozystack.io/monitoring` label to find the VMCluster that holds a tenant's data, and selects the appropriate `vmselect` Service. Which storage to hit for a given range (shortterm vs longterm) is an open question (see Open questions). The tenant label is injected in **both** branches; it is redundant for an isolated per-tenant store but mandatory for the shared one, and injecting it unconditionally removes a "which branch am I in" mistake.
+The server reads the `namespace.cozystack.io/monitoring` label on the tenant's own namespace. That label is set at tenant-render time to the namespace of the nearest ancestor that has monitoring enabled (the tenant itself when it has its own stack, `tenant-root` by default otherwise), so it already names the VMCluster that holds the tenant's data: the server selects that `vmselect` Service directly, with no ancestry walk. Which storage to hit for a given range (shortterm vs longterm) is an open question (see Open questions). The `namespace=<T>` matcher is injected unconditionally; it is redundant for an isolated per-tenant store but mandatory for the shared one, and always injecting it removes a "which store am I in" mistake.
 
 ### 6. Statelessness and caching
 
