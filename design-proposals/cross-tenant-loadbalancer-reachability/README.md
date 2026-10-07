@@ -2,53 +2,52 @@
 
 - **Title:** `Cross-tenant reachability of LoadBalancer public IPs`
 - **Author(s):** `@mattia-eleuteri`
-- **Date:** `2026-10-06`
+- **Date:** `2026-10-06`; revised `2026-10-07`
 - **Status:** Draft
 
 ## Overview
 
 A pod of one tenant cannot reach the public IP of another tenant's
-`LoadBalancer` Service, although anyone on the Internet can. The tenant egress
-policy only allows the own tenant and `world`, and Cilium's kube-proxy
-replacement translates the LoadBalancer IP to the backend pod **before** that
-policy is evaluated, so the connection is judged as "tenant A talking to
-tenant B's pod" and dropped. VMs exposed through cozy-proxy are not affected,
-since `026b1c781` in cozystack/cozystack.
+`LoadBalancer` Service, although anyone on the Internet can. With kube-proxy
+replacement, Cilium translates the LoadBalancer IP to a backend pod **before**
+the tenant egress policy is evaluated, so the verdict is taken against another
+tenant's pod and the connection is dropped.
 
-This proposal asks the maintainers to choose how to fix it for the other
-LoadBalancer Services: tenant Kubernetes ingress (kubevirt CCM), `Ingress`
-applications, and databases with `external: true`. Two families of answers
-exist: widen the **policy** so that the post-translation verdict passes, or take
-the public IP away from Cilium and handle it in a **datapath** that leaves the
-client seen as `world`. The proposal recommends the second, as an opt-in L4
-mode in cozy-proxy prototyped in cozystack/cozy-proxy#25, and records why the
-policy options fall short, mainly for the selectorless CCM Services.
+The proposal splits the fix by the kind of Service:
+
+- **Part A, Services with a selector** (ingress controllers, databases with
+  `external: true`): widen the tenant egress policy with a `toServices` rule on
+  platform-labelled Services. No new datapath; works on every variant,
+  isp-slim included.
+- **Part B, Services of tenant Kubernetes clusters** (kubevirt CCM,
+  selectorless): no policy rule can admit them without opening the NodePort
+  range of every tenant cluster to every tenant. For these only, an opt-in L4
+  mode in cozy-proxy takes the public IP over from Cilium, as the VM mode
+  already does for VMs. Prototype: cozystack/cozy-proxy#25.
+
+Part A is independent and can land first. Part B is limited to the variants
+that run tenant clusters (iaas), which are the ones with MetalLB and kube-ovn.
 
 ## Scope and related proposals
 
-- **Implementation, draft:** cozystack/cozy-proxy#25 (L4 mode), stacked on
+- **Implementation of Part B, draft:** cozystack/cozy-proxy#25, stacked on
   cozystack/cozy-proxy#18 (node-local datapath rules). Its design document,
-  `docs/rfc/l4-loadbalancer-mode.md` in that PR, carries the datapath detail
-  (nftables table, priorities, conntrack purge, lab log) that this proposal
-  only summarizes.
+  `docs/rfc/l4-loadbalancer-mode.md`, carries the datapath detail (nftables
+  table, priorities, conntrack purge, lab log) that this proposal summarizes.
+- **Interacts with:** cozystack/community#87 (`external-source-ranges`, open).
+  Part A must not open a Service whose owner restricted its sources (Part A,
+  Security); Part B removes the Cilium frontend that enforces
+  `loadBalancerSourceRanges`, so it must enforce or refuse it.
 - **Related:** `design-proposals/loadbalancer-announcer-neutrality` — MetalLB
-  is the shipped announcer and `loadBalancerClass` is the integration point for
-  another LoadBalancer implementation. The L4 mode keeps MetalLB as the
-  allocator and announcer; see Alternatives for why it does not use
-  `loadBalancerClass`.
+  is the shipped announcer and `loadBalancerClass` the integration point for
+  another implementation. Part B keeps MetalLB as allocator and announcer; see
+  Alternatives for why it does not use `loadBalancerClass`.
 - **Related:** `design-proposals/external-database-exposure` — databases move
-  towards Gateway API TLS-passthrough. The database rows below apply to the
-  per-release `LoadBalancer` Services that remain (MariaDB, Kafka, non-sharded
-  MongoDB, and any engine before its SNI phase). Whether a Gateway's public IP
-  is reachable across tenants is a separate question, listed under Open
-  questions.
-- **Interacts with:** cozystack/community#87 (`external-source-ranges`, open),
-  which restricts sources through `loadBalancerSourceRanges`, enforced by
-  Cilium on the LoadBalancer frontend. An opted-in Service has no Cilium
-  frontend any more, so the L4 mode must handle that field itself (Security,
-  Open question 7).
-- **Out of scope:** IPv6, UDP, `externalTrafficPolicy: Cluster` (later phases,
-  see Design), and MetalLB in BGP mode.
+  towards Gateway API TLS-passthrough. Part A covers the per-release
+  `LoadBalancer` Services that remain. The Gateway does not change Part B: the
+  Services it serves are created by tenants inside their own clusters.
+- **Out of scope:** VMs (fixed, below), IPv6, UDP, `externalTrafficPolicy:
+  Cluster` in Part B, MetalLB in BGP mode.
 
 All repository paths below refer to `cozystack/cozystack` unless stated
 otherwise.
@@ -57,63 +56,157 @@ otherwise.
 
 ## Context
 
-Tenants are isolated on egress. `packages/apps/tenant/templates/networkpolicy.yaml`
-renders, per tenant, a `CiliumClusterwideNetworkPolicy` `<tenant>-egress` that
-allows the tenant's own namespaces, a list of platform services, and the entity
-`world`. Ingress is open to `world` and `cluster`.
+### The tenant egress policy
 
-With kube-proxy replacement, Cilium resolves the Service frontend in the client
-pod's datapath: a packet to a LoadBalancer IP is translated to a backend pod IP
-and port, and the egress policy is evaluated on the translated destination. The
-verdict is taken against the backend's identity, which belongs to another
-tenant, so it is dropped. From the Internet, the same IP works.
+`packages/apps/tenant/templates/networkpolicy.yaml` renders, per tenant, a
+`CiliumClusterwideNetworkPolicy` `<tenant>-egress`. It allows the tenant's own
+namespaces and, in every ancestor namespace, the `vminsert`, `etcd` and
+`cozystack.io/service: ingress` pods. The ingress rule came with `4dfdbfeb6`
+(`fix(tenant): allow egress to parent ingress pods`) so that a nested cluster in
+`Proxied` mode reaches its own domains through its parent's ingress. A
+namespaced `CiliumNetworkPolicy` adds `world` and the tenant's own ingress pods.
 
-cozy-proxy's VM mode avoids this because Cilium does not own the VM's public IP
-(`026b1c781`, `[virtual-machine] Exclude external VM services from Cilium BPF
-LB`): the packet leaves the pod with the public IP as destination, matches
-`world`, and comes back through the normal ingress path. The VM mode is a
-stateless 1:1 NAT: one backend, no port translation, `v1.Endpoints` only. It
-cannot serve the other Services, which need port translation (CCM Services
-target the tenant nodes' NodePorts), several backends, EndpointSlices (CCM
-Services are selectorless, their slices are written by `kubevirt-eps-controller`)
-and readiness.
+The ancestors are derived from the prefixes of the release namespace. A direct
+child of `tenant-root` gets `tenant-root`; a deeper tenant does not, because
+the children of `tenant-root` are named `tenant-<name>`, not
+`tenant-root-<name>`. Rendered with `helm template`:
+
+| Tenant | Ancestor ingress allowed |
+|---|---|
+| `tenant-foo` (in `tenant-root`) | `tenant-root` |
+| `tenant-foo-bar` | `tenant-foo` |
+| `tenant-foo-bar-baz` | `tenant-foo`, `tenant-foo-bar` |
+
+So from depth 2 on, a tenant does not reach the host ingress. That is a
+separate fix to the existing rule and is not designed here.
+
+### Why the verdict is wrong
+
+With kube-proxy replacement, Cilium resolves the frontend in the client pod's
+datapath (socket LB, then tc): a packet to a LoadBalancer IP is translated to a
+backend pod IP and port, and the egress policy is evaluated on the translated
+destination. Unless a rule above admits the backend, it is dropped. From the
+Internet, the same IP works.
+
+### VMs are fixed
+
+`026b1c781` (`[virtual-machine] Exclude external VM services from Cilium BPF
+LB`, in v1.3.0) puts `service.kubernetes.io/service-proxy-name` on external VM
+Services. Cilium ignores them, cozy-proxy's VM mode serves them, and the packet
+leaves the client pod towards the public IP, matches `world`, and comes back
+through the normal ingress path. The VM mode is a stateless 1:1 NAT (one
+backend, no port translation, `v1.Endpoints`), so it cannot serve the Services
+below.
+
+### Tenant Kubernetes clusters, `Proxied` and `LoadBalancer`
+
+`addons.ingressNginx.exposeMethod` defaults to `Proxied`. In that mode
+`packages/apps/kubernetes/templates/ingress.yaml` renders an `Ingress` on the
+parent's controller with one `ssl-passthrough` rule per entry of
+`addons.ingressNginx.hosts`; with no hosts, nothing is routed. Every domain must
+therefore be declared on the Kubernetes application beforehand, and only HTTP
+and HTTPS reach the cluster through that addon.
+
+Operators who let tenants publish their own domains or TCP services use
+`exposeMethod: LoadBalancer`. More generally, `exposeMethod` only concerns the
+ingress-nginx addon: **every** `LoadBalancer` Service a tenant creates inside
+its cluster (its own ingress controller, a TCP service) is realized by the
+kubevirt CCM as a selectorless Service in the tenant namespace, whatever the
+addon's mode. Its endpoints are the virt-launcher pods of the cluster's nodes,
+written by `kubevirt-eps-controller`, and its target ports are NodePorts.
 
 ### The problem
 
-- A workload in tenant A cannot call an API that tenant B publishes through
-  its Kubernetes cluster's ingress, by its public name.
-- A tenant cannot connect to another tenant's `Postgres` with `external: true`
-  by its public IP, while a VM in the same tenant can.
-- In nested tenants, a child tenant cannot reach the parent tenant's public
-  ingress.
+What is broken on `main`, for a client pod in tenant A:
 
-A public IP is expected to be public. Today, whether it answers depends on
-whether the caller sits in the same cluster, and on whether the Service is a VM.
+1. The ingress controller of a tenant B that is not an ancestor of A
+   (including the host ingress, from depth 2, see above).
+2. A database of tenant B with `external: true`.
+3. Any `LoadBalancer` Service of a Kubernetes cluster of tenant B: the addon
+   in `LoadBalancer` mode, and every Service the tenant creates itself.
+
+Cases 1 and 2 have a selector; case 3 does not. In each case, a tenant that
+exposes a service publicly expects it to be reachable from another tenant's
+project, as it is from the Internet and as it already is for a VM.
 
 ## Goals
 
 - A pod of any tenant reaches the public IP of an opted-in `LoadBalancer`
-  Service on its declared ports, as an Internet client would.
-- The connection is seen by the backend, and by its tenant's policies, as
-  coming from outside: identity `world`, never the client tenant's identity.
-- Tenant isolation is not widened: no tenant gains access to another tenant's
-  pods, ClusterIPs or undeclared ports.
-- Per-Service opt-in, controlled by the platform only, with a per-Service
-  rollback.
+  Service on its declared ports.
+- No tenant gains access to another tenant's ClusterIPs, to pods that are not
+  backends of an opted-in Service, or to undeclared ports of a tenant cluster.
+- Opt-in is set by the platform only, per Service, with a per-Service rollback.
+- A Service whose owner restricted its sources is not opened by this change.
 - The VM mode is unchanged.
 
 ### Non-goals
 
-- Cross-tenant access through ClusterIPs or service names. That stays isolated.
-- Distinguishing tenants among in-cluster clients at the backend (see Security).
-- Replacing MetalLB or Cilium as the LoadBalancer implementation for Services
-  that do not opt in.
+- Cross-tenant access through ClusterIPs or service names.
+- Distinguishing tenants among in-cluster clients at the backend.
+- Replacing MetalLB or Cilium for Services that do not opt in.
+- Fixing the ancestor derivation of the existing rule (Context).
 
 ## Design
 
-### 1. Opt-in
+### Part A: a policy rule for Services with a selector
 
-A Service is taken over only when it carries both:
+The tenant egress CCNP gains one rule per Service type, on a label the
+platform's charts set on the Service:
+
+```yaml
+  - toServices:
+    - k8sServiceSelector:
+        selector:
+          matchLabels:
+            networking.cozystack.io/cross-tenant: postgres
+    toPorts:
+    - ports:
+      - port: "5432"
+        protocol: TCP
+```
+
+Cilium matches the selector against Services in every namespace (empty
+`namespace`) and turns each matched Service's own selector into an endpoint
+selector **scoped to that Service's namespace**
+(`newEndpointSelectorForServiceSelector` in `pkg/policy/k8s/service.go`). The
+grant is therefore exactly "the backends of these Services, on these ports",
+which is what the post-translation verdict needs.
+
+| Type | Chart | Label value | Ports |
+|---|---|---|---|
+| Postgres | `packages/apps/postgres/templates/external-svc.yaml` | `postgres` | 5432 |
+| MariaDB | `packages/apps/mariadb/templates/mariadb.yaml`, through the operator's service template | `mariadb` | 3306 |
+| Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml`, `controller.service.labels` | `ingress` | 80, 443 |
+
+For the ingress controllers, an equivalent and smaller change is to extend the
+existing ancestor rule to `cozystack.io/service: ingress` pods in every
+namespace, on 80 and 443. It relies on the same pod label as that rule.
+
+The label is only set when the Service is public **and** carries no source
+restriction: if cozystack/community#87 lands, a chart with `sourceRanges` set
+leaves the label off, so the rule never opens a Service its owner restricted.
+Tenants do not set labels on these Services; the charts render them.
+
+What the backend sees: the client pod's IP and identity, not `world`. Tenant
+ingress policies admit `cluster` already, so nothing else changes on that side.
+
+### Part B: an L4 mode in cozy-proxy for CCM Services
+
+#### Why not a policy rule
+
+A `toServices` rule on a selectorless Service becomes a CIDR selector on its
+EndpointSlice IPs, which matches pods only with `policy-cidr-match-mode=pods`.
+That value is accepted from Cilium 1.20 (cilium/cilium#45194); Cozystack ships
+1.19.5, whose agent accepts only `nodes`, and Cilium's documentation advises
+against it by default (an identity per pod matched by a CIDR selector). Even
+then the rule is L3 plus static ports, and the backends are the virt-launcher
+pods of whole clusters: one cluster-wide rule would open the NodePort range of
+every tenant cluster to every tenant, including NodePorts no tenant declared as
+LoadBalancer ports. `toEndpoints` on virt-launcher pods has the same exposure.
+
+#### Opt-in
+
+A CCM Service is taken over only when it carries both:
 
 ```yaml
 metadata:
@@ -126,23 +219,26 @@ metadata:
 `service.cilium.io/type: ClusterIP` makes Cilium install only the ClusterIP
 frontend: it stops translating the LoadBalancer IP and the NodePort, while the
 ClusterIP keeps its current, isolated behavior. MetalLB still allocates and
-announces the IP. The label is the trust anchor: the kubevirt CCM copies every
+announces the IP. The label is the trust anchor: the CCM copies every
 annotation of the tenant Service onto the infra Service, but not its labels, so
-a tenant can never opt its own Service in (Security).
+a tenant cannot opt in by itself.
 
-Only `externalTrafficPolicy: Local` is supported in phase 1. A labelled and
-annotated Service in `Cluster` is refused: its IP is guarded and its traffic
-dropped, rather than looping.
+Both are set by a new CCM patch in
+`packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`, switched on
+from `packages/apps/kubernetes/templates/cloud-config.yaml`, only on Services
+with `externalTrafficPolicy: Local`, overriding any copied value. Existing
+infra Services need a one-shot patch. A Service in `Cluster` is refused: its IP
+is guarded and its traffic dropped rather than looping.
 
-### 2. Datapath
+#### Datapath
 
 cozy-proxy gets a second, independent mode behind `--enable-l4-loadbalancer`
 (chart value `l4LoadBalancer.enabled`, off by default), in its own nftables
 table `ip cozy_proxy_l4`, rebuilt atomically on every change:
 
-- `guard`, on every node: drops new packets to an L4 IP on an undeclared
-  port. Without it, such a packet is routed to the gateway and back, since the
-  IP is no longer local once Cilium releases it.
+- `guard`, on every node: drops new packets to an L4 IP on an undeclared port.
+  Without it, such a packet is routed to the gateway and back, since the IP is
+  no longer local once Cilium releases it.
 - `translate`, on the node MetalLB elected to announce the IP only: stateful
   DNAT, with port translation and round-robin, to the **local** ready backends
   from the EndpointSlices. eTP `Local` is what makes MetalLB pick a node that
@@ -156,53 +252,57 @@ the announcer. Conntrack entries are purged as kube-proxy does: UDP on endpoint
 removal, TCP only when the frontend goes away on this node. A DaemonSet restart
 leaves the table in place until the new instance replaces it.
 
-The full datapath, its priorities against the VM mode, and the purge rules are
-in the cozy-proxy design document (Scope).
+Part B targets the variants that run tenant clusters. Those run MetalLB and
+kube-ovn; isp-slim runs neither, and has no iaas bundle, hence no CCM Service.
 
-### 3. Opting Services in, per type
-
-Each change sits behind a platform switch.
-
-| Type | Where | Change |
-|---|---|---|
-| Postgres | `packages/apps/postgres/templates/external-svc.yaml` | label and annotation; eTP is already `Local` |
-| MariaDB | `packages/apps/mariadb/templates/mariadb.yaml` | label and annotation through the operator's service template, and eTP `Local` (operator default is `Cluster`) |
-| Tenant Kubernetes (CCM) | new patch in `packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`, switched on from `packages/apps/kubernetes/templates/cloud-config.yaml` | the CCM sets the label and the annotation itself, overriding any copied value, and only on eTP `Local` Services; existing infra Services need a one-shot patch |
-| Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml` | `controller.service.labels` / `annotations`; eTP is already `Local`; the host ingress with PROXY protocol last |
-| cozy-proxy | `packages/system/cozy-proxy` | bump, enable the mode, RBAC for EndpointSlices, Nodes and `ServiceL2Status` |
-
-### 4. Admission guard on CCM Services
+#### Admission guard on CCM Services
 
 Because the CCM copies tenant annotations, a platform may want an admission
 guard that refuses infra Services carrying copied MetalLB, external-dns or
 Cilium annotations. Cozystack ships none today. If it adds one, it must allow
 `service.cilium.io/type: ClusterIP` on a Service that also carries the
 `lb-proxy` label, and refuse every other `service.cilium.io/*` key. A Kyverno
-rule doing that was tested on a lab with Kyverno 1.18.2; it is reproduced in
-the cozy-proxy design document, section 7.1.
+rule doing that was tested on a lab with Kyverno 1.18.2; it is in the
+cozy-proxy design document, section 7.1.
 
 ## User-facing changes
 
 - Tenants: the public IP of an opted-in Service becomes reachable from every
-  tenant. In-cluster clients appear with the announcer's join-network address
-  (`100.64.x` on kube-ovn) instead of being refused.
-- Admins: one platform switch per Service type, and `l4LoadBalancer.enabled`
-  on cozy-proxy. No new CRD or API.
-- Docs: the source-address table below, for tenants writing allowlists.
+  tenant. Under Part A the backend sees the client pod; under Part B it sees
+  the announcer's join-network address (`100.64.x` on kube-ovn).
+- Admins: a platform switch per Service type for Part A, and
+  `l4LoadBalancer.enabled` on cozy-proxy plus the CCM switch for Part B. No new
+  CRD or API.
+- Docs: what each Service type shows as client address, for tenants writing
+  allowlists.
 
 ## Upgrade and rollback compatibility
 
-- Default render unchanged: the mode is off and no Service carries the label.
-- Per Service, forward: add the label (no effect), then the annotation; Cilium
+- Default render unchanged until the switches are turned on.
+- Part A: adding or removing the label adds or removes the grant; removing the
+  rule from the tenant chart restores today's behavior.
+- Part B, per Service: add the label (no effect), then the annotation; Cilium
   lets go and cozy-proxy programs the IP on its next sync. Connections opened
-  through Cilium may be reset once.
-- Per Service, rollback: remove the annotation. Cilium takes the IP back and
-  cozy-proxy stops programming it at the same time. Removing only the label
-  leaves the IP dark, so the runbook always removes the annotation.
-- Whole mode: remove every annotation, then disable the mode, which deletes the
-  table. Nothing is irreversible.
+  through Cilium may be reset once. Rollback: remove the annotation; Cilium takes
+  the IP back and cozy-proxy stops programming it at the same time. Removing
+  only the label leaves the IP dark, so the runbook always removes the
+  annotation.
+- Part B, whole mode: remove every annotation, then disable the mode, which
+  deletes the table. Nothing is irreversible.
 
 ## Security
+
+Part A:
+
+- The grant is the backends of labelled Services on their declared ports, in
+  their own namespaces. A tenant reaching them can also do so by pod IP or
+  ClusterIP on those ports: the same exposure the ancestor ingress rule already
+  accepts, on ports that are public anyway.
+- Services with a source restriction are not labelled (#87). Without that
+  condition, the rule would let every tenant through a restriction that Cilium's
+  socket LB already does not apply to in-cluster clients.
+
+Part B:
 
 | Client | Source seen by the backend | Cilium identity at the backend |
 |---|---|---|
@@ -210,123 +310,103 @@ the cozy-proxy design document, section 7.1.
 | VM with a public IP (VM mode) | the VM's public IP | `world` |
 | pod or node process, any node | the announcer's join IP (`100.64.x`) | `world` |
 
-- No tenant gains access to another tenant's pods: the client tenant's egress
-  policy is unchanged and still sees `world`.
-- CIDR allowlists now apply to in-cluster clients. A tenant rule that denies
-  `0.0.0.0/0` except an office range is evaluated against a `world` source and
-  holds; with the VM mode today the in-cluster source is `remote-node`, which
-  such a rule does not match.
-- In-cluster clients are indistinguishable from one another at the backend:
-  all share the announcer's address. A tenant that needs to admit one tenant
-  and not another must use ClusterIP and policies, or mTLS.
+- No tenant gains access to another tenant's pods: the client's egress policy is
+  unchanged and still sees `world`; only declared ports are translated, every
+  other port to the IP is dropped by `guard`.
+- In-cluster clients are indistinguishable from one another at the backend.
 - A tenant cannot opt in: the label is set by the platform only, and a copied
-  `service.cilium.io/type: ClusterIP` without it only makes the tenant's own
-  IP dark. A tenant still controls the ports and the eTP of its CCM Service, as
+  `service.cilium.io/type: ClusterIP` without it only makes the tenant's own IP
+  dark. A tenant still controls the ports and the eTP of its CCM Service, as
   today.
-- `loadBalancerSourceRanges` is enforced by Cilium on the LoadBalancer
-  frontend, which an opted-in Service no longer has. The prototype does not
-  read the field, so opting in a Service that sets it would silently drop the
-  restriction. Before acceptance the L4 mode must either enforce it (a
-  per-IP set of allowed sources in `guard`) or refuse such a Service, as it
-  refuses eTP `Cluster`.
+- `loadBalancerSourceRanges` is enforced by Cilium on the frontend this mode
+  removes. The prototype does not read the field yet; before acceptance it must
+  either enforce it (a per-IP set of allowed sources in `guard`) or refuse such
+  a Service, as it refuses eTP `Cluster`.
 - New RBAC for cozy-proxy: read EndpointSlices, Nodes and MetalLB
   `ServiceL2Status`.
 
 ## Failure and edge cases
 
-- Announcer moved by MetalLB → the new announcer programs the DNAT after its
-  `ServiceL2Status` appears; in-flight connections are lost, as with any L2
+- Part A, label on a Service whose selector matches no pod → the rule grants
+  nothing.
+- Part B, announcer moved by MetalLB → the new announcer programs the DNAT after
+  its `ServiceL2Status` appears; in-flight connections are lost, as with any L2
   failover. Lab: one failed probe out of about 110 at a 0.5 s interval.
-- No ready local backend on the announcer → the port is dropped, not forwarded.
-- Undeclared port or ICMP to an L4 IP → dropped on every node; no routing loop.
-- eTP `Cluster` Service opted in → refused and guarded; logged.
-- cozy-proxy restart → the table stays in the kernel; no interruption.
-- High connection churn from node-masqueraded clients → about 0.06 to 0.1 % of
-  connections took over a second on the lab (SYN-ACK dropped inside OVS/OVN,
-  recovered by retransmission). Mitigated with `masquerade fully-random`;
-  Internet clients are not affected. Open question 3.
+- Part B, no ready local backend on the announcer → the port is dropped, not
+  forwarded.
+- Part B, undeclared port or ICMP to an L4 IP → dropped on every node; no
+  routing loop.
+- Part B, eTP `Cluster` Service opted in → refused and guarded; logged.
+- Part B, cozy-proxy restart → the table stays in the kernel; no interruption.
+- Part B, high connection churn from node-masqueraded clients → about 0.06 to
+  0.1 % of connections took over a second on the lab (SYN-ACK dropped inside
+  OVS/OVN, recovered by retransmission). Mitigated with `masquerade
+  fully-random`; Internet clients are not affected. Open question 2.
 
 ## Testing
 
-- Unit tests for selection, desired state and purge decisions.
-- Kernel tests in network namespaces: golden `nft list` output, and real TCP
-  through three namespaces (translation, round-robin, source kept or
-  masqueraded, guard, purge, rebuild with an open connection).
-- Lab, Cilium 1.19.5 with kube-ovn and MetalLB L2: a synthetic multi-port
-  Service, a Postgres application, the CCM ingress of a tenant cluster, VM
-  clients, announcer failover, DaemonSet and ingress restarts, eTP `Cluster`
-  refusal, 300 connections per second without keep-alive.
-- e2e, to add before acceptance: a cross-tenant connection to an opted-in
-  Postgres and to a tenant cluster ingress.
+- Part A: chart unit tests for the label and its `sourceRanges` condition; an
+  e2e connection from one tenant to another tenant's external Postgres and
+  ingress, and a refused connection to a non-labelled pod of the same tenant.
+- Part B, in cozystack/cozy-proxy#25: unit tests for selection, desired state
+  and purge decisions; kernel tests in network namespaces (golden `nft list`,
+  real TCP through three namespaces: translation, round-robin, source kept or
+  masqueraded, guard, purge, rebuild with an open connection); lab run on
+  Cilium 1.19.5 with kube-ovn and MetalLB L2 against the real CCM ingress of a
+  tenant cluster, VM clients, announcer failover, DaemonSet and ingress
+  restarts, eTP `Cluster` refusal, 300 connections per second without
+  keep-alive.
+- Part B, e2e to add: a cross-tenant connection to a `LoadBalancer` Service
+  created inside a tenant cluster.
 
 ## Rollout
 
-1. cozy-proxy release with the mode, off by default.
-2. Databases (single port, low churn), behind their switch.
-3. CCM Services with eTP `Local`, with the CCM patch and, if one is added, the
-   admission guard first.
-4. Tenant ingresses, then the host ingress.
+1. Part A: the egress rule and the chart labels, databases then ingress.
+2. Part B: cozy-proxy release with the mode off by default; then the CCM patch
+   and, if one is added, the admission guard; then CCM Services with eTP
+   `Local`, per Service.
 
-Each step can be rolled back per Service.
+Each step can be rolled back on its own.
 
 ## Open questions
 
-1. **Announcer source.** Phase 1 reads MetalLB L2's `ServiceL2Status`. Should
-   it be behind an interface, and is BGP mode, where every node advertises,
-   required before acceptance?
-2. **Admission guard.** Should Cozystack ship a guard on CCM Services, and in
-   which package?
-3. **Residual SYN-ACK loss under churn** for node-masqueraded clients: accept
+1. **Part B announcer source.** Phase 1 reads MetalLB L2's `ServiceL2Status`.
+   Should it be behind an interface, and is BGP mode, where every node
+   advertises, required before acceptance?
+2. **Residual SYN-ACK loss under churn** for node-masqueraded clients: accept
    it, or fix it on the OVN side (conntrack timeouts or ACLs) first?
-4. **eTP `Cluster`.** Keep refusing it, support it with full masquerade (client
-   IP lost), or have the charts force `Local`?
-5. **Gateway public IPs.** Once databases and HTTP move behind a Cilium Gateway
-   (`external-database-exposure`), is a Gateway's public IP reachable across
-   tenants? If not, it needs its own answer: Cilium's Envoy is not a backend
-   cozy-proxy can take over.
-6. **Label key.** `networking.cozystack.io/lb-proxy: cozy-proxy` is a proposal.
-7. **`loadBalancerSourceRanges`** (Security, cozystack/community#87): enforce
-   it in the L4 mode, or refuse Services that set it? Enforcing it in `guard`
-   would also match in-cluster clients, which Cilium's Socket LB lets through
-   today; which source those clients present at that point (pod IP or node
-   IP, depending on the node) has to be measured first.
+3. **Admission guard.** Should Cozystack ship a guard on CCM Services, and in
+   which package?
+4. **Gateway public IPs.** Once databases and HTTP move behind a Cilium Gateway,
+   is the Gateway's public IP reachable across tenants? Part A's rule targets
+   the per-release Services and would need its own counterpart there.
+5. **Label keys.** `networking.cozystack.io/cross-tenant` and
+   `networking.cozystack.io/lb-proxy` are proposals.
 
 ## Alternatives considered
 
-### Policy side
+### For Services with a selector
 
-These keep Cilium as the datapath and widen the tenant egress policy so that
-the post-translation verdict passes. They need no new datapath, which is their
-main appeal.
-
-- **`toServices` for Services with a selector** (Postgres, MariaDB, Ingress).
-  An egress rule in the tenant egress `CiliumClusterwideNetworkPolicy` with
-  `toServices.k8sServiceSelector` on a platform-set label, and an empty
-  namespace, matches those Services in every namespace; Cilium turns each
-  Service's selector into an endpoint selector. It works for these Services.
-  Its costs: the grant is on the backend **pods**, so the client may also reach
-  them by pod IP; ports are whatever the rule lists, the same for every matched
-  Service, not each Service's own; and the backend sees the client with its pod
-  identity and pod IP, so tenant CIDR allowlists and `pg_hba` rules see
-  in-cluster addresses rather than `world`. This is the strongest alternative
-  for these three types, and the maintainers may prefer it for them.
-- **`toServices` for selectorless Services** (CCM). Cilium converts their
-  EndpointSlice IPs into CIDR selectors, which do not match pods unless
-  `policy-cidr-match-mode=pods` is set. That value is accepted from Cilium 1.20
-  (cilium/cilium#45194); Cozystack ships 1.19.5, whose agent accepts only
-  `nodes`. Cilium's documentation advises against it by default: it allocates
-  an identity per pod matched by a CIDR selector. Even with 1.20, the rule is
-  L3 plus static ports: the backends are the tenant cluster's virt-launcher
-  pods and the ports are NodePorts, so a cluster-wide rule opens the NodePort
-  range of every opted-in tenant cluster to every tenant, including NodePorts
-  the tenant never declared as LoadBalancer ports.
-- **`toEndpoints` on virt-launcher pods.** Same exposure as the previous item
-  without needing 1.20: every tenant reaches every tenant cluster's nodes on
-  the ports listed.
+- **The L4 mode for every type.** The first version of this proposal. It
+  works, but it adds a stateful datapath where a policy rule is enough, and it
+  does nothing on isp-slim (Cilium L2 announcements, no MetalLB). Rejected in
+  favor of Part A, following review.
 - **Allow `cluster` in the tenant egress policy.** Removes tenant isolation;
   rejected.
 
-### Datapath side
+### For CCM Services
+
+- **`toServices` with `policy-cidr-match-mode=pods`**, or **`toEndpoints` on
+  virt-launcher pods.** Opens the NodePort range of every tenant cluster to
+  every tenant (Part B, Why not a policy rule).
+- **`exposeMethod: Proxied` everywhere.** Requires every domain to be declared
+  on the Kubernetes application beforehand, carries only HTTP and HTTPS, and
+  does not cover the `LoadBalancer` Services tenants create themselves.
+- **Wait for the Gateway.** The Gateway serves the platform's HTTP and database
+  exposure; it does not realize the `LoadBalancer` Services a tenant creates in
+  its own cluster, which remain CCM Services.
+
+### Datapath variants for Part B
 
 - **DNAT on the announcer without masquerade.** A pod on another node is
   masqueraded to its node IP by kube-ovn; the backend answers that node
@@ -335,17 +415,16 @@ main appeal.
 - **DNAT on every node plus masquerade.** Breaks VM clients: the VM mode
   rewrites a VM's source statelessly before conntrack, so the reply is never
   translated back. Observed on the lab.
-- **`service.kubernetes.io/service-proxy-name` instead of
-  `service.cilium.io/type: ClusterIP`.** Cilium then drops the ClusterIP and
-  the NodePort as well.
+- **`service.kubernetes.io/service-proxy-name`**, as the VM mode does, instead
+  of `service.cilium.io/type: ClusterIP`. Cilium then drops the ClusterIP and
+  the NodePort as well, changing in-cluster behavior beyond the public IP.
 
-### Opt-in mechanism
+### Opt-in mechanism for Part B
 
 - **`loadBalancerClass`**, the integration point recorded in
   `loadbalancer-announcer-neutrality`. A Service with a non-default class is
   skipped by MetalLB, which would then neither allocate nor announce its IP.
   The L4 mode is not another LoadBalancer implementation: it relies on MetalLB
-  for both and only replaces Cilium's translation. A label plus the Cilium
-  annotation expresses exactly that. `loadBalancerClass` is also immutable,
-  which would turn the per-Service rollback into a Service re-creation and an
-  IP change.
+  for both and only replaces Cilium's translation. `loadBalancerClass` is also
+  immutable, which would turn the per-Service rollback into a Service
+  re-creation and an IP change.
