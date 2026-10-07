@@ -35,13 +35,13 @@ Today, the relevant pieces are:
 - **Per-tenant monitoring is optional.** `tenant.spec.monitoring` (default `false`, `packages/apps/tenant/values.yaml`) deploys a full per-tenant stack (VMCluster, vmagent, Grafana, Alerta) into the tenant namespace. Isolation is by the namespace label `namespace.cozystack.io/monitoring` (`packages/apps/tenant/templates/namespace.yaml`). A tenant **without** its own monitoring inherits the parent's label, so its series live in an ancestor's VMCluster, ultimately `tenant-root`, a store shared by many tenants.
 - **Read endpoint.** Each VMCluster exposes a Prometheus-compatible read API at `vmselect-<name>.<ns>.svc:8481/select/0/prometheus/` (`packages/system/monitoring/templates/vm/grafana-datasource.yaml`). VictoriaMetrics multitenancy (`/insert/<accountID>`) is **not** used; everything is accountID 0, so isolation today is "separate instances plus NetworkPolicy", not a tenant dimension inside one store.
 - **Tenant RBAC and OIDC groups.** The tenant chart binds four aggregated ClusterRoles `cozy:tenant:{view,use,admin,super-admin}` (labels `rbac.cozystack.io/aggregate-to-tenant-<level>`, `packages/system/cozystack-basics/templates/clusterroles.yaml`) in the tenant namespace, to `kind: Group` subjects named `<tenant>-{view,use,admin,super-admin}` plus the service accounts of ancestor tenants (`cozy-lib` `_rbac.tpl`). The Keycloak operator creates exactly those per-tenant groups (`packages/apps/tenant/templates/keycloakgroups.yaml`); the OIDC `groups` claim is used **without** a group prefix, so RoleBindings reference the group names directly.
-- **Dashboard.** `cozystack-ui` is a pure SPA (no BFF). In production an in-pod nginx proxies `/api`, `/apis`, `/k8s` to `kubernetes.default.svc`; an oauth2-proxy sits in front and the SPA relies on its session cookie. There is no charting library, no Prometheus proxy, and no Grafana embed in the bundle.
+- **Dashboard.** `cozystack-ui` is a pure SPA (no BFF). In production an in-pod nginx proxies `/api`, `/apis`, `/k8s` to `kubernetes.default.svc`. In an OIDC deployment (`oidc.enabled: true`, which this proposal's group-based authz assumes) an oauth2-proxy sits in front and the SPA relies on its session cookie; with OIDC off a built-in token-proxy serves the same paths. There is no charting library, no Prometheus proxy, and no Grafana embed in the bundle.
 
 ### The problem
 
 - A tenant opens a VM-instance page in the dashboard and wants to see "how much CPU / RAM / network has this VM been using for the last hour". There is no such graph, and no API the SPA could call to build one.
 - The obvious shortcut, letting the SPA reach `vmselect` directly (for example through the kube-apiserver `services/<vmselect>/proxy` subresource), is unsafe: `services/proxy` authorizes coarsely and does **not** constrain the PromQL. For a tenant whose data lives in the shared `tenant-root` VMCluster, proxy access reads **every** tenant's series. The shortcut is only safe when each tenant has its own isolated `vmselect`, which is the optional, off-by-default case.
-- `workloads.cozystack.io` `status.resources` exposes **allocation** (summed container requests, PVC requests, MetalLB IPs, S3 bytes), not measured consumption, so it cannot answer "actual CPU used over time".
+- `workloads.cozystack.io` `status.resources` is a mix of categories, not a usage time-series: CPU and memory come from summed container **requests** (allocation), PVC entries from the bound volume's `status.capacity`, MetalLB from the allocated IP count, and only S3 size is **measured** (queried from SeaweedFS bucket metrics). It carries no CPU/RAM usage over time, so it cannot answer "actual CPU used over time".
 
 ## Goals
 
@@ -154,7 +154,7 @@ Initial catalog (per `target.kind`):
 
 The exact KubeVirt metric names are **not pinned in this proposal**: they are a third-party contract and must be confirmed against the KubeVirt metrics reference during implementation, not guessed here. Per-VM network is the one category with no usable source today (see Rollout, phase 0).
 
-Consumption means **measured usage**, not requests. The `workloads.cozystack.io` allocation data is a separate concern and may later be offered as an overlay ("requested vs used"), but the graphs this proposal targets are actual usage.
+Consumption means **measured usage**, not requests. The requested-resource data in `workloads.cozystack.io` `status.resources` (container CPU/memory requests) is a separate concern and may later be offered as an overlay ("requested vs used"), but the graphs this proposal targets are actual usage.
 
 ### 5. Tenant-to-vmselect resolution
 
@@ -206,6 +206,7 @@ It runs in the management cluster alongside `cozystack-api`.
 
 - **New trust boundary:** the server issues PromQL to `vmselect` on behalf of users. The whole point of layer 2 is that the server, not the user, decides the tenant filter. Client label selectors are never forwarded verbatim.
 - **Tenant-supplied input** is limited to a namespace (authorized by RBAC), a target kind/name, a metric from a fixed catalog, and a bounded range/step. There is no free-form PromQL, which removes both the cross-tenant read risk and the expensive-query risk inherent in a raw proxy.
+- **Input sanitization.** `target.name` is validated against the Kubernetes resource-name grammar before it is interpolated into any PromQL matcher (for example the `virt-launcher-<vm>-.*` pod selector), so a tenant cannot inject regex metacharacters to widen the selection. Cross-tenant reads stay impossible regardless, because the server's `namespace` matcher is ANDed into every query; sanitization closes the narrower within-tenant widening.
 - **Why not `services/proxy` to `vmselect`:** it authorizes coarsely and cannot inject a tenant filter, so against the shared `tenant-root` VMCluster it leaks every tenant's series. Rejected for that reason (see Alternatives).
 - **New RBAC surface:** one aggregated ClusterRole granting `create` on `metricqueries`. No new secrets are stored or transmitted; the server uses its own ServiceAccount to reach `vmselect` and delegated authn to identify callers.
 
