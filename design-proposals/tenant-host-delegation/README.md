@@ -33,8 +33,6 @@ its own domain-ownership verification.
 - Out of scope here, and deliberately so: **how** ownership of a domain is established. DNS
   challenge flows, a verification state machine, and any operator-facing UI for granting a domain
   belong to whatever component performs the verification, not to Cozystack admission.
-- Also out of scope: BYOD for level-1 tenants, meaning direct children of `Tenant/root` — see
-  §Open questions.
 
 ## Decisions
 
@@ -157,6 +155,30 @@ reach subdomains of their parent's apex and the explicit grants, and nothing els
 ancestor's apex — an uncle's subtree, for one. Two siblings claiming the same name under their
 parent's apex remain the `HostnameConflict` case of §Non-goals.
 
+`tenant-root` is the exception, because the tenant chart skips it: its namespace is rendered by
+`packages/system/cozystack-basics/templates/tenant-root.yaml`, and its children's `_namespace` by
+`cozystack-values-secret.yaml` in the same chart. There the annotation is rendered from a platform
+value, `gateway.rootAllowedHosts` (§7):
+
+```
+allowed-hosts(tenant-root) = gateway.rootAllowedHosts
+inherited(tenant-root)     = ∅
+```
+
+Its entries are explicit and apex-inclusive, as any grant. Two things are deliberately absent:
+
+- **No seeded entry.** Seeding `.<root-host>` would hand every level-1 tenant any subdomain of the
+  platform apex — `dashboard.`, `keycloak.` — which is the hijack layer 4 exists to prevent.
+- **No propagation.** The root's subtree is the whole platform, so an inherited root entry would be
+  claimable by every tenant at every depth. A level-1 tenant that needs a domain further down gets
+  it through its own `spec.allowedHosts`, like any other tenant.
+
+The value has two readers. Layer 8 reads it for `Ingress` objects in `tenant-root` itself (§5), and
+layer 4 reads it for `spec.host` on level-1 tenants, whose `Tenant` objects live in `tenant-root`.
+The latter is level-1 BYOD through an explicitly named platform value rather than a blanket
+annotation. `spec.allowedHosts` on `Tenant/root` stays inert; the field's description points to
+the platform value instead.
+
 ### 2. The new field
 
 ```yaml
@@ -244,6 +266,11 @@ This also bounds the `kubernetes` app's `Proxied` ingress: its `addons.ingressNg
 the root apex must now be granted to the tenant, which is the point — and the one migration step
 (§Upgrade and rollback compatibility).
 
+`tenant-root` is in scope too, since the policy matches every `tenant-*` namespace. Its annotation
+comes from `gateway.rootAllowedHosts` (§1), so a `kubernetes` app in `Proxied` mode or a Harbor with
+a custom `host` living in `tenant-root` keeps its external domain by listing it there. Without
+that value the root's allowlist is empty and those hosts are denied on their next write.
+
 ### 6. Two trust sets, deliberately disjoint
 
 | Set | Members | May |
@@ -263,7 +290,7 @@ the platform's own hostnames.
 
 ### 7. Platform values
 
-Three keys under `gateway:` in `packages/core/platform/values.yaml`, reaching the charts through
+Four keys under `gateway:` in `packages/core/platform/values.yaml`, reaching the charts through
 the existing `_cluster` channel:
 
 | Value | `_cluster` key | Consumer |
@@ -271,6 +298,11 @@ the existing `_cluster` channel:
 | `gateway.reservedHosts` | `gateway-reserved-hosts` | layers 4, 8 and 9 |
 | `gateway.hostGrantGroups` | `gateway-host-grant-groups` | layer 9 |
 | `gateway.tenantHostDelegation` | `gateway-tenant-host-delegation` | the tenant chart, layer 8 |
+| `gateway.rootAllowedHosts` | `gateway-root-allowed-hosts` | `tenant-root.yaml` |
+
+`rootAllowedHosts` never passes through admission on its way in, so `tenant-root.yaml` applies
+layer 9's entry rules at render time: it fails the render on an entry that contains whitespace,
+starts with a dot, or falls under `reservedHosts`.
 
 `hostGrantGroups` takes Kubernetes **group** names (e.g. `system:serviceaccounts:my-api`), because
 the policy compares against `request.userInfo.groups`. A namespace-wide group trusts every service
@@ -286,25 +318,25 @@ review surface for little gain on a list that changes rarely.
   to set `spec.host` to a hostname under an entry of it. The denial message names what is wrong
   instead of naming who they are. With delegation on, an external domain on the default Ingress
   path — the `kubernetes` app's `Proxied` hosts, for one — must also be in their allowlist.
-- **Platform operators** gain three `gateway.*` values. Off by default.
+- **Platform operators** gain four `gateway.*` values. Off by default.
 - **Docs:** `packages/extra/gateway/README.md` gains layer 9 and rewritten layers 4 and 8;
   `content/en/docs/next/operations/configuration/platform-package.md` in `cozystack/website` needs
-  the three new keys.
+  the four new keys.
 
 ## Upgrade and rollback compatibility
 
-At default values — `reservedHosts: []`, `hostGrantGroups: []`, `tenantHostDelegation: false` — an
-existing cluster behaves identically:
+At default values — `reservedHosts: []`, `hostGrantGroups: []`, `rootAllowedHosts: []`,
+`tenantHostDelegation: false` — an existing cluster behaves identically:
 
 - Both reserved checks render as empty CEL list literals and evaluate false unconditionally.
-- Every tenant's allowlist annotation renders empty, and an empty-entry guard keeps an empty
-  annotation from matching anything.
+- Every tenant's allowlist annotation renders empty, `tenant-root`'s included, and an empty-entry
+  guard keeps an empty annotation from matching anything.
 - The trusted-caller set is untouched, so the only passing branch remains the one that passes today.
 - Layer 8 renders today's expression: the outside-root conditions are emitted only when
   `tenantHostDelegation` is true.
 
-No migration at default values. Existing `Tenant` objects gain no field value, and existing namespaces gain one empty
-annotation, which nothing reads unless the feature is on.
+No migration at default values. Existing `Tenant` objects gain no field value, and existing
+namespaces gain one empty annotation, which nothing reads unless the feature is on.
 
 Rollback is reverting the charts: the annotation becomes inert, and any `spec.host` already
 accepted survives, because the policy runs on write.
@@ -319,7 +351,8 @@ That loss is the one migration step. An `Ingress` already admitted survives, bec
 runs on write, but the next write to it — an upgrade of the `kubernetes` app, an edit of
 `addons.ingressNginx.hosts` — is denied if its host is not granted, and the HelmRelease fails.
 Before enabling the flag, an operator lists the `Ingress` hosts in `tenant-*` namespaces that fall
-outside the root apex and grants each on the tenant that owns it, or on an ancestor. Cozystack
+outside the root apex and grants each on the tenant that owns it, or on an ancestor — or, for
+`tenant-root`, which has neither, in `gateway.rootAllowedHosts`. Cozystack
 cannot do this step for them: it has no way to tell a legitimate external domain from a squatted
 one, which is why the branch needs a grant in the first place.
 
@@ -366,7 +399,14 @@ one, which is why the branch needs a grant in the first place.
   the object.
 - Parent's annotation absent (e.g. a namespace the tenant chart has not reconciled) → the allowlist
   resolves empty and the write is denied. Fail-closed.
-- `spec.allowedHosts` on `Tenant/root` → no effect; see §Open questions.
+- `Ingress` in `tenant-root` with a host outside the root apex, delegation on → admitted only if
+  the host is in `gateway.rootAllowedHosts`.
+- Level-1 tenant's `spec.host` set by a tenant user → admitted only if under an entry of
+  `gateway.rootAllowedHosts`, and never under a reserved entry. Empty by default, so denied.
+- `spec.allowedHosts` on `Tenant/root` → no effect; the root's grant is `gateway.rootAllowedHosts`
+  (§1).
+- `gateway.rootAllowedHosts` entry with whitespace, a leading dot, or under `reservedHosts` → the
+  `cozystack-basics` render fails, so the bad value never reaches the cluster.
 
 ## Testing
 
@@ -376,7 +416,9 @@ one, which is why the branch needs a grant in the first place.
   the literal disjunction rather than searching for the operand names, so a variant that AND-gates
   the trusted caller behind the veto fails the suite. Layer 8 renders today's expression with the
   flag off, and with it on carries the allowlist and reserved conditions inside the outside-root
-  branch only.
+  branch only. `tenant-root` carries the annotation from `rootAllowedHosts`, empty by default and
+  with no seeded entry; the root's `cozystack-values` Secret propagates no allowlist; the render
+  fails on a malformed or reserved `rootAllowedHosts` entry.
 - **helm-unittest**, `packages/apps/tenant`: the annotation is empty by default, seeds the apex
   with a leading dot only when delegation is on, unions inherited ∪ explicit grants ∪ seeded apex
   with deduplication, and propagates through `_namespace` without the seeded entry.
@@ -386,31 +428,26 @@ one, which is why the branch needs a grant in the first place.
   host is accepted; an uncovered host is denied; the parent's exact apex is denied; and a reserved
   host is denied *while granted*, that last one gated on the grant having actually propagated so it
   can only fail because of the veto. On the Ingress path, an `Ingress` in the child with an external
-  host is denied until that host is granted, then accepted.
+  host is denied until that host is granted, then accepted; the same in `tenant-root`, granted
+  through `rootAllowedHosts`.
 - **CEL evaluation** of the rendered expressions, as a check that the policies mean what the tests
   assert about their text.
 
 ## Rollout
 
-One release. All three values default to inert, so the charts can ship ahead of any platform
+One release. All four values default to inert, so the charts can ship ahead of any platform
 enabling them. A platform enables in three steps: `reservedHosts` first, to install the veto before
-granting anything; then grants for the external domains already in use on the Ingress path
-(§Upgrade and rollback compatibility); then `tenantHostDelegation`. Nothing is deprecated.
+granting anything; then grants for the external domains already in use on the Ingress path, with
+`rootAllowedHosts` for those in `tenant-root` (§Upgrade and rollback compatibility); then
+`tenantHostDelegation`. Nothing is deprecated.
 
 ## Open questions
 
-1. **Level-1 tenants.** `spec.allowedHosts` on `Tenant/root` has no effect: the root namespace is
-   rendered by `cozystack-basics`, not by the tenant chart, and carries no such annotation. So a
-   level-1 tenant's own `spec.host` stays a trusted-caller field, and only its subtenants benefit.
-   Making the root path emit the annotation would hand every level-1 tenant a subdomain of the
-   platform apex the moment delegation is switched on, which is the hijack layer 4 exists to
-   prevent — so the current no-op is the safe behaviour, and level-1 BYOD probably wants an
-   explicitly-named platform value rather than a blanket annotation. Is deferring that acceptable?
-2. **Reserved grants under GitOps.** Only `system:masters` may place a reserved zone in an
+1. **Reserved grants under GitOps.** Only `system:masters` may place a reserved zone in an
    allowlist, and Flux applies as `cozy-fluxcd` — so such a grant cannot be declared in GitOps and
    would be re-denied on every reconcile. Accept the limitation, or admit the `cozy-*` accounts
    there and rely on layer 4 alone for the veto?
-3. **Scoping a grant.** A grant is inherited by the entire subtree, with no way to scope it to one
+2. **Scoping a grant.** A grant is inherited by the entire subtree, with no way to scope it to one
    branch or narrow an inherited entry. Is per-branch scoping worth a mechanism?
 
 ## Alternatives considered
@@ -434,6 +471,13 @@ self-signed and any external verification trivially bypassable.
 no migration step. Rejected because the default Ingress path would keep admitting any external
 domain, so the API's account of what a tenant may use would hold only on the opt-in path — the
 goal would be met where it matters least.
+
+**Leave `tenant-root` out of §5.** No new value. Rejected because `tenant-root` would then be the
+one namespace whose external Ingress hosts the API does not account for, and level-1 BYOD would
+stay a trusted-caller operation; one platform value closes both.
+
+**Seed or propagate the root's allowlist like any tenant's.** Rejected: seeding hands every level-1
+tenant the platform apex, and propagating makes every root entry claimable by every tenant (§1).
 
 **An apex-inclusive seeded entry.** What the first draft had. It lets a child claim its parent's
 exact apex: no trust boundary is crossed, since only the parent can create that child, but two
