@@ -218,7 +218,7 @@ It runs in the management cluster alongside `cozystack-api`.
 
 ## Testing
 
-- **Unit:** tenant-label injection builds the expected PromQL and cannot be overridden by client input; the vmselect resolver walks the ancestry correctly; the metric catalog maps to the expected templates; range/step validation.
+- **Unit:** tenant-label injection builds the expected PromQL and cannot be overridden by client input; the resolver reads the inherited `namespace.cozystack.io/monitoring` label and selects the right vmselect; the metric catalog maps to the expected templates; range/step validation.
 - **Integration:** the `SubjectAccessReview` path allows `<tenant>-view` in the tenant namespace and denies a foreign tenant; `system:masters` / `cozystack-cluster-admin` bypass.
 - **e2e:** two tenants on a shared `tenant-root` store; tenant A's query returns only A's series and never B's; a parent reading a child succeeds, a sibling reading a sibling fails; a VM graph renders end to end in the dashboard.
 
