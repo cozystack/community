@@ -206,7 +206,7 @@ external Services match the table of cozystack/community#87, §4.
 | nats | `<r>` | nested chart values, `service.merge.metadata.labels` (`nats/templates/nats.yaml`) | 4222, the only client port the app enables |
 | opensearch | `<r>-external`, and `<r>-dashboards-external` with `dashboards.enabled` | chart, `opensearch/templates/external-svc.yaml`, both Services | 9200; 5601 |
 | qdrant | `<r>` | nested chart values, `service.additionalLabels` (`qdrant/templates/qdrant.yaml`) | 6333, 6334, 6335 |
-| openbao | `<r>`, and `<r>-ui` with `ui` (default on) | nested chart values, `server.service.extraLabels` and `ui.extraLabels` (`openbao/templates/openbao.yaml`) | 8200, 8201; 8200 |
+| openbao | `<r>`; `<r>-active` and `<r>-standby` when `replicas > 1`; `<r>-ui` with `ui` (default on) | nested chart values: `server.service.extraLabels`, and in HA `server.service.active.extraLabels` and `server.service.standby.extraLabels`, which the chart reads separately and which inherit `server.service.type`; `ui.extraLabels` (`openbao/templates/openbao.yaml`) | 8200, 8201; 8200 |
 | tcp-balancer | `<r>-haproxy` | chart, `tcp-balancer/templates/service.yaml` | 8080, 8443, 6443, 50000 |
 | vpn | `<r>-vpn`, when `externalIPs` is empty | chart, `vpn/templates/service.yaml`, `LoadBalancer` branch only | 40000 TCP and UDP |
 | ingress | the controller's Service | `packages/extra/ingress/templates/nginx-ingress.yaml`, `controller.service.labels` | 80, 443 |
