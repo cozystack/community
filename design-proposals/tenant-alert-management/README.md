@@ -3,7 +3,7 @@
 - **Title:** `Tenant alert management: rules and receivers`
 - **Author(s):** `@IvanHunters`
 - **Date:** `2026-10-08`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
