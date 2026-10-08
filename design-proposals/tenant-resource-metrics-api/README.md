@@ -1,31 +1,33 @@
-# Read-only aggregation API for tenant resource-consumption metrics
+# Tenant resource-consumption metrics via an application subresource
 
-- **Title:** `Read-only aggregation API for tenant resource-consumption metrics`
+- **Title:** `Tenant resource-consumption metrics via an application subresource`
 - **Author(s):** `@IvanHunters`
-- **Date:** `2026-10-07`
-- **Status:** Review
+- **Date:** `2026-10-08`
+- **Status:** Draft
 
 ## Overview
 
-Cozystack collects rich time-series metrics (CPU, memory, storage, and, once scraped, per-VM network) in VictoriaMetrics, but there is no way for the dashboard to show a tenant their own consumption graphs. The console is a pure SPA that talks only to the Kubernetes API (no backend), and it has neither a query path into VictoriaMetrics nor an authorization model that would let a tenant read only their own series. Today a VM-instance detail page shows status, workloads, and a VNC console, but no CPU/RAM/network graph over time.
+Clients running managed databases and VMs on Cozystack want to see their own real consumption (CPU, memory, network) directly in the dashboard, without opening Grafana and without deploying their own per-tenant monitoring stack. Today the data already lives in VictoriaMetrics, but a tenant has no way to read it: the dashboard is a pure SPA that talks only to the Kubernetes API, there is no per-tenant query path into VictoriaMetrics, and a VM or database detail page shows status and controls but no consumption graph over time. A tenant can set quotas and presets but cannot see how much it actually uses, which is a concrete ask from real clients.
 
-This proposal introduces a small **read-only aggregation API server** registered as a Kubernetes `APIService` under a new group `metrics.cozystack.io`. A client creates a `MetricQuery` object scoped to a tenant namespace; the server authorizes it through normal Kubernetes RBAC, resolves which VictoriaMetrics instance holds that tenant's data, injects a mandatory tenant filter into the PromQL, runs a range query, and returns the series in the response. The server has **no storage of its own**: the durable store is VictoriaMetrics, and the API is a thin, authorizing, tenant-isolating read path on top of it.
+This proposal exposes consumption metrics as a **subresource of the existing `apps.cozystack.io` application resource**, served by the existing `cozystack-api` aggregated API server. The dashboard calls `.../namespaces/<ns>/<plural>/<name>/metrics/api/v1/query_range?query=...`; `cozystack-api` authorizes the call with ordinary Kubernetes RBAC, forwards the Prometheus-compatible query to the tenant's `vmselect` with a server-forced tenant filter, and returns the Prometheus-compatible JSON unmodified for the dashboard to chart. There is **no new API server, no new resource kind, and no Kubernetes envelope (`apiVersion`/`kind`) in the payload**.
 
-The design deliberately reuses the pattern of the existing cozystack aggregation API (`apps.cozystack.io`) and the delegated-authz mechanism, so the dashboard reaches it over the same path and auth it already uses for everything else.
+This is a revision. An earlier draft of this proposal designed a standalone `metrics.cozystack.io` aggregation API server with a `MetricQuery` kind. After a design discussion that shape was dropped in favor of the subresource described here; the Alternatives section records why.
 
 ## Scope and related proposals
 
-- **Complements, does not replace, Grafana.** Grafana stays the place for deep, ad-hoc exploration. This API serves the narrow, embedded, per-resource graphs the dashboard needs, with tenant isolation enforced server-side.
-- **Related to `component-health-reporting`** (same repo). That proposal answers "what is broken right now" as facts in a CRD; this one answers "how much is this resource consuming over time" as series. They are complementary and share the same tenant-scoping philosophy.
-- **Billing is out of scope.** A separate metering/billing effort exists outside this repo (the `billing.aenix.io` aggregation API). It is referenced here only as a **pattern** (a storage-less, query-in/result-out aggregation server). This proposal does not depend on it, does not reuse its code, and does not produce invoices or prices.
-- **Alert management is a separate, future proposal.** Enabling/disabling alert rules and managing where alerts are delivered is read-write and stateful, and belongs in its own design. It is explicitly deferred (see Non-goals).
+- **Supersedes the earlier revision of this proposal** (standalone `metrics.cozystack.io` server with a `MetricQuery` kind). See Alternatives.
+- **Modeled on the Cozystack portal logs API** (external: `aenix-org/cozyportal`, group `logging.portal.cozystack.io`, resource `logs`): a virtual, non-etcd resource that proxies a time-series backend behind Kubernetes authorization. This proposal adapts that pattern and improves on it (RBAC comes for free here, which it did not in the portal; see Design).
+- **Complements, does not replace, Grafana.** Grafana stays the place for deep exploration; this serves embedded, basic per-resource graphs for tenants who do not run their own Grafana.
+- **Billing is out of scope.** The external `billing.aenix.io` server is referenced only as a pattern; this proposal does not depend on it and does not produce invoices.
+- **Alert management is a separate proposal.** Managing alert rules and routing is read-write and stateful; unlike metrics, it likely does need an aggregation API. Deferred (see Non-goals).
+- **Foundational dependency: multi-tenancy for the metrics store.** The real underlying work flagged in the discussion is proper per-tenant isolation of the metrics backend, whatever it is. This proposal's forced-filter and store resolution are the per-tenant access layer on top of that (see Design and Rollout).
 
 ## Prior art
 
-- **cozystack aggregation API (reuse the mechanism).** `cozystack-api` (`packages/system/cozystack-api`) is already a Kubernetes aggregated API server for `apps.cozystack.io` / `core.cozystack.io` / `sdn.cozystack.io`, using delegated authentication and authorization (`RecommendedOptions`, `auth-delegator` / `auth-reader`). For `apps.cozystack.io` the authorization is ordinary Kubernetes RBAC evaluated by the kube-apiserver. This proposal adds a new aggregated API server following the same shape.
-- **Server-side tenant filtering (reuse the pattern).** The `tenantnamespaces` resource in `cozystack-api` is readable by all `system:authenticated` users and filters the result server-side by walking the RoleBindings in each namespace, with a bypass for `system:masters` and `cozystack-cluster-admin`. From it this proposal borrows the `system:masters` / `cozystack-cluster-admin` bypass and the namespace-scoping philosophy. For authorization itself it does not use the "any binding present" walk; it uses the delegated-RBAC model (a verb-specific `SubjectAccessReview`, like `apps.cozystack.io`), which is strictly more specific (see Design, Layer 1).
-- **Storage-less query-in/result-out aggregation server (reuse the shape).** The external `billing.aenix.io` API server (a separate aenix-org repository, referenced as a pattern only and not verifiable from this repo) runs with `Etcd = nil`, exposes a single resource, implements only `Create`, and returns the computed report in the same object. It authorizes each call with an explicit `SubjectAccessReview` against `query.tenant`. We adopt this shape but fix one known gap: that server authorizes only the top-level tenant and then widens the selection to sub-tenants by regex without authorizing them. We authorize each namespace we read (see Design).
-- **Existing usage surface in the console (consumer).** The admin "Capacity" pages already show cluster-wide, point-in-time usage: requested-vs-allocatable gauges, a per-node table whose "Used" column comes from `metrics.k8s.io`, and a PVC-by-StorageClass tally across all tenants. There is no time-series graph and no per-tenant or per-VM consumption view. This API is what a per-VM graph would read from.
+- **Portal logs API (the model, external).** `aenix-org/cozyportal` serves a top-level namespaced virtual resource `logs` (group `logging.portal.cozystack.io`, not stored in etcd) from an aggregated API server, projecting requests into VictoriaLogs and streaming the backend's native response as `text/plain` rather than a Kubernetes object. Its ADR-001 chose a top-level resource over a per-kind subresource specifically because logs must survive their parent (post-mortem), a constraint that does not apply to live metrics. Crucially, the portal's authorization needed a **custom `SubjectAccessReview`** in the handler, because its logs server lives in a different API group than the resources it reports on; its RBAC did not come for free. This proposal avoids that by living in the same group as its target.
+- **cozystack-api (the host).** `cozystack-api` is the aggregated API server for `apps.cozystack.io`, registering one storage per application kind from the `ApplicationDefinition` set, with delegated authentication and authorization. It has no subresource today (`tenantsecret` explicitly reports it has none), so this adds the first one.
+- **Kubernetes subresource precedents.** Upstream `pods/log` uses `GetterWithOptions` + `ResourceStreamer` to stream a non-JSON body; `pods/proxy` uses `rest.Connecter` to return an `http.Handler` that reverse-proxies arbitrary methods and response bodies. The latter is the closer fit for a Prometheus passthrough.
+- **vmauth for traces (in cozystack).** Cozystack already runs `vmauth` to pin a tenant's account for traces via a `VMUser`, forcing isolation with `extra_filters`. This is the basis of the alternative in this proposal.
 
 ## Decisions
 
@@ -37,223 +39,164 @@ Empty while the proposal is still intent. -->
 
 Today, the relevant pieces are:
 
-- **Metrics stack: VictoriaMetrics** (not Prometheus). The `victoria-metrics-operator` runs with the Prometheus-CRD converter enabled; `monitoring-agents` runs a cluster-wide `vmagent` (`selectAllByDefault: true`) scraping cAdvisor, kubelet, node-exporter, kube-state-metrics, and the control plane, remote-writing into the `tenant-root` VMCluster by default (`packages/core/platform/templates/bundles/system.yaml`, `global.target`).
-- **Per-tenant monitoring is optional.** `tenant.spec.monitoring` (default `false`, `packages/apps/tenant/values.yaml`) deploys a full per-tenant stack (VMCluster, vmagent, Grafana, Alerta) into the tenant namespace. Isolation is by the namespace label `namespace.cozystack.io/monitoring` (`packages/apps/tenant/templates/namespace.yaml`). A tenant **without** its own monitoring inherits the parent's label, so its series live in an ancestor's VMCluster, ultimately `tenant-root`, a store shared by many tenants.
-- **Read endpoint.** Each VMCluster exposes a Prometheus-compatible read API at `vmselect-<name>.<ns>.svc:8481/select/0/prometheus/` (`packages/system/monitoring/templates/vm/grafana-datasource.yaml`). VictoriaMetrics multitenancy (`/insert/<accountID>`) is **not** used; everything is accountID 0, so isolation today is "separate instances plus NetworkPolicy", not a tenant dimension inside one store.
-- **Tenant RBAC and OIDC groups.** The tenant chart binds four aggregated ClusterRoles `cozy:tenant:{view,use,admin,super-admin}` (labels `rbac.cozystack.io/aggregate-to-tenant-<level>`, `packages/system/cozystack-basics/templates/clusterroles.yaml`) in the tenant namespace, to `kind: Group` subjects named `<tenant>-{view,use,admin,super-admin}` plus the service accounts of ancestor tenants (`cozy-lib` `_rbac.tpl`). The Keycloak operator creates exactly those per-tenant groups (`packages/apps/tenant/templates/keycloakgroups.yaml`); the OIDC `groups` claim is used **without** a group prefix, so RoleBindings reference the group names directly.
-- **Dashboard.** `cozystack-ui` is a pure SPA (no BFF). In production an in-pod nginx proxies `/api`, `/apis`, `/k8s` to `kubernetes.default.svc`. In an OIDC deployment (`_cluster.oidc-enabled: "true"`, which this proposal's group-based authz assumes) an oauth2-proxy sits in front and the SPA relies on its session cookie; with OIDC off a built-in token-proxy serves the same paths. There is no charting library, no Prometheus proxy, and no Grafana embed in the bundle.
+- **Metrics stack: VictoriaMetrics** (not Prometheus). A cluster-wide `vmagent` (`selectAllByDefault: true`) scrapes cAdvisor, kubelet, node-exporter, kube-state-metrics, and the control plane, remote-writing to the `tenant-root` VMCluster by default (`packages/core/platform/templates/bundles/system.yaml`, `global.target`). Each VMCluster exposes a Prometheus-compatible read API at `vmselect-<name>.<ns>.svc:8481/select/0/prometheus/`.
+- **Per-tenant monitoring is optional** (`tenant.spec.monitoring`, default `false`). When enabled, a tenant gets its own VMCluster, and its namespace label `namespace.cozystack.io/monitoring` names the owning namespace; when not enabled the label is inherited from the nearest ancestor that has monitoring, ultimately `tenant-root`. So cozystack isolates tenants by **separate stores plus NetworkPolicy**, not by an account dimension inside one store.
+- **Tenant RBAC and OIDC groups.** The tenant chart binds four aggregated ClusterRoles `cozy:tenant:{view,use,admin,super-admin}` (labels `rbac.cozystack.io/aggregate-to-tenant-<level>`) in each tenant namespace to `kind: Group` subjects `<tenant>-{view,use,admin,super-admin}` (created by the Keycloak operator) plus ancestor service accounts, with the view < use < admin < super-admin rollup. The OIDC `groups` claim is used without a prefix, so bindings name the groups directly.
+- **Dashboard.** `cozystack-ui` is a pure SPA (no BFF): in production an in-pod nginx proxies `/api`, `/apis`, `/k8s` to `kubernetes.default.svc`, with oauth2-proxy (OIDC) or a built-in token-proxy (non-OIDC) in front. Application objects are served by `cozystack-api` through that same kube-apiserver path. There is no charting library, no Prometheus proxy, and no Grafana embed in the bundle.
 
 ### The problem
 
-- A tenant opens a VM-instance page in the dashboard and wants to see "how much CPU / RAM / network has this VM been using for the last hour". There is no such graph, and no API the SPA could call to build one.
-- The obvious shortcut, letting the SPA reach `vmselect` directly (for example through the kube-apiserver `services/<vmselect>/proxy` subresource), is unsafe: `services/proxy` authorizes coarsely and does **not** constrain the PromQL. For a tenant whose data lives in the shared `tenant-root` VMCluster, proxy access reads **every** tenant's series. The shortcut is only safe when each tenant has its own isolated `vmselect`, which is the optional, off-by-default case.
-- `workloads.cozystack.io` `status.resources` is a mix of categories, not a usage time-series: CPU and memory come from summed container **requests** (allocation), PVC entries from the bound volume's `status.capacity`, MetalLB from the allocated IP count, and only S3 size is **measured** (queried from SeaweedFS bucket metrics). It carries no CPU/RAM usage over time, so it cannot answer "actual CPU used over time".
+- A tenant opens a database or VM page and wants "how much CPU / RAM / network has this been using". There is no such graph and no API the SPA could call to build one.
+- Telling the client to open Grafana does not work for the target audience: clients bought through a reseller who do not run their own Grafana, and who should not have to deploy and pay for a full monitoring stack just to read basic usage.
+- Reaching `vmselect` directly from the SPA (for example via the kube-apiserver `services/<vmselect>/proxy` subresource) is unsafe: it authorizes coarsely and cannot constrain the query, so against the shared `tenant-root` store it reads every tenant's series.
 
 ## Goals
 
-- A tenant user can retrieve time-series consumption for a resource they own (VM instance, pod, or their namespace in aggregate), scoped to a time range and step, and the dashboard renders it as a graph.
-- A tenant user can **never** read another tenant's series, including when both tenants' data lives in the same shared VMCluster. This is enforced server-side, not by trusting the client's query.
-- Authorization reuses the existing tenant RBAC and Keycloak groups with **no new groups** and **no change to the tenant chart's bindings**: adding one labeled ClusterRole is sufficient.
-- The API server is **stateless** (no etcd, no database), horizontally scalable, and adds no durable copy of metrics.
-- A parent tenant can read a child tenant's series exactly when existing RBAC already grants the parent access to the child's namespace, and not otherwise.
+- A tenant can retrieve time-series consumption for a resource it owns (a managed app / database / VM), over a chosen range, and the dashboard renders it as a graph.
+- A tenant can never read another tenant's series, enforced server-side by a forced filter the client cannot override.
+- Authorization reuses the existing tenant RBAC and Keycloak groups with **one aggregated ClusterRole rule** and no new groups; it comes for free from being in the `apps.cozystack.io` group.
+- The dashboard consumes a **Prometheus-compatible response with a standard client**, with no second Kubernetes-style API or client to maintain.
+- Minimal implementation: a subresource handler plus a forced filter in the existing `cozystack-api`, not a new API server, not a new CRD, not a large new code and E2E surface.
 
 ### Non-goals
 
-- Not billing, metering, pricing, or invoices.
-- Not alert-rule management or alert-routing configuration (separate proposal).
-- Not a general-purpose PromQL endpoint: callers choose a metric from a fixed catalog, they do not submit arbitrary PromQL.
+- Not billing, metering, or invoices.
+- Not alert-rule or alert-routing management (separate proposal).
 - Not a replacement for Grafana or for `metrics.k8s.io`.
-- Not a new durable store or downsampling engine; retention and downsampling stay in VictoriaMetrics.
-- Not metrics for resources **inside** guest Kubernetes clusters (Kamaji). This API serves management-cluster tenant resources (VM instances are management-cluster workloads). Guest-internal observability has a different authorization model (per-user email bindings) and is out of scope.
+- Not a new durable store; retention and downsampling stay in VictoriaMetrics.
+- Not a Kubernetes-style `MetricQuery` kind with `apiVersion`/`kind` envelopes (the dropped earlier revision).
+- Not metrics for resources inside guest Kubernetes clusters (Kamaji); that has a different authorization model and is out of scope.
 
 ## Design
 
-### 1. Component placement and data flow
+### 1. Shape: a metrics subresource on `application`
 
-The new server is a thin, read-only aggregation API server. The SPA reaches it through the same kube-apiserver path and session it already uses; the server does the tenant isolation that a raw proxy cannot.
+Add a `metrics` subresource to each `apps.cozystack.io` application kind in `cozystack-api`, registered under the storage key `"<plural>/metrics"` and implemented as a `rest.Connecter` (the `pods/proxy` pattern): the handler returns an `http.Handler` that reverse-proxies to the tenant's `vmselect`.
 
 ```mermaid
 flowchart LR
   UI["cozystack-ui (SPA)"] -->|"oauth2-proxy session"| KAS["kube-apiserver"]
-  KAS -->|"APIService metrics.cozystack.io"| MA["metrics-apiserver<br/>read-only, stateless, no etcd"]
-  MA -->|"query_range + injected tenant filter"| VS["vmselect"]
+  KAS -->|"apps.cozystack.io subresource"| CA["cozystack-api<br/>(existing aggregated server)"]
+  CA -->|"query_range + forced tenant filter"| VS["tenant vmselect"]
   VS --- VMC[("VMCluster (VictoriaMetrics)")]
-  VMA["vmagent"] -->|"scrape kubevirt_vmi_*, cAdvisor"| VMC
 ```
 
-### 2. API resource
+- **Request:** `GET .../namespaces/<ns>/<plural>/<name>/metrics/api/v1/query_range?query=<promql>&start=&end=&step=`. The path tail (`api/v1/query_range`) and the query string are the native VictoriaMetrics request.
+- **Response:** the `vmselect` Prometheus-compatible JSON, returned as the body unchanged, with no `apiVersion`/`kind` wrapper. The dashboard parses it with a standard Victoria/Prometheus client.
 
-A single namespaced resource `MetricQuery` in `metrics.cozystack.io/v1alpha1`. The resource is namespaced so that the namespace is the tenant scope and ordinary RBAC applies to it. Following the storage-less pattern, only `create` is implemented: the client submits a query, the server fills `status` in the response, and nothing is persisted.
+### 2. Why this shape
 
-```yaml
-apiVersion: metrics.cozystack.io/v1alpha1
-kind: MetricQuery
-metadata:
-  namespace: tenant-acme          # tenant scope; authz is evaluated against this
-spec:
-  target:
-    kind: VMInstance              # VMInstance | Pod | Namespace
-    name: my-vm                   # ignored when kind=Namespace
-  metric: cpu-usage               # from the fixed catalog, see 4
-  range:
-    start: "2026-10-07T10:00:00Z"
-    end:   "2026-10-07T11:00:00Z"
-    step:  "30s"
-status:
-  series:
-    - labels: { instance: "my-vm" }
-      points:
-        - { t: 1696672800, v: 0.42 }
-        - { t: 1696672830, v: 0.44 }
-  warnings: []                     # for example: tenant has no monitoring stack
-```
+Compared with the dropped standalone-aggregation-API revision and with the portal's separate-group logs model:
 
-Why `create` rather than a custom subresource or `get`: it mirrors `SubjectAccessReview` and the existing billing pattern, it carries a structured request body without encoding everything into a URL, and it makes the RBAC verb (`create metricqueries` in the tenant namespace) unambiguous. The server never writes the object anywhere.
+| property | this proposal (subresource on `application`) | earlier revision (new `metrics.cozystack.io` + `MetricQuery` kind) | portal-style separate group |
+| --- | --- | --- | --- |
+| RBAC | free: one rule `get <plural>/metrics` in `apps.cozystack.io`, distributed by the existing aggregated ClusterRole label | custom resource, new ClusterRole, still workable but a second surface | needs a custom `SubjectAccessReview` (different group) |
+| payload | native Prometheus JSON, no kube envelope | kube object with `apiVersion`/`kind` | native, but behind a custom SAR |
+| dashboard client | standard Prometheus/Victoria client | a second, kube-style client to build and maintain | standard |
+| new components | none (handler in existing `cozystack-api`) | a new aggregated API server | a new aggregated API server |
+| per-kind cost | none: `application` is one dynamic kind, so `metrics` is defined once | one resource for all | one resource, but per-target SAR wiring |
 
-### 3. Authorization: two independent layers
+The decisive points: RBAC is genuinely free because the subresource shares the `apps.cozystack.io` group with its target (the portal could not get this); the response is the backend's own Prometheus JSON, so the dashboard reuses a standard client instead of a second kube-style API; and because `cozystack-api` serves `application` as a single dynamic kind driven by `ApplicationDefinition`, the subresource is defined once rather than per application type, avoiding the per-kind recompile that the portal and similar systems hit.
 
-RBAC answers only "may this user issue a query in the context of tenant T". It does **not** decide which series come back. These are two separate concerns and must not be conflated.
+### 3. Authorization: two layers, the first free
 
 ```mermaid
 flowchart TD
-  REQ["MetricQuery (namespace = T)"] --> L1{"Layer 1 - RBAC<br/>SAR: create metricqueries in ns=T?"}
+  REQ["GET <plural>/<name>/metrics/... (namespace = T)"] --> L1{"Layer 1 - RBAC<br/>can user get <plural>/metrics in ns=T?"}
   L1 -->|deny| D1["403 Forbidden"]
-  L1 -->|allow| L2["Layer 2 - data isolation<br/>server injects tenant=T label,<br/>discards any client selector"]
-  L2 --> RUN["query_range on resolved vmselect"]
+  L1 -->|allow| L2["Layer 2 - forced filter<br/>handler appends extra_filters for ns=T and the release,<br/>client query cannot override it"]
+  L2 --> VS["reverse-proxy to tenant vmselect"]
 ```
 
-**Layer 1 (RBAC).** The aggregated server delegates to the kube-apiserver with a `SubjectAccessReview` for the authenticated user (and their OIDC groups): `{verb: create, group: metrics.cozystack.io, resource: metricqueries, namespace: T}`. The grant is a single aggregated ClusterRole:
+**Layer 1 (RBAC), free.** Because the subresource is in `apps.cozystack.io`, the kube-apiserver and `cozystack-api`'s delegated authorizer check `get <plural>/metrics` in the request namespace with no custom code. The grant is a single aggregated ClusterRole:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: cozy:tenant:view:metrics-apiserver
+  name: cozy:tenant:view:application-metrics
   labels:
     rbac.cozystack.io/aggregate-to-tenant-view: "true"
 rules:
-  - apiGroups: ["metrics.cozystack.io"]
-    resources: ["metricqueries"]
-    verbs: ["create"]
+  - apiGroups: ["apps.cozystack.io"]
+    resources: ["postgreses/metrics", "virtualmachines/metrics", "..."]
+    verbs: ["get"]
 ```
 
-Because this aggregates into `cozy:tenant:view`, and the tenant chart already binds `cozy:tenant:view` in each tenant namespace to the group `<tenant>-view` (and, through the `cozy-lib` level hierarchy view < use < admin < super-admin, to the higher groups and to ancestor tenants), every level and every ancestor gets the permission automatically. No new Keycloak group, no change to the tenant chart. Reading metrics is granted at `view`.
+Aggregated into `cozy:tenant:view`, which the tenant chart already binds to `<tenant>-view` and above, this reaches every tenant group and ancestor automatically. No new Keycloak group, no tenant-chart change. Reading metrics is granted at `view`.
 
-**Layer 2 (data isolation).** The server takes the tenant from `metadata.namespace` (already authorized in layer 1) and **injects** the tenant label into the PromQL itself. The label is the per-series `namespace` label (the same dimension series already carry and that billing keys tenants on). Client-provided label matchers are not trusted; the only selectors that reach VictoriaMetrics are the ones the server builds. The isolation invariant, and the crux of this whole design, is that every series in a shared store is attributable to exactly one tenant namespace, and that `namespace` label is attributed by the trusted platform scrape path (the kubelet and cAdvisor, the platform agents), not by anything a tenant workload controls. Phase 0 must confirm this per metric source: that the `namespace` label on the preferred KubeVirt per-VMI metrics and on every fallback source carries the resource's own namespace and cannot be set or overridden by the guest. This is what makes a shared `tenant-root` VMCluster safe.
+**Layer 2 (forced filter), the isolation hinge.** The handler takes the tenant from the request namespace (already authorized) and the release from the object name, and appends a mandatory `extra_filters` label matcher to the forwarded query. In VictoriaMetrics `extra_filters` is ANDed into every selector of the query, so even a raw client-supplied PromQL cannot escape the tenant's own `namespace` (and release) scope. This is the same mechanism the portal uses (a scope-label always added, empty selector rejected) and the same one `vmauth` uses for traces. Because the filter is forced server-side, raw Prometheus passthrough is isolation-safe and no fixed metric catalog is required.
 
-**Hierarchy (sub-tenants).** When a parent reads a child tenant, the request's namespace is the child's namespace, and layer 1 authorizes it directly: the `cozy-lib` bindings already place the parent's group into the child namespace, so "parent may read child" falls out of real RBAC rather than a regex. There is no separate `includeSubTenants` flag that widens the query past what RBAC checked.
+### 4. Tenant and `vmselect` resolution
 
-**Platform bypass.** Mirroring `tenantnamespaces`, the groups `system:masters` and `cozystack-cluster-admin` bypass tenant resolution and may query any tenant, for admin dashboards.
+The handler reads `namespace.cozystack.io/monitoring` on the request namespace to pick the `vmselect` holding that tenant's data (the tenant's own store when it has monitoring, otherwise the inherited ancestor, `tenant-root` by default), and forwards the query there with the forced filter. The filter is applied in both cases: redundant for an isolated per-tenant store, mandatory for the shared `tenant-root` one.
 
-### 4. Metric catalog and query construction
+### 5. Scope: per-object now, tenant-wide aggregate later
 
-Callers pick a metric from a fixed catalog; the server owns the PromQL template and fills in the target and the tenant filter. This keeps the surface small, keeps PromQL out of tenant hands, and lets query cost be bounded.
+A subresource answers "metrics for this one object". A tenant-wide view ("all my databases") needs either a top-level resource with the field-selector trick the portal uses for `list`, or a `metrics` subresource on the `Tenant`. This is deferred (see Open questions). A subresource also returns 404 once the application is deleted, which is acceptable for live graphs (unlike logs, which the portal kept post-mortem).
 
-Initial catalog (per `target.kind`):
+### 6. Foundational: metrics multi-tenancy
 
-| metric | meaning | preferred source | fallback source available today |
-| --- | --- | --- | --- |
-| `cpu-usage` | CPU seconds per second | KubeVirt per-VMI CPU metric | `rate(container_cpu_usage_seconds_total{pod=~"virt-launcher-<vm>-.*"}[...])` |
-| `memory-usage` | working-set bytes | KubeVirt per-VMI memory metric | `container_memory_working_set_bytes{...}` |
-| `network-rx` / `network-tx` | bytes/s received / transmitted | KubeVirt per-VMI network metrics | none per-VM today (see Rollout) |
-| `disk-usage` | PVC used/requested bytes | KubeVirt / KSM | `kube_persistentvolumeclaim_resource_requests_storage_bytes{...}` |
-
-The exact KubeVirt metric names are **not pinned in this proposal**: they are a third-party contract and must be confirmed against the KubeVirt metrics reference during implementation, not guessed here. Two catalog entries have no measured per-VM source today and are phase-0 gaps (see Rollout): per-VM network has no usable source at all, and the `disk-usage` fallback reports allocated PVC capacity (`kube_persistentvolumeclaim_resource_requests_storage_bytes`), which is allocation, not the measured usage this catalog otherwise aims for.
-
-Consumption means **measured usage**, not requests. The requested-resource data in `workloads.cozystack.io` `status.resources` (container CPU/memory requests) is a separate concern and may later be offered as an overlay ("requested vs used"), but the graphs this proposal targets are actual usage.
-
-### 5. Tenant-to-vmselect resolution
-
-```mermaid
-flowchart TD
-  Q["MetricQuery for tenant T (namespace = T)"] --> L["read namespace.cozystack.io/monitoring on ns T"]
-  L --> C{"label empty?"}
-  C -->|"no (names owner ns)"| VSV["select vmselect in that namespace"]
-  C -->|"yes (no dedicated stack)"| ROOT["fall back to tenant-root (default remote-write store)"]
-  VSV --> INJ["inject namespace=T matcher (mandatory)"]
-  ROOT --> INJ
-  INJ --> RUN["run query_range"]
-```
-
-The server reads the `namespace.cozystack.io/monitoring` label on the tenant's own namespace. That label is set at tenant-render time to the namespace of the nearest ancestor that has monitoring enabled (the tenant itself when it has its own stack), and is the empty string when no ancestor enables monitoring, which is the default (`tenant.spec.monitoring` is `false` by default). So resolution is a direct read with no ancestry walk: a non-empty label names the VMCluster that holds the tenant's data and the server selects that `vmselect` Service; an empty label means the tenant has no dedicated stack and its series live in the platform default store `tenant-root` (the hardcoded `monitoring-agents` remote-write target), which the resolver uses as the fallback. Which storage to hit for a given range (shortterm vs longterm) is an open question (see Open questions). The `namespace=<T>` matcher is injected unconditionally; it is redundant for an isolated per-tenant store but mandatory for the shared one, and always injecting it removes a "which store am I in" mistake.
-
-### 6. Statelessness and caching
-
-The server keeps **no durable state**. VictoriaMetrics already persists series, enforces retention, and has its own query cache, so a second store would only add a consistency problem.
-
-- **No persistent or shared cache** (no Redis, no sidecar DB). Duplicating a store that is already durable buys nothing and fights graph freshness.
-- **Optional in-process request coalescing** (singleflight): identical concurrent queries from dashboard polling collapse into one upstream `query_range`. This is per-replica, short-lived, and does not change the stateless deployment model.
-- **Heavy or long-range aggregations** are handled by VictoriaMetrics recording rules, not by a bespoke cache in this server.
-- **Query-cost limits** (allowlisted metrics, bounded `step`, max range, max points) protect `vmselect` from expensive queries without caching.
-
-### 7. Deployment
-
-A new package `packages/system/metrics-apiserver` (name TBD) ships:
-
-- the Deployment (2+ replicas, stateless) and Service,
-- the `APIService` for `v1alpha1.metrics.cozystack.io` with delegated authn/authz (`auth-delegator` ClusterRoleBinding, `auth-reader` RoleBinding), mirroring `cozystack-api`,
-- the single aggregated ClusterRole from section 3.
-
-It runs in the management cluster alongside `cozystack-api`.
+The real underlying work is proper per-tenant isolation of the metrics store. Cozystack does this today with separate per-tenant VMClusters plus NetworkPolicy rather than an account dimension, so the forced-filter plus store-resolution in this proposal is the per-tenant access layer. Hardening that model (and deciding whether a shared multi-tenant store with enforced per-tenant filtering is preferable) is a prerequisite tracked in Rollout.
 
 ## User-facing changes
 
-- **Dashboard:** a consumption graph section on the VM-instance detail page (CPU / RAM / network over a selectable range), and potentially a tenant-overview consumption panel. This requires adding a charting approach to `cozystack-ui`, which currently has none.
-- **API:** a new API group `metrics.cozystack.io` with one resource, `metricqueries`, usable via `kubectl create -f query.yaml -o yaml` as well as from the SPA.
-- **RBAC:** granted automatically at tenant `view` and above through existing groups; administrators see no new group to manage.
+- **Dashboard:** a consumption graph section on database and VM detail pages (CPU / RAM / network over a selectable range), rendered from the Prometheus JSON returned by the subresource. This needs a charting approach added to `cozystack-ui`, which has none today.
+- **API:** a new `metrics` subresource on `apps.cozystack.io` application kinds, usable as `kubectl get --raw .../namespaces/<ns>/<plural>/<name>/metrics/api/v1/query_range?query=...` and from the SPA over the existing path.
+- **RBAC:** granted automatically at tenant `view` and above through existing groups; no new group to manage.
 
 ## Upgrade and rollback compatibility
 
-- Purely additive. Existing clusters, manifests, and APIs are unaffected.
-- No CRD and no stored objects, so there is nothing to migrate and nothing to leave behind. Removing the `APIService` and the package cleanly removes the feature; in-flight queries simply start failing with the API group gone, and the dashboard degrades to "no graph" (the same state as today).
-- The phase-0 scrape change (collecting `kubevirt_vmi_*`) is an independent, reversible monitoring change.
+- Additive: a new subresource and one ClusterRole; existing clusters, manifests, and APIs are unaffected.
+- No CRD and no stored objects. Removing the subresource and the ClusterRole removes the feature; the dashboard degrades to "no graph" (today's state).
+- This introduces the first subresource in `cozystack-api`, so the apiserver wiring (storage map key, `Connecter` registration) is new ground and should be validated in `cozystack-api` tests.
 
 ## Security
 
-- **New trust boundary:** the server issues PromQL to `vmselect` on behalf of users. The whole point of layer 2 is that the server, not the user, decides the tenant filter. Client label selectors are never forwarded verbatim.
-- **Tenant-supplied input** is limited to a namespace (authorized by RBAC), a target kind/name, a metric from a fixed catalog, and a bounded range/step. There is no free-form PromQL, which removes both the cross-tenant read risk and the expensive-query risk inherent in a raw proxy.
-- **Input sanitization.** `target.name` is validated against the Kubernetes resource-name grammar before it is interpolated into any PromQL matcher (for example the `virt-launcher-<vm>-.*` pod selector), so a tenant cannot inject regex metacharacters to widen the selection. Cross-tenant reads stay impossible regardless, because the server's `namespace` matcher is ANDed into every query; sanitization closes the narrower within-tenant widening.
-- **Why not `services/proxy` to `vmselect`:** it authorizes coarsely and cannot inject a tenant filter, so against the shared `tenant-root` VMCluster it leaks every tenant's series. Rejected for that reason (see Alternatives).
-- **New RBAC surface:** one aggregated ClusterRole granting `create` on `metricqueries`. No new secrets are stored or transmitted; the server uses its own ServiceAccount to reach `vmselect` and delegated authn to identify callers.
+- **Trust boundary:** `cozystack-api` issues queries to `vmselect` on behalf of users. The forced `extra_filters` is server-decided; a client-supplied query is passed through only after the tenant filter is ANDed into every selector, so it cannot widen past the tenant.
+- **Why not `services/proxy` to `vmselect`:** coarse authz, no forced filter, leaks across tenants on the shared store.
+- **No stored credentials:** `cozystack-api` reaches `vmselect` with its own identity and authorizes callers by delegated kube authn, unlike a `vmauth` path which would require per-tenant tokens.
+- **Query cost:** since raw PromQL is accepted, the handler must bound it (max range, step, series, timeout) to protect `vmselect`; this replaces a fixed catalog as the abuse control.
+- **Input:** the object name flows into the forced filter and must be used as an exact label match, not interpolated into a regex.
 
 ## Failure and edge cases
 
-- Tenant has **no** monitoring stack anywhere in its ancestry: resolver finds no `vmselect`; return an empty `status.series` with a `warning`, not an error, so the dashboard shows "no data" rather than a failure.
-- `vmselect` unreachable or returns an error: surface it in `status` so the client can distinguish "no data" from "backend down".
-- Caller requests a tenant namespace they cannot access: layer 1 denies with 403 before any query runs.
-- Caller tries to widen the query with extra label selectors: ignored; only the server-built selector reaches `vmselect`.
-- Range or step out of bounds: rejected by validation with a clear message.
-- VM has restarted (new `virt-launcher` pod): the fallback cadvisor query uses a pod regex per VM, so the series spans restarts; the preferred KubeVirt per-VMI metric is restart-stable by construction.
+- Tenant has no monitoring stack in its ancestry: resolver finds no `vmselect`; return an empty Prometheus result with a warning, not an error.
+- `vmselect` unreachable: surface a backend error distinct from "no data".
+- Caller lacks `get <plural>/metrics` in the namespace: 403 before any query runs.
+- Client query tries to drop or widen the tenant filter: impossible, `extra_filters` is ANDed in server-side.
+- Application deleted mid-session: 404 from the subresource (acceptable for live graphs).
+- Range or step out of bounds: rejected by the cost limits.
 
 ## Testing
 
-- **Unit:** tenant-label injection builds the expected PromQL and cannot be overridden by client input; the resolver reads the inherited `namespace.cozystack.io/monitoring` label and selects the named vmselect, falling back to `tenant-root` when the label is empty; the metric catalog maps to the expected templates; range/step validation.
-- **Integration:** the `SubjectAccessReview` path allows `<tenant>-view` in the tenant namespace and denies a foreign tenant; `system:masters` / `cozystack-cluster-admin` bypass.
-- **e2e:** two tenants on a shared `tenant-root` store; tenant A's query returns only A's series and never B's; a parent reading a child succeeds, a sibling reading a sibling fails; a VM graph renders end to end in the dashboard.
+- **Unit:** the forced `extra_filters` is always present and cannot be overridden by the client query; the `vmselect` resolver picks the right store (including the empty-label fallback to `tenant-root`); cost limits.
+- **Integration:** the delegated authz allows `<tenant>-view` for `get <plural>/metrics` in the tenant namespace and denies a foreign tenant; the `Connecter` subresource is reachable through the aggregated server.
+- **e2e:** two tenants on a shared `tenant-root` store; tenant A's query returns only A's series; a VM/database graph renders end to end in the dashboard.
 
 ## Rollout
 
-- **Phase 0 (prerequisite): scrape per-VM metrics.** Confirm on a live cluster whether `kubevirt_vmi_*` (cpu/memory/network/storage) are actually collected, by querying `vmselect` for one of the metrics or checking for a KubeVirt scrape object (the virt-operator `ServiceMonitor` lands in its `monitorNamespace`, `tenant-root`, and is converted to a `VMServiceScrape`); if they are not collected, add the scrape so the data exists. Per-VM network is the blocking gap today. This phase has value on its own (Grafana can use the data immediately).
-- **Phase 1: API server + RBAC.** Ship `packages/system/metrics-apiserver`, the `APIService`, and the aggregated ClusterRole. The API is usable via `kubectl`.
-- **Phase 2: dashboard.** Add charts to the VM-instance page in `cozystack-ui`.
+- **Phase 0 (prerequisite): scrape per-VM metrics.** Confirm on a live cluster whether `kubevirt_vmi_*` (cpu/memory/network/storage) are collected, by querying `vmselect` for one of them or checking for the KubeVirt scrape object (the virt-operator `ServiceMonitor` lands in its `monitorNamespace`, `tenant-root`, converted to a `VMServiceScrape`); if not, add the scrape. Per-VM network is the blocking gap today. This phase is useful on its own.
+- **Phase 1: subresource plus RBAC in `cozystack-api`.** Register `"<plural>/metrics"` as a `Connecter`, force `extra_filters` and resolve the `vmselect`, add the one aggregated ClusterRole rule. Usable via `kubectl --raw`.
+- **Phase 2: dashboard graphs.** Add a Prometheus/Victoria client and charts to `cozystack-ui`.
+- **Foundational, parallel:** harden metrics-store multi-tenancy (the team-flagged underlying work).
 
 ## Open questions
 
-- Resource and package naming: `MetricQuery` vs a more specific name; package name under `packages/system`.
-- Should `target.kind: Namespace` (tenant-wide aggregate) be in the first cut, or only `VMInstance` / `Pod`?
-- Range-based storage selection: when a tenant has both shortterm and longterm VMClusters, how does the server pick (by requested range, or always longterm)?
-- Should allocation ("requested") be offered as an overlay next to usage in the same response, or kept entirely separate?
-- Exact KubeVirt metric names and their availability in the shipped KubeVirt version (to be pinned against the KubeVirt metrics reference in phase 0).
-- Confirm the guest-cluster (Kamaji) exclusion is acceptable, or scope a follow-up for guest-internal metrics.
-- Prerequisite to confirm: the Layer 1 group-based authz assumes the management apiserver has OIDC enabled with a flat `groups` claim and no `oidc-groups-prefix` (set out-of-band via talm, the same assumption the existing tenant RBAC already relies on). On a cluster that sets a group prefix, or one without OIDC (no groups claim), the Layer 1 SAR has no group to match; define the behavior there or state the prerequisite explicitly.
+- Handler mechanism: `rest.Connecter` (reverse-proxy, GET/POST, arbitrary body, closest to a passthrough) versus `GetterWithOptions` + `ResourceStreamer` (as the portal does); confirm the `Connecter` wiring works cleanly in `cozystack-api`'s assembler.
+- Tenant-wide aggregate ("all my databases"): a top-level resource with the portal's `list` field-selector trick, or a `metrics` subresource on `Tenant`?
+- Raw PromQL passthrough with cost limits, versus a small server-side allowlist of queries for tighter cost control.
+- Which store to query for a given range when a tenant has both shortterm and longterm VMClusters.
+- Prerequisite to confirm: the Layer 1 group-based authz assumes the management apiserver has OIDC enabled with a flat `groups` claim and no `oidc-groups-prefix` (set out-of-band via talm, the same assumption the existing tenant RBAC relies on); define the behavior on a cluster with a prefix or without OIDC.
+- Confirm the guest-cluster (Kamaji) exclusion is acceptable, or scope a follow-up.
 
 ## Alternatives considered
 
-- **SPA proxies to `vmselect` via `services/proxy`.** Simplest to build and returns native Prometheus JSON, but authorizes coarsely and cannot inject a tenant filter, so it leaks across tenants on the shared store. Rejected on isolation grounds; it is the central reason a server-side filtering API is needed.
-- **Embed Grafana (iframe) per tenant.** Reuses existing dashboards, but couples the console to Grafana auth/session, only works where a per-tenant Grafana exists, and gives no control over the embedded surface. Heavier and less integrated than a small API plus native charts.
-- **Extend the external `billing.aenix.io` server.** It is billing-oriented, returns scalar aggregates over a window (via `integrate(...)`), not time-series, and uses allocation, not usage. Wrong shape for graphs, and mixing read-only graph queries into a billing surface is the scope creep this proposal avoids.
-- **Client submits arbitrary PromQL.** Maximum flexibility, but reintroduces the expensive-query and injection risks and makes tenant isolation a PromQL-rewriting problem. Rejected in favor of a fixed catalog.
-- **VictoriaMetrics native multitenancy (`accountID`).** Could isolate tenants inside one store, but cozystack does not use it today (everything is accountID 0), and adopting it is a larger change to the whole monitoring stack. Out of scope; label injection achieves isolation without restructuring storage.
+- **Standalone aggregation API with a `MetricQuery` kind (this proposal's earlier revision).** A new `metrics.cozystack.io` API server, storage-less, returning structured series in a Kubernetes object. Rejected in the design discussion: it wraps every response in a kube `apiVersion`/`kind` envelope, forces a second kube-style API spec and a second dashboard client to maintain, and adds a new server and E2E surface, for no benefit over a reverse-proxy subresource that returns native Prometheus JSON.
+- **Portal-style separate logging-like group.** A dedicated `metrics.*` virtual resource in its own group, like the portal's `logs`. Rejected: being in a different group from the target resource means RBAC is not free (the portal needed a custom `SubjectAccessReview` and two-rule roles), which is exactly the cost the subresource avoids.
+- **vmauth or a thin self-written proxy to Victoria, bypassing the Kubernetes API.** The simplest infrastructure, and `vmauth` can force per-tenant isolation via `extra_filters`. Rejected as the primary because its authorization is `vmauth`-native (its own tokens or a JWT with a tenant claim), not Kubernetes RBAC, so it needs per-tenant credentials or an OIDC-JWT-to-tenant mapping and a second auth path in the dashboard. Kept as a fallback if the subresource wiring proves too awkward; cozystack already runs `vmauth` for traces. Decision criterion from the discussion: take the subresource route only if it buys Kubernetes RBAC cheaply (it does) and `vmauth` cannot isolate per tenant without bespoke credentials (it cannot, cleanly).
+- **A deep-link button to Grafana** (open the right dashboard with the right metrics preselected). Low effort and good for clients who already run Grafana, but rejected as the primary because the target audience is exactly the clients who do not run their own Grafana or monitoring stack. Worth shipping as a complementary convenience.
+- **Fixed metric catalog / no free-form PromQL** (the earlier revision's stance). Unnecessary once the handler forces `extra_filters` on every selector, which makes raw passthrough isolation-safe; query-cost limits handle abuse instead of a catalog.
 
 ---
 
