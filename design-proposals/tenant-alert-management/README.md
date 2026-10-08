@@ -9,7 +9,7 @@
 
 Cozystack ships a working alerting stack (VMRule, vmalert, VMAlertmanager, Alerta), but a tenant cannot manage any of it: it cannot add, disable, or edit an alert rule, and it cannot say where its alerts should go. Rules require permissions on the VictoriaMetrics operator that tenants do not have, receivers are a hardcoded Alertmanager Secret plus per-instance Alerta channels, and a tenant without its own monitoring stack has no entry point at all. This is the read-write companion to the read-only metrics and logs proposals: unlike those, it is not a query passthrough, it is a management API that parses, validates, and translates tenant intent into backend objects.
 
-This proposal introduces two tenant-facing namespaced CRDs in a new group `alerts.cozystack.io` (`AlertRule` and `AlertReceiver`) and a controller that validates them and renders the privileged backend objects (`VMRule` and `VMAlertmanagerConfig`) into the correct monitoring stack, root or per-tenant, with the tenant's namespace scope forced in so rules and routing stay isolated. The pattern is the one Cozystack already uses for `SecurityGroup`: a tenant writes a simple namespaced CR, a controller holding the privileged RBAC turns it into the platform object the tenant may not touch directly.
+This proposal introduces two tenant-facing namespaced CRDs in a new group `alerts.cozystack.io` (`AlertRule` and `AlertReceiver`) and a controller that validates them and renders the privileged backend objects (`VMRule` and `VMAlertmanagerConfig`) into the correct monitoring stack, root or per-tenant, with the tenant's namespace scope forced in so rules and routing stay isolated. The pattern is the one Cozystack already uses for tenant-facing resources reconciled into privileged objects (`backups.cozystack.io`, and `TenantGateway` for the render mechanism): a tenant writes a simple namespaced resource, and a controller holding the privileged RBAC renders the platform object the tenant may not touch directly.
 
 ## Scope and related proposals
 
@@ -20,8 +20,8 @@ This proposal introduces two tenant-facing namespaced CRDs in a new group `alert
 
 ## Prior art
 
-- **`SecurityGroup` (the exact pattern).** `sdn.cozystack.io` `SecurityGroup` is a tenant-facing, namespace-scoped CR (granted to tenants in `cozy:tenant:base`) that a controller reconciles into a `CiliumNetworkPolicy`, an object the tenant cannot create directly. This proposal copies that shape for alerts: a tenant-writable CR, a controller with the privileged RBAC, a rendered platform object.
-- **`backups.cozystack.io` (the RBAC pattern).** The backup controller ships `cozy:backups:view` and `cozy:backups:admin` ClusterRoles labeled `rbac.cozystack.io/aggregate-to-tenant-{view,admin}`, delivering tenant CRUD without touching the tenant chart. The alerts roles follow this.
+- **`TenantGateway` (the render-privileged-objects pattern).** A namespaced resource that a `cozystack-controller` reconciler renders into privileged platform objects (`Gateway`/`HTTPRoute`/`Certificate`) the requester cannot create directly, validated by CEL `XValidation` on the type. It is the precedent for the controller-renders-a-privileged-object mechanism and the CEL validation this proposal uses. (It is operator-facing, not tenant-granted; `backups.cozystack.io` below is the tenant-facing half.)
+- **`backups.cozystack.io` (the tenant-facing CRD and RBAC pattern).** A tenant-facing namespaced CRD reconciled by its own controller, whose backup controller ships `cozy:backups:view` and `cozy:backups:admin` ClusterRoles labeled `rbac.cozystack.io/aggregate-to-tenant-{view,admin}`, delivering tenant CRUD without touching the tenant chart. The alerts resources and roles follow this.
 - **`tenantlogrouting` (the stack-resolution pattern).** A cozystack-controller reconciler already resolves the `namespace.cozystack.io/monitoring` label to a monitoring stack. The alerts controller resolves the same way.
 - **VictoriaMetrics operator (the backend).** `VMRule` carries alerting/recording rules; `VMAlertmanagerConfig`, when a `VMAlertmanager` selects it, is merged into the Alertmanager config with an operator-added namespace matcher, `continue: true` enforcement, and receiver name-prefixing, giving per-namespace routing. These are the privileged objects the controller renders.
 
@@ -68,7 +68,7 @@ The alerting stack today:
 
 ### 1. Shape: two tenant-facing CRDs plus a controller
 
-A new group `alerts.cozystack.io/v1alpha1` with two namespaced, tenant-facing resources, reconciled by a new controller in `cozystack-controller` (the `SecurityGroup` pattern). The CR is the API; validation and translation (the "parsing") happen in CEL on the type plus the controller, not in the client.
+A new group `alerts.cozystack.io/v1alpha1` with two namespaced, tenant-facing resources, reconciled by a new controller in `cozystack-controller` (the `TenantGateway` / `backups` controller pattern). The CR is the API; validation and translation (the "parsing") happen in CEL on the type plus the controller, not in the client.
 
 ```mermaid
 flowchart LR
@@ -95,7 +95,7 @@ The controller renders an `AlertReceiver` into a `VMAlertmanagerConfig` with a r
 
 ### 4. Stack resolution: root or per-tenant
 
-The controller reads `namespace.cozystack.io/monitoring` on the `AlertRule`/`AlertReceiver` namespace. A non-empty value means the tenant has its own stack, so the `VMRule`/`VMAlertmanagerConfig` are rendered into that stack where the tenant's `VMAlert`/`VMAlertmanager` live. An empty value means the tenant uses the root stack, so they are rendered into `tenant-root` (or `cozy-monitoring`), where the root `VMAlert`/`VMAlertmanager` pick them up, scoped by the forced `namespace` label. This is the same resolution metrics and logs use.
+The controller reads `namespace.cozystack.io/monitoring` on the `AlertRule`/`AlertReceiver` namespace, which names the tenant whose monitoring stack the namespace reports to. When it names the tenant's own stack, the `VMRule`/`VMAlertmanagerConfig` are rendered there, where the tenant's `VMAlert`/`VMAlertmanager` live. When it is empty or the platform target, the tenant uses the root stack, so they are rendered into the root (`tenant-root`/`cozy-monitoring`), where the root `VMAlert`/`VMAlertmanager` pick them up, scoped by the forced `namespace` label. This is the same resolution metrics and logs use.
 
 ### 5. Isolation (closing existing gaps)
 
@@ -162,16 +162,18 @@ Tenant-facing namespaced CRDs get aggregated ClusterRoles `cozy:alerts:view` (la
 
 ## Open questions
 
-- Delivery path for per-tenant Telegram/Slack: Alertmanager-native receivers (`VMAlertmanagerConfig`, proposed here) versus extending Alerta; the former gives per-tenant routing, the latter reuses the existing plugin UX but is one channel per instance.
-- Whether recording rules (not just alerting rules) are in `AlertRule` scope.
-- How receiver-secret references are scoped and validated (and whether the platform-owned SMTP password Secret model generalizes per tenant).
-- Silences/acknowledgements: in a follow-up, or part of this?
-- The exact `ruleNamespaceSelector` shape for the root `VMAlert` so it covers `cozy-monitoring` plus every tenant that uses the root stack without its own.
-- The OIDC prerequisite and the guest-cluster exclusion, as in the metrics and logs proposals.
+The points previously open are resolved below, as decisions, or as recommendations where the implementation will confirm the detail.
+
+- **Delivery path for per-tenant Telegram/Slack: decided Alertmanager-native receivers.** `VMAlertmanagerConfig` is the only mechanism that routes per tenant, because Alerta carries one channel per instance; the platform Alerta stays for the aggregated operator view, and per-tenant delivery moves to Alertmanager-native receivers.
+- **Recording rules: decided out of scope.** `AlertRule` covers alerting rules only in the first cut; recording rules are a platform concern, and a follow-up can add them if tenants need their own.
+- **Receiver secrets: decided a tenant-namespace Secret reference.** `AlertReceiver` names a `Secret` in the tenant namespace for tokens/passwords/URLs; the controller validates its presence and reads it with its own ServiceAccount, generalizing the platform's SMTP-password Secret model per tenant, and never inlines the value into the rendered object.
+- **Silences/acknowledgements: decided out of the first cut.** They are a separate Alertmanager surface (the silence API, not a rule or a receiver) and are a follow-up.
+- **Root `VMAlert` selector: recommended `cozy-monitoring` plus the root-reporting tenant namespaces.** The root `VMAlert` sets `ruleNamespaceSelector` to `cozy-monitoring` (platform rules) plus the namespaces whose monitoring label points at the root store (tenants without their own stack); a tenant `VMAlert` sets it to its own namespace plus `cozy-monitoring`. The exact selector form is confirmed in implementation.
+- **OIDC and guest clusters: as in the metrics and logs proposals.** OIDC enabled with a flat `groups` claim and no prefix is a stated prerequisite; guest-cluster (Kamaji) alerting is out of scope, a dedicated follow-up.
 
 ## Alternatives considered
 
-- **An aggregation API server (like `cozystack-api`) with alert resources.** More code and a second server; the CRD-plus-controller path is the established Cozystack pattern for a tenant-writable resource that renders a privileged object (`SecurityGroup`), and CEL plus the controller already give the validation and parsing, so a bespoke apiserver is not justified.
+- **A synchronous aggregated-API resource in `cozystack-api`** (the `SecurityGroup` pattern: `sdn.cozystack.io/securitygroups` is served by the existing `cozystack-api`, which translates it into a `CiliumNetworkPolicy` synchronously on write and back on read, with no second server added). This is a genuine Cozystack pattern and would give synchronous validation at write time. Rejected in favor of a CRD plus a reconciling controller because alert objects need ongoing reconciliation, not only a write-time projection: the target stack must be re-resolved when a tenant enables its own monitoring, rendered objects must be repaired on drift, and status must be reported back on the tenant's resource. `backups.cozystack.io` and `TenantGateway` are the precedents for that CRD-plus-controller shape.
 - **Grant tenants direct RBAC on `VMRule`/`VMAlertmanagerConfig`.** Rejected: `VMAlert` evaluates rules cluster-wide, so a tenant `VMRule` would fire in every tenant; it exposes operator internals and a malicious receiver could exfiltrate; and there is no validation or namespace scoping. The controller indirection is what makes it safe.
 - **Keep Alerta as the only delivery and manage through Monitoring app values.** Rejected: values give no per-rule management and no per-tenant routing (Alerta is one channel per instance), and a tenant without its own stack has no values to set.
 - **A read-write passthrough like the metrics/logs proposals.** Not applicable: alert management is stateful CRUD with validation and cross-object translation, not a query, so it is modeled as reconciled resources rather than a streaming subresource.
