@@ -158,12 +158,14 @@ Cozystack's Fluent Bit keeps only namespace/pod/container, not application ident
 
 ## Open questions
 
-- Resolving the target to a log selector: resolve the application's current and past pods (how, for deleted ones?) and filter by `kubernetes_pod_name`, versus enriching collection with `resource_*` stream fields.
-- Parameter codec: cozystack-api uses `metav1.ParameterCodec`, while decoding `LogOptions` from the query (the portal uses a scheme-aware parameter codec) needs a codec that knows the `LogOptions` type; confirm the wiring.
-- Whether `list` across a namespace is needed in the first cut, given the `fieldSelector` quirk, or whether per-object Get plus a per-namespace Get is enough.
-- Should gate 2 target `<app>/logs` in `apps.cozystack.io` (free via the existing wildcard, coupling logs to app-read) or `pods/log` in core (not currently granted to tenants, would need an explicit rule)?
-- The OIDC prerequisite (enabled, no group prefix), as in the metrics proposal.
-- Guest-cluster (Kamaji) exclusion, as in the metrics proposal.
+The points previously open are resolved below, as decisions, or as recommendations where the implementation will confirm the detail.
+
+- **Target-to-selector: decided namespace plus pod-name now, resource labels later.** The first cut filters by `kubernetes_namespace_name` and, for a named resource, by the resource's pod names (`kubernetes_pod_name`), which works without a collection change and still spans a restarted pod. Enriching collection with `resource_group`/`resource_kind`/`resource_name` stream fields (Phase 2) is the robust long-term answer and is what makes post-mortem of a deleted resource and non-pod resources clean.
+- **Parameter codec: decided a scheme-aware codec for the new group.** Register a parameter codec that knows `LogOptions` for `logs.cozystack.io` only (as the portal does); `cozystack-api` keeps `metav1.ParameterCodec` for its other groups, so nothing else changes.
+- **`list` scope: decided Get only in the first cut.** Support Get for one object's logs and Get at namespace scope; the rich `list` with the `fieldSelector` trick is deferred until a use case needs it, avoiding that complexity initially.
+- **Gate 2 target: decided `<app>/logs` in `apps.cozystack.io`.** This is free via the existing wildcard and gives the intended "can read the resource implies can read its logs" semantics; `pods/log` in core is not granted to tenants, would need an explicit rule, and exposes pod-level rather than resource-level access.
+- **OIDC: a stated prerequisite**, as in the metrics proposal (a flat `groups` claim, no prefix); where it does not hold, tenant RBAC itself does not work, so there is no extra behavior to define.
+- **Guest clusters (Kamaji): decided out of scope**, a per-user email RBAC model, with a dedicated follow-up if needed.
 
 ## Alternatives considered
 
