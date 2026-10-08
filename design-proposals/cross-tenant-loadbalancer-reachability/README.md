@@ -15,10 +15,11 @@ tenant's pod and the connection is dropped.
 
 The proposal splits the fix by the kind of Service:
 
-- **Part A, Services with a selector** (ingress controllers, databases with
-  `external: true`): widen the tenant egress policy with a `toServices` rule on
-  platform-labelled Services. No new datapath; works on every variant,
-  isp-slim included.
+- **Part A, Services with a selector** (ingress controllers, and the
+  applications published with `external`): widen the tenant egress policy with
+  `toServices` rules on platform-labelled Services. No new datapath; works on
+  every variant, isp-slim included. Every such application has a route for the
+  label except RabbitMQ, which stays as today until one is verified.
 - **Part B, Services of tenant Kubernetes clusters** (kubevirt CCM,
   selectorless): no policy rule can admit them without opening the NodePort
   range of every tenant cluster to every tenant. For these only, an opt-in L4
@@ -121,11 +122,16 @@ What is broken on `main`, for a client pod in tenant A:
 
 1. The ingress controller of a tenant B that is not an ancestor of A
    (including the host ingress, from depth 2, see above).
-2. A database of tenant B with `external: true`.
+2. An application of tenant B that publishes a `LoadBalancer` Service: postgres,
+   mariadb, mongodb, redis, valkey, kafka, nats, rabbitmq, opensearch, qdrant,
+   openbao and tcp-balancer when `external` is set, and vpn when `externalIPs`
+   is empty. Some of these Services come from an operator or a nested chart
+   rather than from the application's own templates (Part A).
 3. Any `LoadBalancer` Service of a Kubernetes cluster of tenant B: the addon
    in `LoadBalancer` mode, and every Service the tenant creates itself.
 
-Cases 1 and 2 have a selector; case 3 does not. In each case, a tenant that
+Cases 1 and 2 have a selector; case 3 does not. VMs are not in the list: they
+are fixed (above). In each case, a tenant that
 exposes a service publicly expects it to be reachable from another tenant's
 project, as it is from the Internet and as it already is for a VM.
 
@@ -133,6 +139,10 @@ project, as it is from the Internet and as it already is for a VM.
 
 - A pod of any tenant reaches the public IP of an opted-in `LoadBalancer`
   Service on its declared ports.
+- Part A opts in every Service of cases 1 and 2 for which a label route exists
+  (all of them but RabbitMQ's, see Part A); Part B opts in the CCM Services of
+  case 3 with `externalTrafficPolicy: Local`. What remains broken is listed,
+  not implied.
 - No tenant gains access to another tenant's ClusterIPs, to pods that are not
   backends of an opted-in Service, or to undeclared ports of a tenant cluster.
 - Opt-in is set by the platform only, per Service, with a per-Service rollback.
@@ -150,8 +160,8 @@ project, as it is from the Internet and as it already is for a VM.
 
 ### Part A: a policy rule for Services with a selector
 
-The tenant egress CCNP gains one rule per Service type, on a label the
-platform's charts set on the Service:
+The tenant egress CCNP gains one rule per kind of application, on a label the
+platform sets on the published Service:
 
 ```yaml
   - toServices:
@@ -172,20 +182,55 @@ selector **scoped to that Service's namespace**
 grant is therefore exactly "the backends of these Services, on these ports",
 which is what the post-translation verdict needs.
 
-| Type | Chart | Label value | Ports |
+The ports of a rule are the **backend** ports, not the Service's: Cilium
+evaluates the translated destination, so tcp-balancer, which publishes 80 and
+443 on container ports 8080 and 8443, needs the latter. The tenant chart renders
+the rules from one map of kind to ports, so adding a kind is one entry there and
+one label in its chart.
+
+Where the label is set, per kind. Paths are under `packages/apps/`; "chart"
+means the application's own template, the other rows go through an operator's
+CR or a nested chart's values. Inventory read on `main` at `f203a47af`; the
+external Services match the table of cozystack/community#87, §4.
+
+| Kind | Published Service(s) | Where the label is set | Backend ports |
 |---|---|---|---|
-| Postgres | `packages/apps/postgres/templates/external-svc.yaml` | `postgres` | 5432 |
-| MariaDB | `packages/apps/mariadb/templates/mariadb.yaml`, through the operator's service template | `mariadb` | 3306 |
-| Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml`, `controller.service.labels` | `ingress` | 80, 443 |
+| postgres | `<r>-external-write` | chart, `postgres/templates/external-svc.yaml` | 5432 |
+| mariadb, `replicas == 1` | `<r>` | `MariaDB` CR, `spec.service.metadata.labels` (`mariadb/templates/mariadb.yaml`) | 3306 |
+| mariadb, `replicas > 1` | `<r>-primary` | `MariaDB` CR, `spec.primaryService.metadata.labels` | 3306 |
+| mongodb, sharded | `<r>-external` (mongos) | chart, `mongodb/templates/external-svc.yaml` | 27017 |
+| mongodb, replicaset | one per pod | `PerconaServerMongoDB` CR, `replsets[].expose.labels`, the Service labels since `serviceLabels` was deprecated (`mongodb/templates/mongodb.yaml`) | 27017 |
+| redis | `<r>-external-lb` | chart, `redis/templates/service.yaml` | 6379 (target port `redis`) |
+| valkey | `<r>-external-lb` | chart, `valkey/templates/service.yaml` | 6379 (target port `redis`) |
+| kafka | external bootstrap, and one per broker | Strimzi `Kafka` CR, `spec.kafka.template.externalBootstrapService.metadata.labels` and `spec.kafka.template.perPodService.metadata.labels` (`kafka/templates/kafka.yaml`) | 9094 |
+| nats | `<r>` | nested chart values, `service.merge.metadata.labels` (`nats/templates/nats.yaml`) | 4222, the only client port the app enables |
+| opensearch | `<r>-external`, and `<r>-dashboards-external` with `dashboards.enabled` | chart, `opensearch/templates/external-svc.yaml`, both Services | 9200; 5601 |
+| qdrant | `<r>` | nested chart values, `service.additionalLabels` (`qdrant/templates/qdrant.yaml`) | 6333, 6334, 6335 |
+| openbao | `<r>`, and `<r>-ui` with `ui` (default on) | nested chart values, `server.service.extraLabels` and `ui.extraLabels` (`openbao/templates/openbao.yaml`) | 8200, 8201; 8200 |
+| tcp-balancer | `<r>-haproxy` | chart, `tcp-balancer/templates/service.yaml` | 8080, 8443, 6443, 50000 |
+| vpn | `<r>-vpn`, when `externalIPs` is empty | chart, `vpn/templates/service.yaml`, `LoadBalancer` branch only | 40000 TCP and UDP |
+| ingress | the controller's Service | `packages/extra/ingress/templates/nginx-ingress.yaml`, `controller.service.labels` | 80, 443 |
+| **rabbitmq** | `<r>` | **none verified**, see below | — |
+
+**rabbitmq stays broken for now.** `RabbitmqCluster.spec.service` takes
+annotations only; a label needs `spec.override.service.metadata.labels`, and
+`rabbitmq/templates/rabbitmq.yaml` deliberately renders no `override.service`:
+the override is a strategic merge against ports the operator regenerates, and
+re-adding a port on a LoadBalancer drives a NodePort reallocation loop. A
+metadata-only override adds no port, so it may avoid both, but that has to be
+shown on a lab against the shipped operator before the chart uses it. Until
+then a rabbitmq published with `external` is reachable from the Internet and
+not from other tenants, as today.
 
 For the ingress controllers, an equivalent and smaller change is to extend the
 existing ancestor rule to `cozystack.io/service: ingress` pods in every
 namespace, on 80 and 443. It relies on the same pod label as that rule.
 
-The label is only set when the Service is public **and** carries no source
-restriction: if cozystack/community#87 lands, a chart with `sourceRanges` set
-leaves the label off, so the rule never opens a Service its owner restricted.
-Tenants do not set labels on these Services; the charts render them.
+The label is only set when the Service is published **and** carries no source
+restriction: wherever cozystack/community#87 routes `sourceRanges`, the label is
+left off when it is set, so the rule never opens a Service its owner
+restricted. Tenants do not set labels on these Services; the platform's charts
+and CRs render them.
 
 What the backend sees: the client pod's IP and identity, not `world`. Tenant
 ingress policies admit `cluster` already, so nothing else changes on that side.
@@ -345,9 +390,14 @@ Part B:
 
 ## Testing
 
-- Part A: chart unit tests for the label and its `sourceRanges` condition; an
+- Part A: chart unit tests, per row of the table, that the label is rendered
+  when the Service is published and absent when `sourceRanges` is set; a unit
+  test of the tenant chart that renders one rule per kind with its ports; an
   e2e connection from one tenant to another tenant's external Postgres and
   ingress, and a refused connection to a non-labelled pod of the same tenant.
+- rabbitmq, before its row is filled: a metadata-only `override.service` on a
+  published `RabbitmqCluster`, checked for NodePort churn over several operator
+  reconciles.
 - Part B, in cozystack/cozy-proxy#25: unit tests for selection, desired state
   and purge decisions; kernel tests in network namespaces (golden `nft list`,
   real TCP through three namespaces: translation, round-robin, source kept or
@@ -361,7 +411,8 @@ Part B:
 
 ## Rollout
 
-1. Part A: the egress rule and the chart labels, databases then ingress.
+1. Part A: the egress rules, then the labels kind by kind; rabbitmq once its
+   route is verified.
 2. Part B: cozy-proxy release with the mode off by default; then the CCM patch
    and, if one is added, the admission guard; then CCM Services with eTP
    `Local`, per Service.
