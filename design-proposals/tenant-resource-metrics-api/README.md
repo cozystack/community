@@ -169,14 +169,16 @@ The real underlying work is proper per-tenant isolation of the metrics store. Co
 
 ## Open questions
 
-- Handler mechanism: `rest.Connecter` (reverse-proxy, GET/POST, arbitrary body, closest to a passthrough) versus `GetterWithOptions` + `ResourceStreamer` (as the portal does); confirm the `Connecter` wiring works cleanly in `cozystack-api`'s assembler.
-- Tenant-wide aggregate ("all my databases"): a top-level resource with the portal's `list` field-selector trick, or a `metrics` subresource on `Tenant`?
-- Raw PromQL passthrough with cost limits, versus a small server-side allowlist of queries for tighter cost control.
-- Which store to query for a given range when a tenant has both shortterm and longterm VMClusters.
-- Prerequisite to confirm: the Layer 1 group-based authz assumes the management apiserver has OIDC enabled with a flat `groups` claim and no `oidc-groups-prefix` (set out-of-band via talm, the same assumption the existing tenant RBAC relies on); define the behavior on a cluster with a prefix or without OIDC.
-- Request method: the normative path is GET (RBAC verb `get`); a POST query, common for large PromQL, maps to verb `create` on `<plural>/metrics` and would need a separate grant and authz, so the first cut restricts the proxy to GET.
-- Whether metrics-read should be gateable separately from app-read: today it inherits the existing `apps.cozystack.io` wildcard `get` grant, so it cannot be gated independently without narrowing that wildcard.
-- Confirm the guest-cluster (Kamaji) exclusion is acceptable, or scope a follow-up.
+The points previously open are resolved below, as decisions, or as recommendations where the implementation will confirm the detail.
+
+- **Handler mechanism: decided `rest.Connecter`.** The goal is a native Prometheus passthrough (GET, forward the `api/v1/query_range` tail, return the backend body unchanged), which is exactly what `Connecter` (the `pods/proxy` pattern) does. `GetterWithOptions` + `ResourceStreamer` is for a single self-produced stream, the right tool for logs, not for proxying a request and its response.
+- **Tenant-wide aggregate ("all my databases"): deferred, as a `Tenant` subresource.** The first cut is per-object only. A tenant-wide view is a follow-up implemented as a `metrics` subresource on the `Tenant` (also `apps.cozystack.io`), which keeps the free RBAC and avoids the `list` field-selector quirk; a top-level resource is rejected for losing both.
+- **Raw PromQL versus an allowlist: decided raw passthrough.** The forced `extra_filters` makes raw PromQL isolation-safe, and the query-cost limits plus the endpoint allowlist handle abuse; a query allowlist would cripple the dashboard for no isolation gain.
+- **Store selection by range: decided by retention fit.** Route to the shortterm store when the whole requested range fits its retention (fresher, higher resolution), otherwise to longterm; default to shortterm for live graphs, since dashboards mostly show recent windows.
+- **Request method: decided GET only.** GET maps to the verb `get` that the existing grant already covers. A POST path (verb `create`, for very large PromQL that overflows a URL) is deferred and would get its own explicit grant if the URL limit ever bites.
+- **Separate gating of metrics-read: decided no, coupled to app-read.** "Can read the resource" implies "can read its consumption", the sensible default, and it needs zero new RBAC; gating separately would require narrowing the existing `apps.cozystack.io` wildcard, a larger change left out of scope.
+- **OIDC: a stated prerequisite, not an open point.** The feature requires the management apiserver OIDC configured with a flat `groups` claim and no `oidc-groups-prefix`, the same assumption the existing tenant RBAC already depends on; where that does not hold, tenant RBAC itself does not work, so there is no additional behavior to define.
+- **Guest clusters (Kamaji): decided out of scope.** Guest-internal resources use a per-user email RBAC model, a different authz path; a dedicated follow-up can address them.
 
 ## Alternatives considered
 
