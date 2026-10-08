@@ -3,7 +3,7 @@
 - **Title:** `Tenant application logs via a virtual logs resource`
 - **Author(s):** `@IvanHunters`
 - **Date:** `2026-10-08`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
