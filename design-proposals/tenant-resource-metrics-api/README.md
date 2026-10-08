@@ -3,7 +3,7 @@
 - **Title:** `Tenant resource-consumption metrics via an application subresource`
 - **Author(s):** `@IvanHunters`
 - **Date:** `2026-10-08`
-- **Status:** Draft
+- **Status:** Review
 
 ## Overview
 
@@ -11,11 +11,11 @@ Clients running managed databases and VMs on Cozystack want to see their own rea
 
 This proposal exposes consumption metrics as a **subresource of the existing `apps.cozystack.io` application resource**, served by the existing `cozystack-api` aggregated API server. The dashboard calls `.../namespaces/<ns>/<plural>/<name>/metrics/api/v1/query_range?query=...`; `cozystack-api` authorizes the call with ordinary Kubernetes RBAC, forwards the Prometheus-compatible query to the tenant's `vmselect` with a server-forced tenant filter, and returns the Prometheus-compatible JSON unmodified for the dashboard to chart. There is **no new API server, no new resource kind, and no Kubernetes envelope (`apiVersion`/`kind`) in the payload**.
 
-This is a revision. An earlier draft of this proposal designed a standalone `metrics.cozystack.io` aggregation API server with a `MetricQuery` kind. After a design discussion that shape was dropped in favor of the subresource described here; the Alternatives section records why.
+This proposal was redrafted during review. An earlier draft in this same PR designed a standalone `metrics.cozystack.io` aggregation API server with a `MetricQuery` kind; after a design discussion that shape was dropped in favor of the subresource described here, and the Alternatives section records why.
 
 ## Scope and related proposals
 
-- **Supersedes the earlier revision of this proposal** (standalone `metrics.cozystack.io` server with a `MetricQuery` kind). See Alternatives.
+- **Replaces an earlier draft in this PR** (standalone `metrics.cozystack.io` server with a `MetricQuery` kind). See Alternatives.
 - **Modeled on the Cozystack portal logs API** (external: `aenix-org/cozyportal`, group `logging.portal.cozystack.io`, resource `logs`): a virtual, non-etcd resource that proxies a time-series backend behind Kubernetes authorization. This proposal adapts that pattern and improves on it (RBAC comes for free here, which it did not in the portal; see Design).
 - **Complements, does not replace, Grafana.** Grafana stays the place for deep exploration; this serves embedded, basic per-resource graphs for tenants who do not run their own Grafana.
 - **Billing is out of scope.** The external `billing.aenix.io` server is referenced only as a pattern; this proposal does not depend on it and does not produce invoices.
@@ -94,9 +94,9 @@ Compared with the dropped standalone-aggregation-API revision and with the porta
 | payload | native Prometheus JSON, no kube envelope | kube object with `apiVersion`/`kind` | native, but behind a custom SAR |
 | dashboard client | standard Prometheus/Victoria client | a second, kube-style client to build and maintain | standard |
 | new components | none (handler in existing `cozystack-api`) | a new aggregated API server | a new aggregated API server |
-| per-kind cost | none: `application` is one dynamic kind, so `metrics` is defined once | one resource for all | one resource, but per-target SAR wiring |
+| per-kind cost | none: one shared handler, registered per plural in the existing loop, no per-kind code or recompile | one resource for all | one resource, but per-target SAR wiring |
 
-The decisive points: RBAC is genuinely free because the subresource shares the `apps.cozystack.io` group with its target, so it inherits the existing wildcard `get apps.cozystack.io/*` grant (the portal could not get this); the response is the backend's own Prometheus JSON, so the dashboard reuses a standard client instead of a second kube-style API; and because `cozystack-api` serves `application` as a single dynamic kind driven by `ApplicationDefinition`, the subresource is defined once rather than per application type, avoiding the per-kind recompile that the portal and similar systems hit.
+The decisive points: RBAC is genuinely free because the subresource shares the `apps.cozystack.io` group with its target, so it inherits the existing wildcard `get apps.cozystack.io/*` grant (the portal could not get this); the response is the backend's own Prometheus JSON, so the dashboard reuses a standard client instead of a second kube-style API; and because `cozystack-api` builds its application storages in one loop over `ApplicationDefinition`, the `metrics` subresource is one shared handler registered per plural in that loop rather than hand-written per application type, avoiding the per-kind recompile that the portal and similar systems hit.
 
 ### 3. Authorization: two layers, the first free
 
