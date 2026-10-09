@@ -98,8 +98,8 @@ Any tenant member at `view` or above can list the accounts.
 
 ```
 $ kubectl get credentials -n tenant-acme
-NAME                  APPLICATION       USER   ORIGIN      ENGINE
-postgres-orders.web   Postgres/orders   web    NotIssued   Applied
+NAME                  APPLICATION       USER   ORIGIN
+postgres-orders.web   Postgres/orders   web    NotIssued
 ```
 
 ## 6. The administrator mints a password
@@ -111,7 +111,7 @@ POST /apis/core.cozystack.io/v1alpha1/namespaces/tenant-acme/credentials/postgre
 {"apiVersion": "core.cozystack.io/v1alpha1", "kind": "CredentialRequest", "spec": {"preconditions": {"resourceVersion": "48190"}}}
 
 201 Created
-{"apiVersion": "core.cozystack.io/v1alpha1", "kind": "CredentialRequest", "status": {"username": "web", "password": "<32 characters, shown once>", "issuedAt": "2026-10-02T09:14:07Z", "engine": {"state": "Pending"}}}
+{"apiVersion": "core.cozystack.io/v1alpha1", "kind": "CredentialRequest", "status": {"username": "web", "password": "<32 characters, shown once>", "issuedAt": "2026-10-02T09:14:07Z"}}
 ```
 
 Inside the mint the API generated the 32 characters, computed their verifier, wrote it into `postgres-orders.web.account` in one update conditioned on `resourceVersion: "48190"`, and put the plaintext into the response. The Secret now reads:
@@ -130,9 +130,9 @@ data:
 
 The plaintext is in no object. If the response is lost, nobody holds this password, and the next call replaces it.
 
-## 7. CNPG applies the new verifier, and the record says so
+## 7. CNPG applies the new verifier
 
-The reload label makes CNPG notice the change. The instance manager runs `ALTER ROLE web PASSWORD 'SCRAM-SHA-256$...'`, and PostgreSQL stores the verifier as it is. CNPG reports `resourceVersion: "48240"` for `web`, which matches the Secret, so the API reports the change as applied:
+The reload label makes CNPG notice the change. The instance manager runs `ALTER ROLE web PASSWORD 'SCRAM-SHA-256$...'`, and PostgreSQL stores the verifier as it is. CNPG reports `resourceVersion: "48240"` for `web`, and the new password works from then on. The `Credential` shows the record only, and says nothing about the engine:
 
 ```yaml
 apiVersion: core.cozystack.io/v1alpha1
@@ -149,7 +149,6 @@ status:
   history:
   - {operation: Mint, at: "2026-10-02T09:14:07Z", by: jane@example.org}
   - {operation: Create, at: "2026-10-02T09:10:02Z", by: jane@example.org}
-  engine: {state: Applied, observedAt: "2026-10-02T09:14:09Z"}
 ```
 
 ## 8. What the audit log and the events show
@@ -224,7 +223,7 @@ stringData:
   web: "<16 characters>"
 ```
 
-The release that converts PostgreSQL runs a hook before any chart changes. It writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, and touches nothing else. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. Once the release is Ready on the new chart, the Job removes a `users.web.password` if one was left in the HelmRelease values and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
+The release that converts PostgreSQL runs a hook before any chart changes. It records the chart version of the release and writes `postgres-orders.web.account` with the verifier of that same password, origin `Migrated`, and touches nothing else. Then the new chart renders the `managed.roles` of step 3. CNPG takes over `web` and applies the verifier of the same password, so every client keeps working. Once the release is Ready on a chart version other than the recorded one, the Job removes a `users.web.password` if one was left in the HelmRelease values and deletes `postgres-orders-credentials`, since PostgreSQL keeps no platform account there. The record shows `Migrated` until someone mints or revokes, and older Helm revisions keep the old plaintext until `MaxHistory` drops them.
 
 ## When the migration leaves a release out
 
@@ -237,7 +236,7 @@ A release the migration cannot convert is reported in the migration log and with
 | ClickHouse account Secrets that do not exist | The HelmRelease names them in `valuesFrom`, Flux stops the release with `ValuesError`, and it keeps its previous revision. |
 | A PostgreSQL release whose Secret was gone | The converted chart renders. CNPG leaves a role without an account Secret untouched, so the old passwords keep working, and tenants can no longer read them. A tenant mints a new one. |
 
-Once an operator fixes the cause, the next write through the API starts the conversion: while `<release>-credentials` still holds the plaintext the API derives the account Secret from it, and otherwise it seeds one and a mint follows.
+Once an operator fixes the cause, running the Job again writes the account Secrets that are missing, from the plaintext in `<release>-credentials` while it is there, lets the release switch and finishes it. An account with no Secret and no plaintext is listed with no origin, and a mint creates the Secret.
 
 ## How MariaDB and ClickHouse differ
 
@@ -245,8 +244,45 @@ Once an operator fixes the cause, the next write through the API starts the conv
 |---|---|---|
 | 2, the account Secret | labelled `k8s.mariadb.com/watch`, `password` holds `PASSWORD()` output (`*` and 40 hex digits) | labelled `reconcile.fluxcd.io/watch: Enabled`, `password` holds the SHA-256 hex, and the HelmRelease gets a `valuesFrom` entry for the Secret, keyed by a digest of the user name |
 | 3, the chart | the `User` points `passwordHashSecretKeyRef` at the account Secret | the chart renders `password_sha256_hex` into the CHI from the value that entry supplies |
-| 7, applying a new value | the operator re-runs `ALTER USER`, and the engine state stays `Unknown` | helm-controller upgrades the release, the operator rewrites `chi-<chi>-common-usersd`, and the state is Applied once the CHI reconcile completes on every host |
+| 7, applying a new value | the operator re-runs `ALTER USER` | helm-controller upgrades the release, the operator rewrites `chi-<chi>-common-usersd`, and ClickHouse re-reads it within seconds |
 | Conversion | `<release>-credentials` keeps `root`, which the Job rotates with `ALTER USER` | `<release>-credentials` keeps `backup`, which the Job rotates, restarting the ClickHouse pods once |
+
+## How the kinds declare their accounts
+
+The block is `spec.credentials` of the ApplicationDefinition of the kind, so a tenant administrator, who can edit the application, cannot change how its passwords are stored.
+
+| Kind | Block |
+|---|---|
+| PostgreSQL | `format: scram-sha-256`, `secretLabels: {cnpg.io/reload: "true"}`, `users: users` |
+| MariaDB | `format: mysql-native`, `secretLabels: {k8s.mariadb.com/watch: ""}`, `users: users`, `accounts: [{name: root, owner: platform}]` |
+| ClickHouse | `format: sha256`, `secretLabels: {reconcile.fluxcd.io/watch: Enabled}`, `users: users`, `valuesPath: _accounts`, `accounts: [{name: backup, owner: platform}]` |
+| Redis | `format: plaintext`, `accounts: [{name: default, when: authEnabled}]` |
+
+`owner` is `tenant` unless the entry says otherwise. MariaDB's `root` and ClickHouse's `backup` are `owner: platform`: they stay in `<release>-credentials`, and the API does nothing for them, so there is no `Credential` and no account Secret for either, and a mint cannot reach them. The entry also keeps a `users.root`, which the MariaDB chart ignores today, from being listed, seeded or migrated as a tenant account. ClickHouse's chart refuses its reserved names itself.
+
+## A kind with no users: Redis
+
+Redis has no `users`: one password, in `redis-cache-auth` for an application `cache`, which the chart generates with `lookup` and the operator reads through `auth.secretPath`. Its ApplicationDefinition declares that password as a fixed account, present while `authEnabled` is true:
+
+```yaml
+spec:
+  credentials:
+    format: plaintext      # the account Secret holds the password itself, as in wave 2
+    accounts:
+    - name: default        # Credential redis-cache.default
+      when: authEnabled    # the values key that switches the account on, true by default
+```
+
+The chart stops generating the password and points the operator at the account Secret that the API seeds, whose `password` key has the name the operator reads today:
+
+```yaml
+  {{- if .Values.authEnabled }}
+  auth:
+    secretPath: {{ .Release.Name }}.default.account
+  {{- end }}
+```
+
+The account starts as `NotIssued`, and a mint replaces the password in that Secret. How a changed password reaches the replicas and the sentinels is the Redis row of §3 at its conversion.
 
 ## Headless provisioning and Terraform
 
