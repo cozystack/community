@@ -51,7 +51,7 @@ Today Cozystack already has every primitive needed *except* the glue that ties t
 - **ApplicationDefinition** (`api/v1alpha1/applicationdefinitions_types.go`) maps a user-facing `kind` → a `HelmRelease` via `cozystack-api` (`pkg/registry/apps/application/rest.go`, `ConvertApplicationToHelmRelease()`). `spec.dashboard` already drives UI presentation (incl. `module: true`); the visibility control (Design §6) extends that path.
 - **Network isolation** (`packages/apps/tenant/templates/networkpolicy.yaml`): the `<tenant>-egress` `CiliumClusterwideNetworkPolicy` selects every pod in the tenant namespace — including the KubeVirt `virt-launcher` node pods — and denies egress to the kube-apiserver by default. This is the enforcement point the `sandbox` posture and the scoped data-plane egress (Design §5) build on.
 
-What does **not** exist yet: the `extra/computeplane` module chart and its `computeplane-application` PackageSource, a `placement` field on `ApplicationDefinition`, the scoped ComputePlane→tenant-service egress policy, and the `cozystack-api` visibility/mutation control. The substrate is present; the assembly is new.
+What has since shipped (cozystack/cozystack#3280, merged 2026-07-29): the `extra/computeplane` module chart and its `computeplane-application` PackageSource, including the `computeplane-rd` resource-definition component and the tenant-chart toggle. What still does **not** exist: a `placement` field on `ApplicationDefinition`, the scoped ComputePlane→tenant-service egress policy, and the `cozystack-api` visibility/mutation control.
 
 ### The problem
 
@@ -83,7 +83,7 @@ The platform already isolates *tenant-owned* untrusted compute (a managed `kind:
 Reuse the `kubernetes` app as the substrate, unchanged. A ComputePlane is delivered as a new Tenant module, `packages/extra/computeplane`, of the same shape as `extra/etcd` / `extra/seaweedfs`. The packaging is **two-level** — the module chart is the wrapper, and the wrapper is what carries the operator-fixed values:
 
 1. When a tenant has the module enabled, the **tenant chart** renders the module `HelmRelease` (name `computeplane`, in the tenant namespace on the management cluster) whose `chartRef` points at the **`extra/computeplane`** chart's `ExternalArtifact`. Its own Helm release takes the `-module` suffix so the canonical release name `computeplane` stays reserved for the cluster release below.
-2. The **`extra/computeplane` chart** in turn renders the cluster `HelmRelease` (object name `computeplane-cluster`, `spec.releaseName: computeplane`) whose `chartRef` points at the **source-only re-sourced `apps/kubernetes`** `ExternalArtifact`, carrying the operator-fixed values. The release name `computeplane` is what makes Kamaji write the admin kubeconfig to the `computeplane-admin-kubeconfig` Secret — the contract `placement: ComputePlane` apps consume.
+2. The **`extra/computeplane` chart** in turn renders the cluster `HelmRelease` (object name `computeplane-cluster`) whose `chartRef` points at the **source-only re-sourced `apps/kubernetes`** `ExternalArtifact`, carrying the operator-fixed values. Neither `HelmRelease` sets `spec.releaseName` — the aggregated API rebuilds `HelmRelease` specs without that field, so both releases must derive their names from object names. The derived cluster release name `computeplane-cluster` is what makes Kamaji write the admin kubeconfig to the `computeplane-cluster-admin-kubeconfig` Secret — the contract `placement: ComputePlane` apps consume.
 
 ```yaml
 # 1) tenant chart → module HelmRelease (illustrative)
@@ -93,7 +93,6 @@ metadata:
   name: computeplane
   namespace: tenant-<name>            # management cluster, tenant namespace
 spec:
-  releaseName: computeplane-module    # frees the canonical name for the cluster release
   chartRef:
     kind: ExternalArtifact
     name: cozystack-computeplane-application-kubevirt-computeplane  # extra/computeplane
@@ -109,7 +108,7 @@ metadata:
   name: computeplane-cluster
   namespace: tenant-<name>
 spec:
-  releaseName: computeplane           # → Kamaji Secret computeplane-admin-kubeconfig
+  # no releaseName: derived from the object name → Kamaji Secret computeplane-cluster-admin-kubeconfig
   chartRef:
     kind: ExternalArtifact
     name: cozystack-computeplane-application-kubevirt-kubernetes  # apps/kubernetes, re-sourced (Design §2)
@@ -122,7 +121,7 @@ spec:
       name: cozystack-values
 ```
 
-**The release name `computeplane` is a stable external contract.** For every other tenant module (`etcd`, `monitoring`, `seaweedfs`) the Helm release name is *internal identity* — nothing outside the module resolves it by name. Here it is consumed by objects the module never sees: `apps/kubernetes` derives the Kamaji admin-kubeconfig Secret from its release name (`<release>-admin-kubeconfig`, key `super-admin.svc`), and every `placement: ComputePlane` HelmRelease references `computeplane-admin-kubeconfig` by that fixed name. No future repackaging, migration, or generic module-provisioning path may rename this release. A rename would, at best, dangle every routed app's `secretRef` (fail-closed, consistent with the missing-credential behaviour below); at worst, Helm treats the cluster as a *different release* and uninstalls the old one — a live Kamaji control plane plus KubeVirt-VM workers and their PVCs, i.e. tenant data. The implementation pins the release name and Secret name in helm-unittest; this paragraph is the *why* behind those pins.
+**The cluster `HelmRelease` object name `computeplane-cluster` is a stable external contract.** For every other tenant module (`etcd`, `monitoring`, `seaweedfs`) the inner release identity is *internal* — nothing outside the module resolves it by name. Here it is consumed by objects the module never sees: `apps/kubernetes` derives the Kamaji admin-kubeconfig Secret from the Helm release name (`<release>-admin-kubeconfig`, key `super-admin.svc`); the release name derives from the object name because **neither `HelmRelease` may set `spec.releaseName`** — the aggregated `cozystack-api` rebuilds `HelmRelease` specs on every write and cannot represent that field, so an explicit release name would be silently dropped on the first tenant edit and the release renamed out from under Helm. Every `placement: ComputePlane` HelmRelease therefore references `computeplane-cluster-admin-kubeconfig` by that derived name, and the module's `ApplicationDefinition` withholds the same name from tenant-visible secrets. No future repackaging, migration, or generic module-provisioning path may rename the `computeplane-cluster` object. A rename would, at best, dangle every routed app's `secretRef` (fail-closed, consistent with the missing-credential behaviour below); at worst it re-exposes the credential (the secrets exclusion matches by literal name) or has Helm treat the cluster as a *different release* and uninstall the old one — a live Kamaji control plane plus KubeVirt-VM workers and their PVCs, i.e. tenant data. The implementation pins the object name, the derived Secret name and the secrets exclusion in helm-unittest and a bats cross-check; this paragraph is the *why* behind those pins.
 
 Why a module wrapping the app, rather than a new kind or new fields on the app:
 
@@ -138,7 +137,7 @@ flowchart TB
   subgraph mgmt["Management / infra cluster (control plane)"]
     MOD["extra/computeplane module (enabled on tenant)<br/>→ HelmRelease chartRef: apps/kubernetes<br/>+ operator-fixed values"]
     AD["ApplicationDefinition (kind: JupyterHub)<br/>placement: ComputePlane"]
-    HR["HelmRelease<br/>kubeConfig.secretRef → computeplane-admin-kubeconfig"]
+    HR["HelmRelease<br/>kubeConfig.secretRef → computeplane-cluster-admin-kubeconfig"]
     IAP["ingress / identity-aware proxy"]
   end
   subgraph cp["ComputePlane = kind: Kubernetes (single-tenant, operator-controlled)"]
@@ -161,7 +160,7 @@ The module is registered by a `PackageSource` (`packages/core/platform/sources/c
 - `kubernetes` → `path: apps/kubernetes` — **source-only**, a deliberate **duplicate** of the component already in `kubernetes-application`, so the wrapped chart's `ExternalArtifact` is materialized within this package's own scope and the module is self-contained (it does not depend on the `kubernetes-application` source being independently enabled).
 - `computeplane-rd` → `path: system/computeplane-rd` with `install:` — the resource-definition chart carrying the module's `cozyrd` (its `ApplicationDefinition` / dashboard presentation and the tenant-values wiring), the same role `seaweedfs-rd` / `kubernetes-rd` play.
 
-The tenant chart gains a `computeplane` bool toggle alongside the existing module toggles (a profile-name string is a possible later extension if the operator ships more than one module variant); when set by the parent tenant, `packages/apps/tenant/templates/computeplane.yaml` renders the module `HelmRelease` (level 1 above). Kamaji writes the cluster's admin kubeconfig to `computeplane-admin-kubeconfig` (key `super-admin.svc`), which `placement: ComputePlane` apps consume (Design §4).
+The tenant chart gains a `computeplane` bool toggle alongside the existing module toggles (a profile-name string is a possible later extension if the operator ships more than one module variant); when set by the parent tenant, `packages/apps/tenant/templates/computeplane.yaml` renders the module `HelmRelease` (level 1 above). Kamaji writes the cluster's admin kubeconfig to `computeplane-cluster-admin-kubeconfig` (key `super-admin.svc`), which `placement: ComputePlane` apps consume (Design §4).
 
 ### 3. What the operator exposes vs fixes
 
@@ -169,13 +168,13 @@ Everything security-relevant is **fixed** in the module chart and unreachable by
 
 ### 4. `placement` routes a catalog app onto the ComputePlane
 
-`ApplicationDefinition` gains `placement` = `ManagementPlane` (default) | `ComputePlane`. `ManagementPlane` deploys into the tenant namespace on the management cluster, as today. `ComputePlane` routes the generated `HelmRelease` onto the tenant's ComputePlane by injecting `spec.kubeConfig.secretRef` → `computeplane-admin-kubeconfig` (the module's fixed secret) and `spec.install.createNamespace: true`. Because the module is a single per-tenant enabler, `ComputePlane` resolves unambiguously to *that* tenant's cluster — no cluster name to thread through the app.
+`ApplicationDefinition` gains `placement` = `ManagementPlane` (default) | `ComputePlane`. `ManagementPlane` deploys into the tenant namespace on the management cluster, as today. `ComputePlane` routes the generated `HelmRelease` onto the tenant's ComputePlane by injecting `spec.kubeConfig.secretRef` → `computeplane-cluster-admin-kubeconfig` (the module's fixed secret) and `spec.install.createNamespace: true`. Because the module is a single per-tenant enabler, `ComputePlane` resolves unambiguously to *that* tenant's cluster — no cluster name to thread through the app.
 
 *(Optional, advanced — deferred.)* The same routing generalizes to `placement: <named cluster>` for a tenant that deliberately runs its own `kind: Kubernetes` and wants apps placed there; that path reuses the identical `kubeConfig` injection with the cluster's own `<name>-admin-kubeconfig`. It is not the default delivery surface and is out of scope for v1.
 
 ### 5. Connectivity, remote apply, and inbound access
 
-- **Remote apply (into the cluster).** For a `placement: ComputePlane` app, `cozystack-api` converts it to a `HelmRelease` on the management cluster carrying `spec.kubeConfig.secretRef` → `computeplane-admin-kubeconfig`; Flux applies the chart **into the ComputePlane**, never into the tenant namespace on management. This is exactly what the first revision implemented.
+- **Remote apply (into the cluster).** For a `placement: ComputePlane` app, `cozystack-api` converts it to a `HelmRelease` on the management cluster carrying `spec.kubeConfig.secretRef` → `computeplane-cluster-admin-kubeconfig`; Flux applies the chart **into the ComputePlane**, never into the tenant namespace on management. This is exactly what the first revision implemented.
 - **Connectivity to tenant services (`sandbox` data-plane contract).** A notebook/LLM/n8n flow needs the tenant's data ("my Jupyter → my managed Postgres"), which runs in the tenant namespace on the management cluster. The guarantee is "no kube-API access / no creds to escalate," **not** "no packets ever." No mesh is required: the ComputePlane's KubeVirt-VM node pods sit on the management Cilium pod network, so reachability is a **scoped per-service `CiliumNetworkPolicy`** — allow → the tenant's Postgres Service, deny → kube-apiserver (same shape as the existing `policy.cozystack.io/allow-to-apiserver` label). Per-service egress is narrower-by-construction than a node mesh — which matters because the consumer is untrusted code.
 - **Inbound access.** Workloads expose themselves via Ingress/Gateway on the ComputePlane; the management ingress proxies to the cluster's `exposeMethod: Proxied` NodePort (or a kubevirt-ccm `Service type: LoadBalancer`). Inbound data path only — no reverse kube-API path, and the tenant never receives cluster credentials.
 
@@ -232,7 +231,7 @@ Tenant *visibility* is a separable UX/operability default, not a security mechan
 
 ## Failure and edge cases
 
-- **ComputePlane not ready when a `placement: ComputePlane` app is created** → the `HelmRelease` waits on the `computeplane-admin-kubeconfig` Secret; Flux surfaces not-ready, as with any dependency ordering.
+- **ComputePlane not ready when a `placement: ComputePlane` app is created** → the `HelmRelease` waits on the `computeplane-cluster-admin-kubeconfig` Secret; Flux surfaces not-ready, as with any dependency ordering.
 - **kubeconfig Secret missing/rotated** → remote apply fails closed (no fallback to local apply); the security-correct behavior.
 - **`placement: ComputePlane` app but the module is disabled on the tenant** → reject at admission. Never climb to an ancestor's ComputePlane (Design §7).
 - **GPU exhaustion** → cluster-autoscaler adds GPU nodes up to the configured `maxReplicas`; beyond that the workload pends.
