@@ -16,14 +16,14 @@ This is the logs companion to the metrics proposal (`design-proposals/tenant-res
 ## Scope and related proposals
 
 - **Companion to the metrics proposal** (`tenant-resource-metrics-api`, cozystack/community#94). Both expose observability of `apps.cozystack.io` resources in the dashboard behind Kubernetes authorization. They differ on purpose: metrics are a **subresource** on `application` (live only, 404 after deletion is fine, RBAC comes for free); logs are a **top-level resource** (must survive deletion, so RBAC is not free). The asymmetry is explained in Design.
-- **Modeled on the Cozystack portal logs API** (external: `aenix-org/cozyportal`, group `logging.portal.cozystack.io`, resource `logs`). That is a working implementation of exactly this pattern; this proposal adapts it to cozystack's tenancy and RBAC. The portal scopes by an `account`/`project` dimension; cozystack scopes by namespace, which is the only log isolation dimension it has today.
+- **Follows a known aggregated-API pattern** for log access: a virtual, non-etcd resource that streams a log backend's native response behind Kubernetes authorization (the shape upstream `pods/log` uses). This proposal applies it with cozystack's tenancy and RBAC, scoping by namespace, which is the only log isolation dimension cozystack has today.
 - **Complements, does not replace, Grafana.** Grafana stays the place for deep log exploration; this serves an embedded per-resource / per-namespace log view for tenants who do not run their own Grafana.
 - **Alert management is a separate proposal.** Deferred.
 - **Foundational dependency: per-application log labeling.** Cozystack's log collection today keeps only namespace/pod/container, not application identity (see Context); filtering logs to a specific application, rather than a whole namespace, depends on closing that gap (see Rollout).
 
 ## Prior art
 
-- **Portal logs API (the model, external).** `aenix-org/cozyportal` serves a top-level namespaced virtual resource `logs` (group `logging.portal.cozystack.io`, no etcd) from its aggregated API server, enabled by `--serve-logging` and a VictoriaLogs endpoint. It implements `GetterWithOptions` + `Lister` + `Scoper` (no Create/Watch), decodes `LogOptions` (a `PodLogOptions` analogue) from query parameters, and returns a `ResourceStreamer` that streams VictoriaLogs NDJSON as `text/plain`. `list` cannot receive custom query parameters, so it carries them through `fieldSelector` plus an `AddFieldLabelConversionFunc`. It builds LogsQL with a scope label always prepended from the namespace and rejects an empty scope. Its authorization has two gates: a front-door kube RBAC check on `logs` in the logging group, and a custom `SubjectAccessReview` in the handler against the target resource's own group; its own delegated authorizer is short-circuited to Allow for `logs` so the thin SAR is authoritative. Because the logs resource lives in a separate group from its targets, its RBAC is not free; roles carry two rules.
+- **Aggregated-API streaming resource (the mechanism).** An aggregated API server can serve a top-level, namespaced, non-etcd resource that implements `GetterWithOptions` + `Lister` + `Scoper` (no Create/Watch), decodes `LogOptions` (a `PodLogOptions` analogue) from query parameters, and returns a `ResourceStreamer` that streams the backend's NDJSON as `text/plain`; upstream `pods/log` is the reference for the streaming shape. Because `list` cannot receive custom query parameters, filters travel through `fieldSelector` plus an `AddFieldLabelConversionFunc`. A resource whose authorization lives in a different API group than the objects it reports on needs a custom `SubjectAccessReview` in the handler, with the server's own delegated authorizer short-circuited to Allow so the thin SAR is authoritative and its roles carry two rules; this proposal keeps that two-gate model (see Design).
 - **Virtual resources in cozystack-api (the host precedent).** `cozystack-api` already serves etcd-less virtual resources (`options`, `taps` in `pkg/registry/core`) with `Lister`/`Getter`/`Watcher`/`Scoper`, and assembles its API groups (`core`/`sdn`/`apps.cozystack.io`) in one place (`pkg/apiserver/apiserver.go`). A new `logs.cozystack.io` group is added the same way, with a fourth `APIService`; no separate API server is needed. It has no `ResourceStreamer`, `GetterWithOptions`, or `SubjectAccessReview` code yet, so those are new ground.
 - **Metrics proposal.** The sibling design for metrics; read it for the shared tenancy and `vmselect`/`vlselect` resolution model.
 
@@ -67,9 +67,9 @@ Empty while the proposal is still intent. -->
 
 ### 1. Shape: a top-level virtual `logs` resource, and why not a subresource
 
-Logs must survive their parent: the most valuable logs are often those of an already-deleted pod or application. A Kubernetes subresource is tied to its parent object's lifecycle and returns 404 once the parent is gone, so it cannot serve post-mortem logs. The metrics proposal could accept that (a live graph of a deleted VM is pointless); logs cannot. This is the same reason the portal's ADR-001 chose a top-level resource over a per-kind `/logs` subresource.
+Logs must survive their parent: the most valuable logs are often those of an already-deleted pod or application. A Kubernetes subresource is tied to its parent object's lifecycle and returns 404 once the parent is gone, so it cannot serve post-mortem logs. The metrics proposal could accept that (a live graph of a deleted VM is pointless); logs cannot. For that reason logs are a top-level resource, not a per-kind `/logs` subresource.
 
-So logs are a **top-level namespaced virtual resource** `logs` (kind `Log`) in a new group `logs.cozystack.io/v1alpha1`, served by `cozystack-api` with no etcd, implementing `GetterWithOptions` + `Lister` + `Scoper` (no Create/Watch), following the portal's shape and cozystack's existing `options`/`taps` virtual-resource precedent.
+So logs are a **top-level namespaced virtual resource** `logs` (kind `Log`) in a new group `logs.cozystack.io/v1alpha1`, served by `cozystack-api` with no etcd, implementing `GetterWithOptions` + `Lister` + `Scoper` (no Create/Watch), following cozystack's existing `options`/`taps` virtual-resource precedent and the upstream `pods/log` streaming shape.
 
 ```mermaid
 flowchart LR
@@ -83,11 +83,11 @@ flowchart LR
 ### 2. Request and response
 
 - **Get one object's logs:** `GET .../namespaces/<ns>/logs/<name>?resourceGroup=&resourceKind=&source=&level=&follow=&tailLines=&sinceTime=&sinceSeconds=`. The query parameters decode into a `LogOptions` (a `PodLogOptions` analogue); `<name>` identifies the target resource. The response is the VictoriaLogs NDJSON streamed as `text/plain` (a `ResourceStreamer`), with `follow` upgrading to a live tail.
-- **List a namespace's logs:** `GET .../namespaces/<ns>/logs?fieldSelector=resourceGroup=...,resourceKind=...`. Because Kubernetes `list` does not pass custom query parameters, the filters travel through `fieldSelector`, which requires an `AddFieldLabelConversionFunc` for the `Log` kind (as the portal does); `metadata.name`/`metadata.namespace` are rejected there in favor of the Get path.
+- **List a namespace's logs:** `GET .../namespaces/<ns>/logs?fieldSelector=resourceGroup=...,resourceKind=...`. Because Kubernetes `list` does not pass custom query parameters, the filters travel through `fieldSelector`, which requires an `AddFieldLabelConversionFunc` for the `Log` kind; `metadata.name`/`metadata.namespace` are rejected there in favor of the Get path.
 
 ### 3. Tenant isolation: forced namespace scope
 
-The handler takes the tenant from the request namespace (already authorized, see 4) and **always prepends a scope filter to the LogsQL**: `kubernetes_namespace_name="<ns>"`, the only log isolation dimension cozystack has today. A query with an empty scope is rejected. Client-supplied filters are added only on top of this forced scope, so a client cannot read another namespace's logs. This mirrors the portal (a scope label always prepended, empty scope rejected).
+The handler takes the tenant from the request namespace (already authorized, see 4) and **always prepends a scope filter to the LogsQL**: `kubernetes_namespace_name="<ns>"`, the only log isolation dimension cozystack has today. A query with an empty scope is rejected. Client-supplied filters are added only on top of this forced scope, so a client cannot read another namespace's logs. Always prepending a scope and rejecting an empty one is the standard way to make a shared backend safe.
 
 ### 4. Authorization: two gates, and RBAC is not free
 
@@ -100,7 +100,7 @@ flowchart TD
   L2 -->|allow| SC["force kubernetes_namespace_name=T, query vlselect"]
 ```
 
-Because `logs.cozystack.io` is a new group, it is **not** covered by the existing `apps.cozystack.io` wildcard, so unlike metrics this needs an explicit grant. Two gates, following the portal:
+Because `logs.cozystack.io` is a new group, it is **not** covered by the existing `apps.cozystack.io` wildcard, so unlike metrics this needs an explicit grant. Two gates:
 
 - **Gate 1 (front-door).** The kube-apiserver authorizes `get`/`list` on `logs.cozystack.io/logs` in the request namespace by RBAC before proxying to the aggregated server (the aggregated server's own delegated re-check of this resource is removed, see Gate 2, so the front door is this kube-apiserver RBAC). This needs one new aggregated ClusterRole rule, delivered by the owning package and labeled `rbac.cozystack.io/aggregate-to-tenant-view`, so it reaches the `<tenant>-view` groups through the existing bindings (precedent: `migration-controller` ships its own tenant ClusterRoles this way).
 - **Gate 2 (handler SAR).** The handler issues a `SubjectAccessReview` for the calling user against the **target** resource: `get <resourceKind-plural>/logs` in group `resourceGroup` (default `apps.cozystack.io`), namespace T. `cozystack-api`'s own delegated authorizer is short-circuited to Allow for the `logs` resource so this SAR is authoritative. The elegant part: when the target is an `apps.cozystack.io` application, `get <plural>/logs` is already covered by the existing wildcard app-read grant, so gate 2 passes for anyone who can read the application, tying "can read logs" to "can read the resource". The resource need not exist for the SAR to pass (SAR is about permission, not existence), which is exactly what makes post-mortem work: a tenant keeps `get` in namespace T after the pod is gone. `cozystack-api`'s ServiceAccount already has `system:auth-delegator`, so it can create the SAR with no new grant.
@@ -113,7 +113,7 @@ The handler reads `namespace.cozystack.io/monitoring` on the request namespace: 
 
 ### 6. Filtering to an application (a collection gap)
 
-Cozystack's Fluent Bit keeps only namespace/pod/container, not application identity (pod labels are stripped), so filtering logs to one application rather than a whole namespace is not possible from the stream today. Two options, deferred to Rollout: resolve the application's pods and filter by `kubernetes_pod_name`, or enrich collection with `resource_group`/`resource_kind`/`resource_name` stream fields as the portal does. The first cut can serve namespace-scoped logs and per-pod logs.
+Cozystack's Fluent Bit keeps only namespace/pod/container, not application identity (pod labels are stripped), so filtering logs to one application rather than a whole namespace is not possible from the stream today. Two options, deferred to Rollout: resolve the application's pods and filter by `kubernetes_pod_name`, or enrich collection with `resource_group`/`resource_kind`/`resource_name` stream fields. The first cut can serve namespace-scoped logs and per-pod logs.
 
 ## User-facing changes
 
@@ -132,7 +132,7 @@ Cozystack's Fluent Bit keeps only namespace/pod/container, not application ident
 - **Forced namespace scope** is the isolation hinge: the LogsQL always carries `kubernetes_namespace_name=<ns>` server-side, and an empty scope is rejected, so a client query cannot widen past its namespace.
 - **Two authorization gates:** a front-door RBAC check and a target-resource SAR; the server's own authorizer is bypassed only for the `logs` resource, so the SAR is authoritative.
 - **Why not `services/proxy` to `vlselect`:** coarse authz, no forced scope, reads every mapped namespace on a shared store.
-- **Query cost and safety:** `tailLines`/limit are bounded (the portal defaults to 100, caps at 10000); `follow` is incompatible with `since*`; `source`/`level` and the resource selectors are validated against an allowlist and a name grammar before entering LogsQL.
+- **Query cost and safety:** `tailLines`/limit are bounded (for example a default of 100 and a cap of 10000); `follow` is incompatible with `since*`; `source`/`level` and the resource selectors are validated against an allowlist and a name grammar before entering LogsQL.
 - **Platform logs:** audit and system-source logs must not be reachable through a tenant's namespace scope; restrict `source` so a tenant cannot select platform log sources.
 
 ## Failure and edge cases
@@ -161,7 +161,7 @@ Cozystack's Fluent Bit keeps only namespace/pod/container, not application ident
 The points previously open are resolved below, as decisions, or as recommendations where the implementation will confirm the detail.
 
 - **Target-to-selector: decided namespace plus pod-name now, resource labels later.** The first cut filters by `kubernetes_namespace_name` and, for a named resource, by the resource's pod names (`kubernetes_pod_name`), which works without a collection change and still spans a restarted pod. Enriching collection with `resource_group`/`resource_kind`/`resource_name` stream fields (Phase 2) is the robust long-term answer and is what makes post-mortem of a deleted resource and non-pod resources clean.
-- **Parameter codec: decided a scheme-aware codec for the new group.** Register a parameter codec that knows `LogOptions` for `logs.cozystack.io` only (as the portal does); `cozystack-api` keeps `metav1.ParameterCodec` for its other groups, so nothing else changes.
+- **Parameter codec: decided a scheme-aware codec for the new group.** Register a parameter codec that knows `LogOptions` for `logs.cozystack.io` only; `cozystack-api` keeps `metav1.ParameterCodec` for its other groups, so nothing else changes.
 - **`list` scope: decided a plain namespace list in the first cut, no rich filtering.** The resource supports Get for one object's logs and a plain namespace-scoped `list` (the `Lister` in Design 1); only the richer filtered `list` that needs the `fieldSelector` trick is deferred until a use case needs it, avoiding that complexity initially.
 - **Gate 2 target: decided `<app>/logs` in `apps.cozystack.io`.** This is free via the existing wildcard and gives the intended "can read the resource implies can read its logs" semantics; `pods/log` in core is not granted to tenants, would need an explicit rule, and exposes pod-level rather than resource-level access.
 - **OIDC: a stated prerequisite**, as in the metrics proposal (a flat `groups` claim, no prefix); where it does not hold, tenant RBAC itself does not work, so there is no extra behavior to define.
@@ -169,9 +169,7 @@ The points previously open are resolved below, as decisions, or as recommendatio
 
 ## Alternatives considered
 
-- **A `logs` subresource on `application`** (symmetric with the metrics proposal). Rejected: a subresource is tied to its parent's lifecycle and returns 404 after deletion, so it cannot serve post-mortem logs, which is the main reason to read logs. The asymmetry with metrics is deliberate.
-- **Reuse the portal's logs API as-is.** The portal (`logging.portal.cozystack.io`) is a separate product with its own tenancy dimension (`account`/`project`) and its own RBAC group; cozystack scopes by namespace and has its own tenant groups, so the mechanism is adopted but not the deployment.
-- **A deep link to Grafana / the VictoriaLogs UI.** Low effort and good for clients who already run Grafana, but rejected as the primary because the target audience is clients who do not; worth shipping as a complementary convenience.
+- **A `logs` subresource on `application`** (symmetric with the metrics proposal). Rejected: a subresource is tied to its parent's lifecycle and returns 404 after deletion, so it cannot serve post-mortem logs, which is the main reason to read logs. The asymmetry with metrics is deliberate.- **A deep link to Grafana / the VictoriaLogs UI.** Low effort and good for clients who already run Grafana, but rejected as the primary because the target audience is clients who do not; worth shipping as a complementary convenience.
 - **Direct `services/proxy` to `vlselect`.** Rejected: coarse authz and no forced namespace scope, so it leaks across namespaces on a shared store.
 - **VictoriaLogs native multitenancy (`AccountID`/`ProjectID`).** Could isolate tenants inside one store, but cozystack writes everything at account 0 and isolates by separate stores plus namespace, so adopting it is a larger change to the whole logging pipeline; out of scope.
 
