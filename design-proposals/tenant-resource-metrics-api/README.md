@@ -16,15 +16,15 @@ This proposal was redrafted during review. An earlier draft in this same PR desi
 ## Scope and related proposals
 
 - **Replaces an earlier draft in this PR** (standalone `metrics.cozystack.io` server with a `MetricQuery` kind). See Alternatives.
-- **Modeled on the Cozystack portal logs API** (external: `aenix-org/cozyportal`, group `logging.portal.cozystack.io`, resource `logs`): a virtual, non-etcd resource that proxies a time-series backend behind Kubernetes authorization. This proposal adapts that pattern and improves on it (RBAC comes for free here, which it did not in the portal; see Design).
+- **Follows a known aggregated-API pattern**: a virtual, non-etcd resource served by an aggregated API server that proxies a time-series backend behind Kubernetes authorization (the shape upstream `pods/log` and `pods/proxy` use). RBAC comes for free here because the subresource shares the `apps.cozystack.io` group with its target (see Design).
 - **Complements, does not replace, Grafana.** Grafana stays the place for deep exploration; this serves embedded, basic per-resource graphs for tenants who do not run their own Grafana.
-- **Billing is out of scope.** The external `billing.aenix.io` server is referenced only as a pattern; this proposal does not depend on it and does not produce invoices.
+- **Billing is out of scope.** This proposal exposes measured consumption for graphs; it does not meter, price, or produce invoices.
 - **Alert management is a separate proposal.** Managing alert rules and routing is read-write and stateful; unlike metrics, it likely does need an aggregation API. Deferred (see Non-goals).
 - **Foundational dependency: multi-tenancy for the metrics store.** The real underlying work flagged in the discussion is proper per-tenant isolation of the metrics backend, whatever it is. This proposal's forced-filter and store resolution are the per-tenant access layer on top of that (see Design and Rollout).
 
 ## Prior art
 
-- **Portal logs API (the model, external).** `aenix-org/cozyportal` serves a top-level namespaced virtual resource `logs` (group `logging.portal.cozystack.io`, not stored in etcd) from an aggregated API server, projecting requests into VictoriaLogs and streaming the backend's native response as `text/plain` rather than a Kubernetes object. Its ADR-001 chose a top-level resource over a per-kind subresource specifically because logs must survive their parent (post-mortem), a constraint that does not apply to live metrics. Crucially, the portal's authorization needed a **custom `SubjectAccessReview`** in the handler, because its logs server lives in a different API group than the resources it reports on; its RBAC did not come for free. This proposal avoids that by living in the same group as its target.
+- **Aggregated-API streaming resources (the mechanism).** An aggregated API server can serve a virtual, non-etcd resource that streams a backend's native response rather than a Kubernetes object, the way upstream `pods/log` streams container logs and `pods/proxy` reverse-proxies to a pod. A resource whose authorization lives in a different API group than the objects it reports on needs a **custom `SubjectAccessReview`** in the handler, so its RBAC is not free; this proposal avoids that by exposing metrics as a subresource in the same `apps.cozystack.io` group as its target.
 - **cozystack-api (the host).** `cozystack-api` is the aggregated API server for `apps.cozystack.io`, registering one storage per application kind from the `ApplicationDefinition` set, with delegated authentication and authorization. It has no subresource today, so this adds the first one.
 - **Kubernetes subresource precedents.** Upstream `pods/log` uses `GetterWithOptions` + `ResourceStreamer` to stream a non-JSON body; `pods/proxy` uses `rest.Connecter` to return an `http.Handler` that reverse-proxies arbitrary methods and response bodies. The latter is the closer fit for a Prometheus passthrough.
 - **vmauth for traces (in cozystack).** Cozystack already runs `vmauth` to isolate traces per tenant, via a `VMUser` that injects `AccountID`/`ProjectID` headers (the VictoriaTraces account dimension), not a label filter. The metrics alternative in this proposal would instead force `extra_filters` (VictoriaMetrics' documented label-filter mechanism). So `vmauth` is a component precedent in cozystack, but the isolation mechanism for metrics would differ from the one used for traces.
@@ -86,9 +86,9 @@ flowchart LR
 
 ### 2. Why this shape
 
-Compared with the dropped standalone-aggregation-API revision and with the portal's separate-group logs model:
+Compared with the dropped standalone-aggregation-API revision and with a separate-group resource:
 
-| property | this proposal (subresource on `application`) | earlier revision (new `metrics.cozystack.io` + `MetricQuery` kind) | portal-style separate group |
+| property | this proposal (subresource on `application`) | earlier revision (new `metrics.cozystack.io` + `MetricQuery` kind) | separate-group resource |
 | --- | --- | --- | --- |
 | RBAC | free: already covered by the existing `apps.cozystack.io` wildcard app-read grant, zero new rules | custom resource, new ClusterRole, still workable but a second surface | needs a custom `SubjectAccessReview` (different group) |
 | payload | native Prometheus JSON, no kube envelope | kube object with `apiVersion`/`kind` | native, but behind a custom SAR |
@@ -96,7 +96,7 @@ Compared with the dropped standalone-aggregation-API revision and with the porta
 | new components | none (handler in existing `cozystack-api`) | a new aggregated API server | a new aggregated API server |
 | per-kind cost | none: one shared handler, registered per plural in the existing loop, no per-kind code or recompile | one resource for all | one resource, but per-target SAR wiring |
 
-The decisive points: RBAC is genuinely free because the subresource shares the `apps.cozystack.io` group with its target, so it inherits the existing wildcard `get apps.cozystack.io/*` grant (the portal could not get this); the response is the backend's own Prometheus JSON, so the dashboard reuses a standard client instead of a second kube-style API; and because `cozystack-api` builds its application storages in one loop over `ApplicationDefinition`, the `metrics` subresource is one shared handler registered per plural in that loop rather than hand-written per application type, avoiding the per-kind recompile that the portal and similar systems hit.
+The decisive points: RBAC is genuinely free because the subresource shares the `apps.cozystack.io` group with its target, so it inherits the existing wildcard `get apps.cozystack.io/*` grant (a separate-group resource could not); the response is the backend's own Prometheus JSON, so the dashboard reuses a standard client instead of a second kube-style API; and because `cozystack-api` builds its application storages in one loop over `ApplicationDefinition`, the `metrics` subresource is one shared handler registered per plural in that loop rather than hand-written per application type, avoiding a per-kind recompile.
 
 ### 3. Authorization: two layers, the first free
 
@@ -110,7 +110,7 @@ flowchart TD
 
 **Layer 1 (RBAC), free and already granted.** Because the subresource is in `apps.cozystack.io`, the kube-apiserver and `cozystack-api`'s delegated authorizer check `get <plural>/metrics` in the request namespace with no custom code. And it needs no new rule: the existing `cozy:tenant:view:base` ClusterRole already grants `get` on `apps.cozystack.io` with resources `["*"]`, and an RBAC resource wildcard matches subresources, so `get <plural>/metrics` is already authorized at tenant `view` and above through the existing `<tenant>-view` group bindings. Metrics-read therefore inherits app-read, with zero new ClusterRole, no new Keycloak group, and no tenant-chart change. The consequence is that metrics-read cannot be gated separately from app-read while that wildcard stands: gating it differently would mean narrowing the existing wildcard, which is out of scope here (see Open questions).
 
-**Layer 2 (forced filter), the isolation hinge.** The handler takes the tenant from the request namespace (already authorized) and the release from the object name, and appends a mandatory `extra_filters` label matcher to the forwarded query. In VictoriaMetrics `extra_filters` is ANDed into every selector of the query, so even a raw client-supplied PromQL cannot escape the tenant's own `namespace` (and release) scope. This is the same shape the portal uses for logs (a scope-label always added to the backend query, empty selector rejected); `extra_filters` is VictoriaMetrics' documented way to do the equivalent for metrics. Because the filter is forced server-side, raw Prometheus passthrough is isolation-safe and no fixed metric catalog is required.
+**Layer 2 (forced filter), the isolation hinge.** The handler takes the tenant from the request namespace (already authorized) and the release from the object name, and appends a mandatory `extra_filters` label matcher to the forwarded query. In VictoriaMetrics `extra_filters` is ANDed into every selector of the query, so even a raw client-supplied PromQL cannot escape the tenant's own `namespace` (and release) scope. Always adding a scope filter and rejecting an empty one is the standard way to make a shared backend safe; `extra_filters` is VictoriaMetrics' documented mechanism for it. Because the filter is forced server-side, raw Prometheus passthrough is isolation-safe and no fixed metric catalog is required.
 
 ### 4. Tenant and `vmselect` resolution
 
@@ -118,7 +118,7 @@ The handler reads `namespace.cozystack.io/monitoring` on the request namespace. 
 
 ### 5. Scope: per-object now, tenant-wide aggregate later
 
-A subresource answers "metrics for this one object". A tenant-wide view ("all my databases") needs either a top-level resource with the field-selector trick the portal uses for `list`, or a `metrics` subresource on the `Tenant`. This is deferred (see Open questions). A subresource also returns 404 once the application is deleted, which is acceptable for live graphs (unlike logs, which the portal kept post-mortem).
+A subresource answers "metrics for this one object". A tenant-wide view ("all my databases") needs either a top-level resource with a field-selector-based `list`, or a `metrics` subresource on the `Tenant`. This is deferred (see Open questions). A subresource also returns 404 once the application is deleted, which is acceptable for live graphs (logs, by contrast, are kept post-mortem).
 
 ### 6. Foundational: metrics multi-tenancy
 
@@ -183,7 +183,7 @@ The points previously open are resolved below, as decisions, or as recommendatio
 ## Alternatives considered
 
 - **Standalone aggregation API with a `MetricQuery` kind (this proposal's earlier revision).** A new `metrics.cozystack.io` API server, storage-less, returning structured series in a Kubernetes object. Rejected in the design discussion: it wraps every response in a kube `apiVersion`/`kind` envelope, forces a second kube-style API spec and a second dashboard client to maintain, and adds a new server and E2E surface, for no benefit over a reverse-proxy subresource that returns native Prometheus JSON.
-- **Portal-style separate logging-like group.** A dedicated `metrics.*` virtual resource in its own group, like the portal's `logs`. Rejected: being in a different group from the target resource means RBAC is not free (the portal needed a custom `SubjectAccessReview` and two-rule roles), which is exactly the cost the subresource avoids.
+- **A separate-group virtual resource.** A dedicated `metrics.*` virtual resource in its own API group. Rejected: being in a different group from the target resource means RBAC is not free (it would need a custom `SubjectAccessReview` and two-rule roles), which is exactly the cost the subresource avoids.
 - **vmauth or a thin self-written proxy to Victoria, bypassing the Kubernetes API.** The simplest infrastructure, and `vmauth` can force per-tenant isolation via `extra_filters`. Rejected as the primary because its authorization is `vmauth`-native (its own tokens or a JWT with a tenant claim), not Kubernetes RBAC, so it needs per-tenant credentials or an OIDC-JWT-to-tenant mapping and a second auth path in the dashboard. Kept as a fallback if the subresource wiring proves too awkward; cozystack already runs `vmauth` for traces. Decision criterion from the discussion: take the subresource route only if it buys Kubernetes RBAC cheaply (it does) and `vmauth` cannot isolate per tenant without bespoke credentials (it cannot, cleanly).
 - **A deep-link button to Grafana** (open the right dashboard with the right metrics preselected). Low effort and good for clients who already run Grafana, but rejected as the primary because the target audience is exactly the clients who do not run their own Grafana or monitoring stack. Worth shipping as a complementary convenience.
 - **Fixed metric catalog / no free-form PromQL** (the earlier revision's stance). Unnecessary once the handler forces `extra_filters` on every selector, which makes raw passthrough isolation-safe; query-cost limits handle abuse instead of a catalog.
