@@ -19,6 +19,10 @@ Hybrid clusters — workers that live outside the Cozystack management cluster (
 - **Phase 3 (hybrid clusters)** lives in a separate draft proposal: [`kubernetes-nodes-hybrid-clusters`](../kubernetes-nodes-hybrid-clusters/) ([PR #9](https://github.com/cozystack/community/pull/9)). None of the design here forecloses Phase 3; the package split is exactly what makes Phase 3 expressible cleanly.
 - **Companion: [`cross-cluster-tenant-mesh`](../cross-cluster-tenant-mesh/)** (PR #7). Independent of this proposal; relevant once tenants need to reach services across cluster boundaries.
 
+## Decisions
+
+- [0001. Pool labels and taints are `kubernetes-nodes` chart fields for every worker OS, not a Talos `userMachineConfig` layer](./decisions/0001-pool-labels-and-taints-are-chart-fields-for-every-os.md) — why the `userMachineConfig` user layer below was not built.
+
 ## Context
 
 ### The current shape
@@ -122,6 +126,8 @@ Each `kubernetes-nodes` HelmRelease generates a single Talos machineconfig for i
 **User layer** (`userMachineConfig` in `values.yaml`): extra kubelet args, extra labels/taints, registry mirror overrides, Talos image-factory schematic, anything else explicitly exposed by the chart.
 
 The two layers are merged at render time; the user never writes raw Talos YAML for cluster-critical fields. The chart guarantees the machineconfig results in a worker that joins the right Kamaji control-plane.
+
+The user layer was not built. Registry mirrors and the image-factory schematic became chart fields of their own, and labels and taints became chart fields for every worker OS; see [decision 0001](./decisions/0001-pool-labels-and-taints-are-chart-fields-for-every-os.md).
 
 ### `kubevirt-ccm` stays in `kubernetes` package
 
