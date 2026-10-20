@@ -366,7 +366,7 @@ The policy text goes into `CONTRIBUTING.md` of `cozystack/cozystack` after this 
 6. **A signed index exists.** The trust model relies on signature checks in the community index, but there is only a template in `hack/packages-index/`. Taps pin by tag and nothing verifies a signature at pull time. Either digests are accepted, or `spec.verify` is set from the index entry.
 7. **Publisher guidance.** The `cozypkg init` scaffold ships a `ClusterRole` with the tenant aggregation labels, because the tenant-admin role lists kinds by name and otherwise a third-party kind is unusable for tenant admins. Documentation explains how an external chart gets `cozy-lib` (see K5). An e2e test publishes a fixture catalog, connects it, creates an application and disconnects it.
 
-Items 2, 3 and 4 are [cozystack#4975](https://github.com/cozystack/cozystack/issues/4975), [cozystack#4977](https://github.com/cozystack/cozystack/issues/4977) and [cozystack#4976](https://github.com/cozystack/cozystack/issues/4976), item 5 is [cozystack#4359](https://github.com/cozystack/cozystack/issues/4359).
+Items 2, 3 and 4 are [cozystack#4975](https://github.com/cozystack/cozystack/issues/4975), [cozystack#4977](https://github.com/cozystack/cozystack/issues/4977) and [cozystack#4976](https://github.com/cozystack/cozystack/issues/4976), item 5 is [cozystack#4978](https://github.com/cozystack/cozystack/issues/4978) (related: [cozystack#4359](https://github.com/cozystack/cozystack/issues/4359)), and pinning by digest from item 6 is [cozystack#4979](https://github.com/cozystack/cozystack/issues/4979).
 
 The marketplace ships enabled in 1.7.0, and items 2 to 7 land in 1.7 patch releases. Items 3, 5 and 6 are reachable only through a connected catalog: the platform ships no `Tap`, and only cluster administrators can create one. Items 2 and 4 are not marketplace code. They sit in the `Package` reconciler and in `cozystack-api`, so the 1.6 path through a hand-written `PackageSource` and `cozypkg add` reaches them too, and they get fixed first.
 
@@ -435,7 +435,7 @@ Every item here is useful whatever the final shape is, needs no new mechanism an
 - Boundary defects: the root tenant references modules it never enabled (etcd case: [cozystack#4783](https://github.com/cozystack/cozystack/issues/4783)), and the two writers of `_namespace` disagree.
 - Dashboard without new mechanisms: icons and category order from the AD (free categories landed in [cozystack#4741](https://github.com/cozystack/cozystack/pull/4741), order by `weight` remains), `visibility` ([community#39](https://github.com/cozystack/community/pull/39)) instead of special cases, the Migration section only when the forklift API exists, the backup bucket from backup configuration.
 
-Each item gets an issue in `cozystack/cozystack`, and one tracking issue collects them.
+Step 0 is tracked in [cozystack#4982](https://github.com/cozystack/cozystack/issues/4982), the marketplace items in [cozystack#4981](https://github.com/cozystack/cozystack/issues/4981).
 
 ### Step 1: mechanisms
 
