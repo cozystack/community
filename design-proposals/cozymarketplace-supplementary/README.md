@@ -3,17 +3,26 @@
 - **Title:** `Cozymarketplace — Phase 1 backend, private repository support, and publication validation`
 - **Author(s):** `@IvanHunters`
 - **Date:** `2026-06-25`
-- **Status:** Draft
-- **Supplements:** [`cozystack/community#18`](https://github.com/cozystack/community/pull/18) by `@kvaps`; builds on [`cozystack/community#12`](https://github.com/cozystack/community/pull/12) by `@kvaps` (`cozypkg tap` / `init` / `push` plus the community index)
+- **Status:** Accepted
+- **Amended:** `2026-10-20`: reconciled with the shipped implementation, and the dependency on the closed `#12` removed; see Decisions.
+- **Supplements:** [`cozystack/community#18`](https://github.com/cozystack/community/pull/18) by `@kvaps`
 - **Related code:** [`cozystack/cozystack#2472`](https://github.com/cozystack/cozystack/pull/2472) (merged), [`cozystack/cozystack#2455`](https://github.com/cozystack/cozystack/issues/2455)
+
+## Decisions
+
+Newest first. Records are frozen once merged; this proposal keeps evolving.
+
+- [`0001`: A Tap is a computed view, and the materializer runs in the operator](decisions/0001-tap-is-a-computed-view-materialized-in-the-operator.md)
+
+> **Note on `#12`.** An earlier draft of this proposal built on `cozystack/community#12`, which was closed, with its author's note that `init` and `push` would be carried into `#18`. They were not folded into `#18`'s text, but they did ship: `cozypkg` on `main` carries `tap`, `untap`, `init`, `push`, `validate` and `search`. This proposal no longer depends on `#12`; where it needs those commands it refers to what shipped.
 
 ## Overview
 
-This proposal is supplementary, not competing, to `#18`. It accepts the repository-centric model — the install and version unit is the External-Apps repository as a versioned OCI artifact — and fills in three concrete pieces that `#18` lists as open questions or leaves implicit: the in-cluster backend the dashboard talks to, the credential plumbing that makes private repositories work in one command, and the publication validation that gates submissions to the meta-index. It also stays aligned with `#12`, which specifies the `cozypkg` authoring and tap workflow this proposal's backend and validator reuse rather than re-invent. Per-package version pinning remains out of scope, siding with `#18`.
+This proposal is supplementary, not competing, to `#18`. It accepts the repository-centric model — the install and version unit is the External-Apps repository as a versioned OCI artifact — and fills in three concrete pieces that `#18` lists as open questions or leaves implicit: the in-cluster backend the dashboard talks to, the credential plumbing that makes private repositories work in one command, and the publication validation that gates submissions to the meta-index. Its backend and validator reuse the `cozypkg` authoring and tap workflow (`init`, `push`, `tap`, `untap`) rather than re-invent it. Per-package version pinning remains out of scope, siding with `#18`.
 
 ## Scope and related proposals
 
-`#18` defines the meta-index, the repository-as-unit model, and the `cozypkg` repository commands. `#12` defines the `cozypkg` authoring workflow (`init` / `push`), the `tap` / `untap` semantics, and the metadata-only community index. This proposal modifies neither. It specifies the backend that the dashboard view in `#18` implies, the credential plumbing private taps require, and the CI gate that lets the index accept community submissions safely — reusing `#12`'s `cozypkg tap` (which already creates both the `PackageSource` and its Flux source) and `#12`'s `cozypkg push` validation as the building blocks.
+`#18` defines the meta-index, the repository-as-unit model, and the `cozypkg` repository commands. The `cozypkg` authoring workflow (`init` / `push`), the `tap` / `untap` semantics, and the metadata-only community index were originally proposed in the closed `#12` and shipped in `cozypkg`; this proposal reuses them rather than redefining them. It specifies the backend that the dashboard view in `#18` implies, the credential plumbing private taps require, and the CI gate that lets the index accept community submissions safely, building on `cozypkg tap` (which creates both the `PackageSource` and its Flux source) and the `cozypkg` publish-time validation.
 
 ## Context
 
@@ -49,7 +58,9 @@ Cross-tap dependency resolution with version constraints. Within a single tapped
 
 ### Architecture
 
-Two additions carry the design: the `cozystack-api` marketplace endpoints plus the `TapIndex` cache (blue, new here), and the credential threaded onto the Flux source that a tap already creates. Everything else is the existing `PackageSource` / Flux pipeline `#18` and `#12` describe.
+> **Implemented differently, see decision 0001.** This section proposed a set of `/marketplace/*` HTTP endpoints in `cozystack-api` plus a `TapIndex` cache controller. What shipped instead: the catalog is a cluster-scoped `Tap` resource served through the aggregated Kubernetes API and computed on read, with the materialization done by a controller in the operator, so there is no bespoke endpoint set and no separate cache. The credential-on-the-Flux-source design below did ship as written. The endpoint-and-cache prose is kept here as the original intent; decision 0001 records what replaced it and why.
+
+Two additions carry the design: the `cozystack-api` marketplace endpoints plus the `TapIndex` cache (blue, new here), and the credential threaded onto the Flux source that a tap already creates. Everything else is the existing `PackageSource` / Flux pipeline `#18` describes.
 
 ```mermaid
 flowchart TB
@@ -100,7 +111,7 @@ The dashboard reads marketplace state through a small set of endpoints layered i
 | `POST` | `/marketplace/taps` | Connect a tap: creates the Flux source (with `spec.secretRef` referencing a `Secret` the admin pre-created in `cozy-system`, when private) and the `PackageSource` — the same resources `cozypkg tap` creates. The body carries a `secretRef` (Secret name), not raw credentials (see Security). |
 | `DELETE` | `/marketplace/taps/{name}` | Disconnect a tap; mirrors `cozypkg untap`. Lifecycle of installed `Package` CRs follows `#12` (see below). |
 
-A `TapIndex` cache controller in the same binary watches each tap's Flux source `status.artifact.revision`, pulls the assembled artifact on each revision change, parses the `PackageSource` + `ApplicationDefinition`s it carries, and serves the GET endpoints from memory. Without it, every search would hit OCI per request. Cluster-admin is required for `POST` and `DELETE`, matching both the cluster-scoped `PackageSource` model and `#12`'s "tap requires cluster-admin". `GET` returns catalog metadata only and is open to any authenticated user so tenant-admins can browse; it never returns Secret names or contents (see Security).
+A `TapIndex` cache controller in the same binary watches each tap's Flux source `status.artifact.revision`, pulls the assembled artifact on each revision change, parses the `PackageSource` + `ApplicationDefinition`s it carries, and serves the GET endpoints from memory. Without it, every search would hit OCI per request. Cluster-admin is required for `POST` and `DELETE`, matching the cluster-scoped tap model. `GET` returns catalog metadata only and is open to any authenticated user so tenant-admins can browse; it never returns Secret names or contents (see Security). The shipped `taps` resource keeps exactly this access split: create and delete are admin-only, read is granted to the tenant base roles.
 
 ### Private repository support — credential on the Flux source, not a new CRD field
 
@@ -116,7 +127,7 @@ This is exactly symmetric with `cozystack/cozystack#2472` (merged): that change 
 
 A new `cozypkg validate <repository-url>[@<tag>]` subcommand pulls the artifact (or fails); validates the `PackageSource` and each `ApplicationDefinition` against the published OpenAPI / `cozyvalues-gen` schema — the same validation `#12`'s `cozypkg push` runs at publish time, exposed as a standalone offline command; for each declared component, runs `helm lint` on every `Component.Path`; verifies that every `dependsOn` resolves either inside the same repository or in a known cozystack-shipped source; flags components with `install.privileged: true` so the operator sees a privileged badge in the dashboard before install; and, with `--require-signature`, performs cosign verification (Flux `OCIRepository` artifact verification, as `#12` recommends).
 
-The same logic runs in a GitHub Actions workflow in the index repository (`#18`'s meta-index / `#12`'s `cozystack/packages-index`), triggered on PRs that add or modify an entry. The workflow resolves the entry's OCI ref and tag from the diff, runs the validator, annotates the PR with the report, and blocks merge on hard failures.
+The same logic runs in a GitHub Actions workflow in the index repository, triggered on PRs that add or modify an entry. As built, this exists only as a template under `hack/packages-index` (a validation workflow and an entry-validator script); no live index repository has been created, and the workflow's pinned `cozypkg` version predates the `validate` subcommand it calls. See the main proposal's decision 0002. The workflow resolves the entry's OCI ref and tag from the diff, runs the validator, annotates the PR with the report, and blocks merge on hard failures.
 
 Following krew-index, the gate is two-lane rather than requiring a human on every submission:
 
@@ -169,13 +180,15 @@ The tap API takes a `secretRef` (the name of a `Secret` the admin pre-creates in
 
 Metadata visibility is a boundary to state explicitly, because it is easy to over-read "credentials do not leak" as "a private tap is private". They are different claims. The pull credential stays protected, but the *catalog metadata* of a private tap — package names, tags, descriptions — is visible to every authenticated user through the open `GET /marketplace/*` endpoints, because taps are cluster-scoped. A cluster-admin tapping a private repository must therefore treat its package names and descriptions as visible cluster-wide; only the artifact contents behind the pull credential are protected. Where even that metadata is sensitive in a multi-tenant cluster, the tap carries a `visibility: private` marker on its `PackageSource` and the `GET` endpoints restrict those entries to cluster-admin. Recommended default for multi-tenant clusters: private taps are admin-only in the catalog, public taps stay world-readable.
 
+**As built, this `visibility` marker does not exist.** There is no `visibility` field on `Tap` or `PackageSource`, and the `taps` resource is readable by every authenticated user with no per-tap restriction. So the catalog metadata of a private tap, its package names, tags and descriptions, is cluster-wide visible today; only the pull credential stays protected. Closing this is open work, tracked next to the marketplace privilege model in the 1.7 marketplace epic, and the main proposal's Security section records the same gap.
+
 ## Failure and edge cases
 
 `PackageSource` / `ApplicationDefinition` malformed inside the artifact → cache controller logs the parse error, marks the tap as `Degraded`, and returns the last-known-good payload. Operator sees a clear error in the dashboard.
 
 Secret removed while still referenced → Flux surfaces the failed-pull condition on the source, which the marketplace endpoint forwards.
 
-Tap removed while packages from it remain installed → handled per `#12`'s `cozypkg untap`: warn and require confirmation, reusing the reverse-dependency analysis from `cozypkg del`; already-installed `Package` resources are left in place until explicitly removed. Mechanically, installed `Package` CRs carry no `ownerReference` to the tap's `PackageSource`, so removing the tap never triggers Kubernetes garbage collection of the packages — orphaning is the default by construction, not an active step. A finalizer on the `PackageSource` lets the backend / `cozypkg untap` run the reverse-dependency check and surface the confirmation before the object is actually deleted. The dashboard computes the `OrphanedSource` state by detecting installed `Package`s whose `sourceRef` no longer resolves to a live `PackageSource`, and holds it until the operator re-taps or removes them.
+Tap removed while packages from it remain installed → handled per `#12`'s `cozypkg untap`: warn and require confirmation, reusing the reverse-dependency analysis from `cozypkg del`; already-installed `Package` resources are left in place until explicitly removed. Mechanically, installed `Package` CRs carry no `ownerReference` to the tap's `PackageSource`, so removing the tap never triggers Kubernetes garbage collection of the packages — orphaning is the default by construction, not an active step. A finalizer on the `PackageSource` lets the backend / `cozypkg untap` run the reverse-dependency check and surface the confirmation before the object is actually deleted. The dashboard computes the `OrphanedSource` state by detecting installed `Package`s whose `sourceRef` no longer resolves to a live `PackageSource`, and holds it until the operator re-taps or removes them. As built, the orphaning works as described (user `Package`s keep no owner reference, so garbage collection never reaches them), with one correction: the `apps.cozystack.io/tap-materializer` finalizer that gates teardown sits on the tap's Flux `OCIRepository`, not on the `PackageSource` as the paragraph above says. The `OrphanedSource` surfacing is not implemented: disconnect leaves the packages installed and unmanaged without a dedicated orphaned-state indicator. See decision 0001.
 
 `POST /marketplace/taps` with a `secretRef` pointing at a non-existent Secret → endpoint accepts the request (Flux can recover later when the Secret appears), and the dashboard shows the `Secret not found` condition sourced from Flux.
 
@@ -189,7 +202,7 @@ Independent PRs in cozystack, several landable in parallel. The `--secret` flag 
 
 ## Open questions
 
-Tap-remove lifecycle. Mechanism is specified (no `ownerReference` from `Package` to `PackageSource` so nothing cascades via garbage collection; a `PackageSource` finalizer gates deletion behind the `cozypkg del` reverse-dependency confirmation; `OrphanedSource` is computed from a dangling `sourceRef`). What remains open is policy, not mechanism: whether disconnect should ever offer an opt-in cascade-delete rather than always orphaning. Default proposed: keep installed packages, mark orphaned.
+Tap-remove lifecycle. Mechanism is specified, corrected here to match what shipped: a user `Package` carries no `ownerReference` to the `PackageSource`, so nothing cascades via garbage collection; the `apps.cozystack.io/tap-materializer` finalizer sits on the tap's Flux `OCIRepository`, not on the `PackageSource`, and orders teardown; and the `OrphanedSource` surfacing is not implemented (see decision 0001). What remains open is policy, not mechanism: whether disconnect should ever offer an opt-in cascade-delete rather than always orphaning. Default proposed: keep installed packages.
 
 Endpoint hosting. Marketplace endpoints inside `cozystack-api` versus a new `cozystack-marketplace-controller`. Default proposed: extend `cozystack-api`.
 

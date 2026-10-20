@@ -3,7 +3,15 @@
 - **Title:** `Cozymarketplace — a meta-repository index of community External-Apps repositories`
 - **Author(s):** `@kvaps`
 - **Date:** `2026-06-23`
-- **Status:** Draft
+- **Status:** Accepted
+- **Amended:** `2026-10-20`: reconciled with the shipped implementation; see Decisions.
+
+## Decisions
+
+Newest first. Each record is a settled question with its reasoning; the record is frozen once merged, this proposal keeps evolving.
+
+- [`0002`: There is no in-cluster index and no default index](decisions/0002-no-in-cluster-index-and-no-default-index.md)
+- [`0001`: Tapped repositories keep their own names, and identity comes from a label](decisions/0001-tapped-repositories-keep-their-names-identity-from-a-label.md)
 
 ## Overview
 
@@ -39,7 +47,7 @@ There is no shared, browsable place that answers "which External-Apps repositori
 - **The repository is the versioned unit.** A repository *is* an OCI artifact bundling all of its applications, and that artifact carries a version/tag. The versioned, installable thing is the repository as a whole — not individual packages. This is free: External Apps already ship as versioned OCI artifacts, so a repository inherits versioning by construction. Per-package version pinning remains out of scope (see Non-goals).
 - **`cozypkg` repository commands.** Extend `cozypkg` so an operator can list repositories from the index, refresh the index, and tap (connect) a chosen repository — after which the existing `cozypkg list` / `cozypkg add` flow installs packages from it.
 - **Reuse the existing External-Apps mechanism.** A tapped repository becomes a Flux-connected `PackageSource` exactly like other External Apps — served from the OCI/Flux pipeline, with no new runtime machinery.
-- **Surface the catalog in Cozystack itself**, so operators can install apps from there. In Phase 1 the dashboard's role is administrative — enable/disable a connected repository, not perform installs.
+- **Surface the catalog in Cozystack itself**, so operators can install apps from there. Connecting a repository and installing an app are two separate acts. Connecting registers the repository's apps as catalog metadata and is administrative; installing is a later explicit act that creates a `Package` (via `cozypkg add` or a user resource), reachable from the dashboard too. The shipped split is recorded in the supplementary proposal's decision 0001.
 - **Room for a flatter view.** Nothing prevents also rendering one cross-repository list of which packages exist in which repositories, as a view on top of the index.
 
 ### Non-goals
@@ -47,7 +55,7 @@ There is no shared, browsable place that answers "which External-Apps repositori
 - **Per-package version pinning.** Pinning an *individual package* to a concrete version is out of scope for Phase 1; there is no per-package pinning today and the design proceeds without it. This is distinct from repository-level versioning, which is **in** scope: a repository is a single versioned OCI artifact, so the repository as a whole is versioned even though its individual packages are not separately pinnable.
 - **A commercial / operator marketplace** (Red Hat Marketplace-style, with paid operators). This is a separate, later marketplace, not designed here. The intent is two marketplaces — a community one first (this proposal), a commercial one later.
 - **Automatic cross-repository dependency resolution** between arbitrary community packages. `PackageSource` already supports `dependsOn` within the platform's own sources; generalized community-wide resolution is not part of Phase 1.
-- **Installing from the dashboard.** In Phase 1 installation happens via `cozypkg` under an administrator's authority; the dashboard only enables/disables repositories.
+- **A bespoke marketplace install flow.** Installation reuses the existing `Package`-creation path, the same one that installs any app, rather than a separate marketplace installer. Connecting a repository is the admin step; creating a `Package` from it (through `cozypkg add` or the normal dashboard app-creation flow) is the install step. As built, connecting also writes one tap-managed registration `Package` per source that deploys the catalog registrations (its only install-marked components; the app components carry no install block), so the apps appear before anyone installs them; see the supplementary proposal's decision 0001.
 
 ## Design
 
@@ -55,7 +63,7 @@ Three parts — the meta-repository (index), the repository contract, and the `c
 
 ### 1. The meta-repository (index)
 
-A single git/OCI-hosted index repository, analogous to `krew`'s `krew-index`, with one descriptor per published External-Apps repository. A descriptor declares a name/identifier, where the repository lives (its OCI reference **including the artifact tag/version**), and human-facing metadata (title, description, maintainer) for listings. Because a repository is a single versioned OCI artifact, the index entry's source references a specific tag — that is how a repository is pinned to a version.
+A single git/OCI-hosted index repository, analogous to `krew`'s `krew-index`, with one descriptor per published External-Apps repository. A descriptor declares a name/identifier, where the repository lives (its OCI reference **including the artifact tag/version**), and human-facing metadata (title, description, maintainer) for listings. Because a repository is a single versioned OCI artifact, the index entry's source references a tag. A tag names a version but does not freeze one: OCI tags are mutable, and the connected Flux source follows whatever the tag currently resolves to, re-checking on its sync interval. So a tag selects a version, it does not pin content. As built, `cozypkg tap` sets the source's `spec.ref.tag` and rejects a digest reference outright, so there is no content pin today; digest pinning is left as later work. Calling a tag a pin, below and in the example, is loose wording for "selects a version."
 
 ```yaml
 # index entry — illustrative shape, not a fixed schema
@@ -115,7 +123,7 @@ flowchart LR
 ## User-facing changes
 
 - **CLI (`cozypkg`):** new repository-level commands (list/update the index, tap a repository) on top of the existing `add`/`del`/`list`/`dependencies`.
-- **Dashboard:** a marketplace view listing available repositories, letting an administrator enable or disable a connected repository. No installs from the dashboard in Phase 1.
+- **Dashboard:** a marketplace view listing available repositories, where an administrator connects or disconnects a repository. Installing an app from a connected repository uses the normal app-creation flow, the same as any other app; there is no separate marketplace install action.
 - **New public artifact:** the meta-repository index itself, which the community publishes into.
 - **No change** to how tenants consume already-installed apps; this is an admin-facing discovery/installation surface.
 
@@ -128,16 +136,17 @@ Because a repository is a single versioned OCI artifact, upgrade and rollback ar
 ## Security
 
 - **New trust boundary:** tapping a third-party repository runs that repository's charts in the operator's cluster. The index is a discovery surface, not an endorsement — listing does not imply Aenix vouches for a repository's contents, and the UI must make that explicit.
-- **Authority model:** installation happens via `cozypkg` under an administrator's authority; the marketplace surface is admin-only, consistent with today's admin-only package interface.
-- **RBAC / access control:** who may add or enable repositories. Phase 1 keeps it simple — admin authority for install/enable — and defers fine-grained delegation. (Open question.)
-- **Private repositories / credentials:** supporting private repositories (and threading a pull secret through to the connected package source) is a later refinement, not part of Phase 1. (Open question.)
+- **Authority model, as built:** connecting and disconnecting a repository creates and deletes a cluster-scoped `Tap`, which requires cluster-admin. Reading the catalog does not: the `taps` resource is granted `get`/`list`/`watch` to the tenant base roles, so any authenticated user can browse what is connected. Installing an app is the normal app-creation path under its usual authority. So the mutating surface is admin-only; the catalog surface is not.
+- **Catalog metadata is cluster-wide readable, and there is no per-tap visibility control.** Because `taps` is cluster-scoped and tenant-readable, the catalog metadata of every connected repository, including a private one, is visible to every authenticated user: names, descriptions, tags, the privileged badge. Only the pull credential is protected, as a `secretRef` that read responses never return. The supplementary proposal describes a `visibility: private` marker to restrict sensitive metadata; it is not built. Treat the package names and descriptions of any connected repository as cluster-wide visible. This gap sits next to the privilege-model work tracked in the 1.7 marketplace epic.
+- **Connecting verifies no signature.** Tapping checks the artifact's structure and its content digest, but does not verify a cosign signature; `spec.verify` is not set on the connected source. Signature verification lives at publication time instead, in `cozypkg validate --require-signature` and the index CI gate, not on the connect path. A cluster-admin connecting a repository is trusting its publisher directly.
+- **Private repositories / credentials:** supported through a pull `Secret` the admin pre-creates, referenced by `secretRef` on the connected Flux source at tap time (see the supplementary proposal). The credential stays inside Flux's RBAC and is never returned by the API; only the catalog metadata is exposed, per the bullet above.
 
 ## Failure and edge cases
 
 - **Index entry points at an unreachable / invalid source →** tap fails; the resulting `PackageSource` / Flux source surfaces the error on its status, like a broken External App today.
 - **Repository chart fails to template or install →** Flux `HelmRelease` reports the failure; no different from a normal External App install failure.
-- **Operator disables a repository that has installed packages →** the connected source is disabled; already-installed packages remain until explicitly removed (`cozypkg del`). (Exact behavior to confirm.)
-- **Two repositories expose a package with the same name →** name collision across repositories. With the repository as the unit, a package is addressed within its repository; a global flat view must disambiguate by repository. (Identifier namespacing is an open question.)
+- **Operator disables a repository that has installed packages →** the connected source is removed; already-installed packages are left running and become unmanaged until explicitly removed (`cozypkg del`) or the repository is tapped again. This is now settled, not orphan by accident: disconnect deletes only the tap-managed registration `Package`, the `PackageSource`, and the Flux source, in that order, and a user-installed `Package` carries no owner reference back to the source, so garbage collection never reaches it. A finalizer on the tap's Flux source (`OCIRepository`), not on the `PackageSource`, holds it until the materialized `PackageSource`s are cleaned up, so teardown is ordered rather than racing deletion.
+- **Two repositories expose a package with the same name →** name collision across repositories. This is now settled: a tapped repository keeps its own declared `PackageSource` names, with no `community.` prefix, and identity is carried by the `apps.cozystack.io/marketplace-tap` label rather than by a name prefix. A name that collides with an existing core component, or with another repository's source, is refused at connect time instead of overwriting it. See decision 0001.
 
 ## Testing
 
@@ -152,13 +161,19 @@ Because a repository is a single versioned OCI artifact, upgrade and rollback ar
 
 ## Open questions
 
-- **Concrete index schema and resource kind.** What an index entry looks like, and whether the connected repository is a dedicated CRD or reuses `PackageSource` directly.
-- **`cozypkg` verb naming.** Final names for the repository-level subcommands (`tap` vs `repo add`, etc.).
-- **Per-package versioning.** Repository-level versioning is settled (a repository is a versioned OCI artifact — in scope). Whether Phase 1 ships without *per-package* pinning is the open point.
-- **Publication validation.** Whether and what CI gate validates a submitted repository before it appears in the index (Helm template/lint, structure checks).
-- **Private repositories and credentials.** How to support private repositories and thread a pull secret through `cozypkg` and the connected source.
-- **Namespacing / identity for repositories.** How repository identifiers stay globally unique (e.g. anchoring on an external identity such as a GitHub org).
+Several questions this proposal opened are now settled; they are recorded as decisions rather than left here.
+
+- **Connected-repository shape.** Settled: the connected repository reuses `PackageSource`, and the `Tap` that represents it is a read-only computed view, not stored state. See the supplementary proposal's decision 0001.
+- **`cozypkg` verb naming.** Settled: the repository-level subcommands shipped as `tap` and `untap`.
+- **Namespacing / identity for repositories.** Settled: identity is a label, not a name prefix, and name collisions are refused. See decision 0001.
+- **The index itself.** Settled for now: there is no in-cluster index and no default index repository; the publication side exists only as a CI template. See decision 0002.
+
+Still open:
+
+- **Per-package versioning.** Repository-level versioning is settled (a repository is a versioned OCI artifact, in scope). Whether to add *per-package* pinning is still open, deferred unless a concrete case appears.
+- **Content pinning by digest.** A tag selects a version but does not freeze content; connecting by digest is rejected today. Whether to support a digest pin is open.
 - **Dependencies across community packages.** Whether and how `dependsOn`-style dependencies generalize beyond a single repository.
+- **Per-tap metadata visibility.** Catalog metadata is cluster-wide readable today, and there is no `visibility` control. Whether to add one, and how it relates to the marketplace privilege model, is open (see Security).
 
 ## Alternatives considered
 
