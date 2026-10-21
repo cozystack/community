@@ -1,9 +1,9 @@
 # 0001. Tapped repositories keep their own names, and identity comes from a label
 
 - **Number:** `0001`
-- **Date:** `2026-09-07`
+- **Date:** `2026-08-31`
 - **Status:** Accepted
-- **Deciders:** `@IvanHunters, @kvaps`
+- **Deciders:** `@IvanHunters`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940)
 - **Implemented in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940), kind ownership in [`cozystack/cozystack#4424`](https://github.com/cozystack/cozystack/pull/4424)
@@ -16,7 +16,7 @@ Three ways out were put on the table in the pull request ([comment](https://gith
 
 ## Decision
 
-A tapped repository keeps its own declared `PackageSource` names, with no `community.` prefix. Tap identity is carried by the `apps.cozystack.io/marketplace-tap` label, not by a name prefix. A `PackageSource` name that collides with an existing core component, or with another repository's source that is not this one's own materialization, is refused at connect time rather than overwritten, enforced both in `cozypkg tap` and in the operator's materializer. `ApplicationDefinition` kind ownership is handled separately: the oldest definition owns a kind, and a second definition claiming the same kind is refused by an admission webhook ([`#4424`](https://github.com/cozystack/cozystack/pull/4424)).
+A tapped repository keeps its own declared `PackageSource` names, with no `community.` prefix. Tap identity is carried by the `apps.cozystack.io/marketplace-tap` label, not by a name prefix. An exact `PackageSource` name that collides with an existing core component, or with another repository's source that is not this one's own materialization, is refused at connect time rather than overwritten, enforced both in `cozypkg tap` and in the operator's materializer (`collision.PackageSourceName`). This check is on the exact name only; it does not cover the other ways a tapped name can still collide, listed under Consequences. `ApplicationDefinition` kind ownership is handled separately: the oldest definition owns a kind, and a second definition claiming the same kind is refused by an admission webhook ([`#4424`](https://github.com/cozystack/cozystack/pull/4424)).
 
 ## Why not the alternatives
 
@@ -28,8 +28,9 @@ The three were argued in [the pull request comment](https://github.com/cozystack
 
 ## Consequences
 
-- There is no automatic namespacing. A tapped repository cannot share a `PackageSource` name with a core component or another tapped source; the collision is refused at connect, and resolving it means renaming upstream.
-- Kind ownership is first-come. Because the oldest `ApplicationDefinition` owns a kind and a later one is refused, a tapped repository that registers a kind before the platform ships the same kind keeps it, and the platform's later definition is the one refused. Platform definitions do not automatically win. This inversion, and the related cases of a name the platform adds later and the dashed form of a reserved name, are the known residual gaps, tracked as the kind-ownership-by-origin item in the 1.7 marketplace epic.
+- There is no automatic namespacing. A tapped repository cannot share an exact `PackageSource` name with a core component or another tapped source; the collision is refused at connect, and resolving it means renaming upstream.
+- The exact-name check does not catch every collision. Two names collapse in the artifact layer because `naming.ArtifactName` turns `.` into `-`, so `cozystack.x` and `cozystack-x` map to the same `ExternalArtifact` name; and a component's release name can still clash with a platform `HelmRelease`. Neither is refused by the exact `PackageSource`-name check. These are known gaps, tracked as [`cozystack/cozystack#4977`](https://github.com/cozystack/cozystack/issues/4977) and [`cozystack/cozystack#4975`](https://github.com/cozystack/cozystack/issues/4975).
+- Kind ownership is first-come. Because the oldest `ApplicationDefinition` owns a kind and a later one is refused, a tapped repository that registers a kind before the platform ships the same kind keeps it, and the platform's later definition is the one refused. Platform definitions do not automatically win. This inversion, and the related cases of a name the platform adds later and the dashed form of a reserved name, are the known residual gaps, tracked as the kind-ownership-by-origin item in the 1.7 marketplace epic ([`cozystack/cozystack#4981`](https://github.com/cozystack/cozystack/issues/4981)).
 - The `community.` prefix agreed in the original design is gone from `PackageSource` names. The only prefix that remains is on the Flux source object the tap creates (`tap-<org>-<repo>`), which is not the `PackageSource` name.
 
 ## Revisit if

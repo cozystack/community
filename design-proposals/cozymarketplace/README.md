@@ -55,7 +55,7 @@ There is no shared, browsable place that answers "which External-Apps repositori
 - **Per-package version pinning.** Pinning an *individual package* to a concrete version is out of scope for Phase 1; there is no per-package pinning today and the design proceeds without it. This is distinct from repository-level versioning, which is **in** scope: a repository is a single versioned OCI artifact, so the repository as a whole is versioned even though its individual packages are not separately pinnable.
 - **A commercial / operator marketplace** (Red Hat Marketplace-style, with paid operators). This is a separate, later marketplace, not designed here. The intent is two marketplaces — a community one first (this proposal), a commercial one later.
 - **Automatic cross-repository dependency resolution** between arbitrary community packages. `PackageSource` already supports `dependsOn` within the platform's own sources; generalized community-wide resolution is not part of Phase 1.
-- **A bespoke marketplace install flow.** Installation reuses the existing `Package`-creation path, the same one that installs any app, rather than a separate marketplace installer. Connecting a repository is the admin step; creating a `Package` from it (through `cozypkg add` or the normal dashboard app-creation flow) is the install step. As built, connecting also writes one tap-managed registration `Package` per source that deploys the catalog registrations (its only install-marked components; the app components carry no install block), so the apps appear before anyone installs them; see the supplementary proposal's decision 0001.
+- **A bespoke marketplace install flow.** Installation reuses the existing `Package`-creation path, the same one that installs any app, rather than a separate marketplace installer. Connecting a repository is the admin step; creating a `Package` from it (through `cozypkg add` or the normal dashboard app-creation flow) is the install step. As built, connecting also writes one tap-managed registration `Package` per source that deploys the catalog registrations (its only install-marked components; the app components carry no install block), so the apps appear before anyone installs them; see the supplementary proposal's decision 0001. That registration runs as Flux's cluster-admin identity, and only `privileged` components wait for confirmation. What connect installs, under which identity, and what the privilege gate covers is a security question that is not settled (see Intended guarantees and Open questions).
 
 ## Design
 
@@ -63,7 +63,7 @@ Three parts — the meta-repository (index), the repository contract, and the `c
 
 ### 1. The meta-repository (index)
 
-A single git/OCI-hosted index repository, analogous to `krew`'s `krew-index`, with one descriptor per published External-Apps repository. A descriptor declares a name/identifier, where the repository lives (its OCI reference **including the artifact tag/version**), and human-facing metadata (title, description, maintainer) for listings. Because a repository is a single versioned OCI artifact, the index entry's source references a tag. A tag names a version but does not freeze one: OCI tags are mutable, and the connected Flux source follows whatever the tag currently resolves to, re-checking on its sync interval. So a tag selects a version, it does not pin content. As built, `cozypkg tap` sets the source's `spec.ref.tag` and rejects a digest reference outright, so there is no content pin today; digest pinning is left as later work. Calling a tag a pin, below and in the example, is loose wording for "selects a version."
+A single git/OCI-hosted index repository, analogous to `krew`'s `krew-index`, with one descriptor per published External-Apps repository. A descriptor declares a name/identifier, where the repository lives (its OCI reference **including the artifact tag/version**), and human-facing metadata (title, description, maintainer) for listings. Because a repository is a single versioned OCI artifact, the index entry's source references a tag. A tag names a version but does not freeze one: OCI tags are mutable, and the connected Flux source follows whatever the tag currently resolves to, re-checking on its sync interval. So a tag selects a version, it does not pin content. As built, `cozypkg tap` sets the source's `spec.ref.tag` and rejects a digest reference outright, so there is no content pin today; digest pinning is left as later work. The connected source then polls every 5 minutes and uses `latest` when no tag is given, so a publisher moving the tag changes what the cluster runs with no admin action. Following the tag this way is a known gap, not a deliberate guarantee (see Intended guarantees and [#4979](https://github.com/cozystack/cozystack/issues/4979)). Reconnecting a repository through the aggregated API replaces the source spec wholesale, while the CLI re-tap applies with server-side apply.
 
 ```yaml
 # index entry — illustrative shape, not a fixed schema
@@ -75,7 +75,7 @@ spec:
   source:
     # An External-Apps repository served the same way as today's platform
     # sources (OCIRepository / package-source pipeline). The repository is one
-    # versioned OCI artifact bundling all its apps; the tag pins the version.
+    # versioned OCI artifact bundling all its apps; the tag names the version.
     url: oci://ghcr.io/aenix-io/cozystack-apps
     tag: v1.5.0          # repository-artifact version (the versioned unit)
   maintainer: Aenix
@@ -96,7 +96,7 @@ Extend the existing `cozypkg` CLI (`add`, `del`, `list`, `dependencies`) with re
 
 - **list repositories** — read the index and show available repositories.
 - **refresh the index** — re-pull the index.
-- **tap `<repository>`** — connect a chosen repository to the current cluster, creating the package source. Tapping can target a **specific repository version** (the OCI artifact tag); upgrading means moving to a newer version, rollback means re-pinning to a previous tag.
+- **tap `<repository>`** — connect a chosen repository to the current cluster, creating the package source. Tapping can target a **specific repository version** (the OCI artifact tag); upgrading means moving to a newer version, rollback means re-selecting a previous tag.
 - then the existing flow: `cozypkg list` shows packages from tapped repositories, `cozypkg add <package>` installs one.
 
 ```text
@@ -104,7 +104,7 @@ Extend the existing `cozypkg` CLI (`add`, `del`, `list`, `dependencies`) with re
 cozypkg repo list                 # list repositories from the meta-index
 cozypkg repo update               # refresh the index
 cozypkg tap aenix-apps            # connect a repository (latest tag) to this cluster
-cozypkg tap aenix-apps@v1.5.0     # pin the repository to a specific OCI artifact version
+cozypkg tap aenix-apps@v1.5.0     # select a specific OCI artifact version (a tag, which can move)
 cozypkg list                      # packages available from tapped repos
 cozypkg add <package>             # install a package
 ```
@@ -131,7 +131,7 @@ flowchart LR
 
 Additive. The marketplace builds on the existing `PackageSource` / `Package` / `OCIRepository` / Flux pipeline and the `cozypkg` CLI; clusters that never tap a community repository behave exactly as before. Tapping creates standard package-source manifests, so removing the feature degrades to "wire up a package source by hand," which already works. Disabling or removing a tapped repository disables its package source (dashboard control or `cozypkg del`).
 
-Because a repository is a single versioned OCI artifact, upgrade and rollback are repository-level operations: upgrading points a tapped repository at a newer artifact version (tag), rollback re-pins it to a previous tag. There is no per-package upgrade/rollback in Phase 1 — the whole repository moves as a unit, consistent with the "tested together" guarantee.
+Because a repository is a single versioned OCI artifact, upgrade and rollback are repository-level operations: upgrading points a tapped repository at a newer artifact version (tag), rollback re-selects a previous tag, which restores the previous content only if that tag has not been moved. There is no per-package upgrade/rollback in Phase 1 — the whole repository moves as a unit, consistent with the "tested together" guarantee.
 
 ## Security
 
@@ -141,11 +141,24 @@ Because a repository is a single versioned OCI artifact, upgrade and rollback ar
 - **Connecting verifies no signature.** Tapping checks the artifact's structure and its content digest, but does not verify a cosign signature; `spec.verify` is not set on the connected source. Signature verification lives at publication time instead, in `cozypkg validate --require-signature` and the index CI gate, not on the connect path. A cluster-admin connecting a repository is trusting its publisher directly.
 - **Private repositories / credentials:** supported through a pull `Secret` the admin pre-creates, referenced by `secretRef` on the connected Flux source at tap time (see the supplementary proposal). The credential stays inside Flux's RBAC and is never returned by the API; only the catalog metadata is exposed, per the bullet above.
 
+## Intended guarantees and what holds today
+
+These are the security-relevant properties the design means to hold, and how far the shipped code meets each. "Holds today" is read from `main`; a row that depends on runtime behaviour not exercised on a cluster says so, so follow-up fixes can point at this table.
+
+| Intended guarantee | Holds today |
+| --- | --- |
+| Connecting a repository installs nothing without admin confirmation | Partly. Connecting is admin-only, but it does install: the operator creates one tap-managed registration `Package` per source, whose `-rd` components render the repository's `ApplicationDefinition`s as Flux's default (cluster-admin) identity, with no `serviceAccountName` set. Only components marked `privileged` wait for `--allow-privileged`; the rest install on connect with no separate confirmation. The privilege model here is not settled ([#4358](https://github.com/cozystack/cozystack/issues/4358), [#4359](https://github.com/cozystack/cozystack/issues/4359), [#4978](https://github.com/cozystack/cozystack/issues/4978)). |
+| Disconnecting does not break running apps | Partly. User-installed apps are left running. But disconnect deletes the registration `Package` first, which garbage-collects its HelmReleases and the `ApplicationDefinition`s they rendered; once an `ApplicationDefinition` is gone, that kind is dropped from the aggregated apps API on the next cozystack-api rollout, so existing tenant instances of that kind lose their API. The same happens when a publisher revision drops a `PackageSource` and the materializer prunes it. Read from code, not run on a cluster ([#4980](https://github.com/cozystack/cozystack/issues/4980)). |
+| A tap cannot take over platform objects (names, kinds, releases) | Partly. An exact `PackageSource` name clashing with a core component is refused. Not caught: artifact names collapse `.` to `-` (so `cozystack.x` and `cozystack-x` map to one `ExternalArtifact`), a component release name can clash with a platform `HelmRelease`, and kind ownership is first-come, so a tap that registers a kind before the platform keeps it ([#4975](https://github.com/cozystack/cozystack/issues/4975), [#4977](https://github.com/cozystack/cozystack/issues/4977); kind ownership in [#4981](https://github.com/cozystack/cozystack/issues/4981)). |
+| Content stays put until an admin moves it | No. The connected source follows a moving tag on a 5-minute interval and defaults to `latest` when no tag is given, so whatever the publisher pushes to that tag is pulled automatically; a digest reference is rejected. Reconnecting through the aggregated API also replaces the source spec wholesale, while the CLI re-tap uses server-side apply. Digest pinning is open ([#4979](https://github.com/cozystack/cozystack/issues/4979)). |
+
+None of these is a hard guarantee yet. Treat the gaps as the marketplace's current security posture, tracked under the 1.7 marketplace epic ([#4981](https://github.com/cozystack/cozystack/issues/4981)).
+
 ## Failure and edge cases
 
 - **Index entry points at an unreachable / invalid source →** tap fails; the resulting `PackageSource` / Flux source surfaces the error on its status, like a broken External App today.
 - **Repository chart fails to template or install →** Flux `HelmRelease` reports the failure; no different from a normal External App install failure.
-- **Operator disables a repository that has installed packages →** the connected source is removed; already-installed packages are left running and become unmanaged until explicitly removed (`cozypkg del`) or the repository is tapped again. This is now settled, not orphan by accident: disconnect deletes only the tap-managed registration `Package`, the `PackageSource`, and the Flux source, in that order, and a user-installed `Package` carries no owner reference back to the source, so garbage collection never reaches it. A finalizer on the tap's Flux source (`OCIRepository`), not on the `PackageSource`, holds it until the materialized `PackageSource`s are cleaned up, so teardown is ordered rather than racing deletion.
+- **Operator disables a repository that has installed packages →** the connected source is removed; already-installed packages are left running and become unmanaged until explicitly removed (`cozypkg del`) or the repository is tapped again. This is now settled, not orphan by accident: disconnect deletes only the tap-managed registration `Package`, the `PackageSource`, and the Flux source, in that order, and a user-installed `Package` carries no owner reference back to the source, so garbage collection never reaches it. Deleting the registration `Package` does cascade, though: it garbage-collects that `Package`'s HelmReleases and the `ApplicationDefinition`s they rendered, so the app's kind is dropped from the aggregated apps API on the next cozystack-api rollout, and existing tenant instances of that kind lose their API until the repository is tapped again. The same cascade runs when a publisher revision drops a `PackageSource` and the materializer prunes it. That effect on tenant instances is read from code, not run on a cluster, and is not fully settled ([#4980](https://github.com/cozystack/cozystack/issues/4980)). A finalizer on the tap's Flux source (`OCIRepository`), not on the `PackageSource`, holds it until the materialized `PackageSource`s are cleaned up, so teardown is ordered rather than racing deletion.
 - **Two repositories expose a package with the same name →** name collision across repositories. This is now settled: a tapped repository keeps its own declared `PackageSource` names, with no `community.` prefix, and identity is carried by the `apps.cozystack.io/marketplace-tap` label rather than by a name prefix. A name that collides with an existing core component, or with another repository's source, is refused at connect time instead of overwriting it. See decision 0001.
 
 ## Testing
@@ -174,9 +187,10 @@ Still open:
 - **Content pinning by digest.** A tag selects a version but does not freeze content; connecting by digest is rejected today. Whether to support a digest pin is open.
 - **Dependencies across community packages.** Whether and how `dependsOn`-style dependencies generalize beyond a single repository.
 - **Per-tap metadata visibility.** Catalog metadata is cluster-wide readable today, and there is no `visibility` control. Whether to add one, and how it relates to the marketplace privilege model, is open (see Security).
+- **Privilege model on connect.** Connecting installs the registration components as Flux's cluster-admin identity, and only `privileged` components gate on `--allow-privileged`. What the gate should cover, whether catalog registration should install anything before an explicit install, and whether a handed-over package can escalate on a later revision, are open ([#4978](https://github.com/cozystack/cozystack/issues/4978), [#4358](https://github.com/cozystack/cozystack/issues/4358), [#4359](https://github.com/cozystack/cozystack/issues/4359)).
 
 ## Alternatives considered
 
 - **Marketplace of individual packages (package-centric, AUR-style).** Publish individual packages with a web form / JSON descriptor pointing at a git repo, collected into one flat catalog. This is a "repository of packages" rather than a "repository of repositories"; it could itself be one more entry in the index rather than the primary model, since the repository-as-unit gives a "tested together" guarantee a loose package catalog does not.
 - **Standalone SaaS marketplace (Artifact Hub-style) vs. in-product.** A separate hosted site where users browse packages and copy install instructions, versus surfacing the marketplace inside Cozystack. This proposal prioritizes the in-product/CLI path so operators install directly; the two are not mutually exclusive — an external browsable view can sit on top of the same index.
-- **Per-package version-pinned dependency graph up front.** Building per-package versioning and dependency resolution into Phase 1. Rejected: per-package pinning does not exist today and the design can proceed without it; adding it now expands scope before the core repository-index model is proven. Repository-level versioning is still adopted (a repository is a single versioned OCI artifact, pinned/upgraded/rolled back as a whole).
+- **Per-package version-pinned dependency graph up front.** Building per-package versioning and dependency resolution into Phase 1. Rejected: per-package pinning does not exist today and the design can proceed without it; adding it now expands scope before the core repository-index model is proven. Repository-level versioning is still adopted (a repository is a single versioned OCI artifact, selected, upgraded and rolled back as a whole).

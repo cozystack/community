@@ -1,9 +1,9 @@
 # 0001. A Tap is a computed view, and the materializer runs in the operator
 
 - **Number:** `0001`
-- **Date:** `2026-09-07`
+- **Date:** `2026-09-02`
 - **Status:** Accepted
-- **Deciders:** `@IvanHunters, @kvaps`
+- **Deciders:** `@IvanHunters`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940)
 - **Implemented in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940), [`cozystack/cozystack#4308`](https://github.com/cozystack/cozystack/pull/4308)
@@ -28,8 +28,8 @@ The catalog is a cluster-scoped `Tap` resource served through the aggregated Kub
 - No cache to invalidate and no endpoint surface to keep in step with the CRDs: a read recomputes from the live `PackageSource` and the artifact metadata. The cost is paid per read rather than amortised in a cache.
 - Because the catalog is the cluster-scoped `taps` resource, it inherits Kubernetes RBAC directly: create and delete are admin-only, read is granted to the tenant base roles. That is also why catalog metadata is cluster-wide readable (see the proposal's Security section).
 - Two properties this proposal's re-approval ([`cozystack/community#23` review](https://github.com/cozystack/community/pull/23#pullrequestreview-5007756943)) listed were not built, and are not planned as part of this record:
-  - **`visibility: private`.** There is no `visibility` field on `Tap` or `PackageSource`; catalog metadata of a private tap is readable by every authenticated user, only the pull credential is protected. Reason: the computed-view model has no place to enforce a per-tap read restriction without the bespoke endpoints that were dropped, so the control was deferred with the endpoints rather than reintroduced on its own.
-  - **An `OrphanedSource` indicator.** Orphaning on disconnect works as designed (a user `Package` keeps no owner reference back to the source, and a `apps.cozystack.io/tap-materializer` finalizer gates deletion), but no dedicated orphaned-state condition is surfaced. Reason: the orphaning is the safe default on its own, and the indicator was not load-bearing for it.
+  - **`visibility: private`.** There is no `visibility` field on `Tap` or `PackageSource`; catalog metadata of a private tap is readable by every authenticated user, only the pull credential is protected. This was not a recorded decision: the marker depended on the dropped endpoints and simply did not ship with them. Read it as "dropped together with the endpoints", not as a choice to keep private metadata world-readable; whether to add the control back is open, next to the privilege-model work in the 1.7 marketplace epic ([`cozystack/cozystack#4981`](https://github.com/cozystack/cozystack/issues/4981)).
+  - **An `OrphanedSource` indicator.** Orphaning on disconnect works (a user `Package` keeps no owner reference back to the source, and the `apps.cozystack.io/tap-materializer` finalizer on the tap's Flux `OCIRepository` orders teardown), but no dedicated orphaned-state condition is surfaced. This too was not a recorded decision: the surfacing was not built, and the orphaning does not depend on it.
 - The credential-on-the-Flux-source design (a `secretRef` on the source the tap creates, the admin pre-creating the `Secret` in `cozy-system`) did ship as the proposal wrote it.
 
 ## Revisit if
