@@ -23,6 +23,15 @@ NVIDIA's vGPU stack changes quickly. Within the last few releases the driver bra
 
 ## Decisions
 
+- [0008. The GPU controller gets its node-label and plugin-restart rights with the host layer, not before](./decisions/0008-the-controller-gets-its-host-layer-rights-with-the-host-layer.md)
+- [0007. Whoever can write a VM orders its template devices, while held devices stay with tenant admins](./decisions/0007-whoever-can-write-a-vm-orders-its-template-devices.md)
+- [0006. A `Stay` pin holds through `NotReady` and taints, and breaks when the node cannot serve the device](./decisions/0006-a-stay-pin-yields-only-to-a-node-that-cannot-serve-the-device.md)
+- [0005. The taint rule skips exactly the three taints that mirror a cordon or readiness](./decisions/0005-the-taint-rule-skips-exactly-three-kubernetes-taints.md)
+- [0004. GPUNode health is what kubelet lists as allocatable, and the node reports its GPU resource names and per-function counts](./decisions/0004-gpunode-health-is-kubelet-allocatability.md)
+- [0003. The usage-monitor label reservation is always on, and it ratchets](./decisions/0003-the-usage-monitor-label-reservation-is-always-on-and-ratchets.md)
+- [0002. GPUDevice works only where gpu-operator serves GPUs to VMs, while its finalizers and usage records always run](./decisions/0002-gpudevice-serves-vms-only-where-gpu-operator-serves-gpus-to-vms.md)
+- [0001. A device whose class resource name KubeVirt does not permit is refused at VMI admission](./decisions/0001-a-device-outside-permittedhostdevices-is-refused-at-admission.md)
+
 ## Context
 
 ### What exists
