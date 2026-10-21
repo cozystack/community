@@ -98,7 +98,7 @@ spec:
     mtu: 9000                 # optional override
 ```
 
-The CRD carries CEL validations: `vlan` in 1..4094 and never equal to `uplinkVLAN`; `vlan` unique within the zone; (`namespace`, `name`) unique within the zone; `uplinkBridges` never contains `bridge`. The package chart refuses two zones on one bridge and the same (`namespace`, `name`) in two zones. There is no status: the zone is the admin's statement, nothing reports on it.
+The CRD carries CEL validations: `vlan` in 1..4094 and never equal to `uplinkVLAN`; `vlan` unique within the zone; `uplinkBridges` never contains `bridge`. (`namespace`, `name`) is the list-map key of `networks` (`x-kubernetes-list-type: map`), so the apiserver keeps it unique without a CEL rule whose cost would grow with the square of the table. The package chart refuses two zones on one bridge and the same (`namespace`, `name`) in two zones. There is no status: the zone is the admin's statement, nothing reports on it.
 
 ### IP pool
 
