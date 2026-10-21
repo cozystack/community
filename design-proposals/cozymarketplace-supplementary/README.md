@@ -16,6 +16,10 @@ Newest first. Records are frozen once merged; this proposal keeps evolving.
 
 > **Note on `#12`.** An earlier draft of this proposal built on `cozystack/community#12`, which was closed, with its author's note that `init` and `push` would be carried into `#18`. They were not folded into `#18`'s text, but they did ship: `cozypkg` on `main` carries `tap`, `untap`, `init`, `push`, `validate` and `search`. This proposal no longer depends on `#12`; where it needs those commands it refers to what shipped.
 
+## How these proposals relate
+
+This feature is described across two proposals. The main `#18` defines the meta-index, the repository-as-unit model, and the `cozypkg` repository commands, and answers the index, naming, and the connect and disconnect lifecycle. `#23` (this one, supplementary) answers the in-cluster backend shape, private-repository credentials, and publication validation. They cross-link, and consolidating them into a single proposal is planned as a follow-up.
+
 ## Overview
 
 This proposal is supplementary, not competing, to `#18`. It accepts the repository-centric model — the install and version unit is the External-Apps repository as a versioned OCI artifact — and fills in three concrete pieces that `#18` lists as open questions or leaves implicit: the in-cluster backend the dashboard talks to, the credential plumbing that makes private repositories work in one command, and the publication validation that gates submissions to the meta-index. Its backend and validator reuse the `cozypkg` authoring and tap workflow (`init`, `push`, `tap`, `untap`) rather than re-invent it. Per-package version pinning remains out of scope, siding with `#18`.
@@ -101,6 +105,8 @@ flowchart TB
 
 ### Backend endpoints in `cozystack-api`
 
+> **Superseded by decision 0001.** The `/marketplace/*` endpoints and the `TapIndex` cache in this subsection were not built; the catalog is a computed `Tap` served through the aggregated API. This, and the `/marketplace/*` and `TapIndex` mentions further down (in Upgrade and rollback, Rollout, Failure and edge cases, and Testing), are kept as the original intent.
+
 The dashboard reads marketplace state through a small set of endpoints layered into `cozystack-api`, which already mediates dashboard access to platform CRs and existing auth/RBAC. No new component, no new CRDs — the marketplace state is fully derived from the `PackageSource` resources on the cluster plus the `ApplicationDefinition`s and chart metadata inside each tapped artifact (the shape `#18` and `#12` already define; no new `marketplace.yaml` file is introduced).
 
 | Method | Path | Purpose |
@@ -184,6 +190,8 @@ Metadata visibility is a boundary to state explicitly, because it is easy to ove
 
 ## Failure and edge cases
 
+> Superseded by decision 0001 where these reference the `/marketplace/*` endpoints or the `TapIndex` cache: the shipped equivalent surfaces the same condition on the computed `Tap` resource rather than through a cache controller.
+
 `PackageSource` / `ApplicationDefinition` malformed inside the artifact → cache controller logs the parse error, marks the tap as `Degraded`, and returns the last-known-good payload. Operator sees a clear error in the dashboard.
 
 Secret removed while still referenced → Flux surfaces the failed-pull condition on the source, which the marketplace endpoint forwards.
@@ -194,17 +202,17 @@ Tap removed while packages from it remain installed → handled by `cozypkg unta
 
 ## Testing
 
-Unit: new endpoints against a fake k8s client; cache controller refresh logic against a fake OCI source; `cozypkg validate` golden-output tests against fixture repositories, both valid and intentionally broken. Integration: end-to-end test that taps a fixture private OCI repository with a `dockerconfigjson` Secret on a kind cluster and verifies the dashboard endpoint surfaces the parsed packages. CI workflow is exercised on a fixture entry pointing at `cozystack/external-apps-example`.
+Unit: new endpoints against a fake k8s client; cache controller refresh logic against a fake OCI source (both superseded by decision 0001; the shipped equivalent tests the computed `Tap` resource); `cozypkg validate` golden-output tests against fixture repositories, both valid and intentionally broken. Integration: end-to-end test that taps a fixture private OCI repository with a `dockerconfigjson` Secret on a kind cluster and verifies the dashboard endpoint surfaces the parsed packages. CI workflow is exercised on a fixture entry pointing at `cozystack/external-apps-example`.
 
 ## Rollout
 
-Independent PRs in cozystack, several landable in parallel. The `--secret` flag on `cozypkg tap` plus the `secretRef` handling in the backend `POST` (small; sets a field on the already-created Flux source, no CRD change, no migration) and `cozypkg validate` plus the CI workflow (~600 LOC Go and ~200 LOC YAML/shell) can land before or after `#18` / `#12`. The marketplace endpoints in `cozystack-api` (~400 LOC Go) and the `TapIndex` cache controller (~300 LOC Go) consume the `PackageSource` / `ApplicationDefinition` shape and depend on `#18` / `#12` landing first. The external static catalog is a separate proposal under Aenix maintenance; designed-only here.
+Independent PRs in cozystack, several landable in parallel. The `--secret` flag on `cozypkg tap` plus the `secretRef` handling in the backend `POST` (small; sets a field on the already-created Flux source, no CRD change, no migration) and `cozypkg validate` plus the CI workflow (~600 LOC Go and ~200 LOC YAML/shell) can land before or after `#18` / `#12`. The marketplace endpoints in `cozystack-api` (~400 LOC Go) and the `TapIndex` cache controller (~300 LOC Go) consume the `PackageSource` / `ApplicationDefinition` shape and depend on `#18` / `#12` landing first. (Superseded by decision 0001: neither was built; the catalog ships as a computed `Tap`.) The external static catalog is a separate proposal under Aenix maintenance; designed-only here.
 
 ## Open questions
 
 Tap-remove lifecycle. Mechanism is specified, corrected here to match what shipped: a user `Package` carries no `ownerReference` to the `PackageSource`, so nothing cascades via garbage collection; the `apps.cozystack.io/tap-materializer` finalizer sits on the tap's Flux `OCIRepository`, not on the `PackageSource`, and orders teardown; and the `OrphanedSource` surfacing is not implemented (see decision 0001). What remains open is policy, not mechanism: whether disconnect should ever offer an opt-in cascade-delete rather than always orphaning. Default proposed: keep installed packages.
 
-Endpoint hosting. Marketplace endpoints inside `cozystack-api` versus a new `cozystack-marketplace-controller`. Default proposed: extend `cozystack-api`.
+Endpoint hosting. Resolved, no longer open: decision 0001 settled this. There are no dedicated marketplace endpoints and no `cozystack-marketplace-controller`; the catalog is a computed `Tap` served through the aggregated API, materialized by a controller in the operator.
 
 External catalog hostname. `marketplace.cozystack.io`, `apps.cozystack.io`, `hub.cozystack.io`. Aenix-side decision.
 

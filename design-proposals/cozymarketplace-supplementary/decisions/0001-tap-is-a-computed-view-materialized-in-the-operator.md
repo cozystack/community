@@ -3,7 +3,7 @@
 - **Number:** `0001`
 - **Date:** `2026-09-02`
 - **Status:** Accepted
-- **Deciders:** `@IvanHunters`
+- **Deciders:** `@IvanHunters, @kvaps`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940)
 - **Implemented in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940), [`cozystack/cozystack#4308`](https://github.com/cozystack/cozystack/pull/4308)
