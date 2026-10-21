@@ -1,9 +1,9 @@
 # 0002. There is no in-cluster index and no default index
 
 - **Number:** `0002`
-- **Date:** `2026-09-07`
+- **Date:** `2026-09-02`
 - **Status:** Accepted
-- **Deciders:** `@IvanHunters, @kvaps`
+- **Deciders:** `@IvanHunters`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940)
 - **Implemented in:** [`cozystack/cozystack#3940`](https://github.com/cozystack/cozystack/pull/3940) (publication scaffold under `hack/packages-index`)
@@ -20,13 +20,13 @@ Ship no in-cluster index resource and no default index repository. Index entries
 
 ## Why not the alternatives
 
-- **Ship a default or official index repository now.** It would commit the maintainers to curating that repository and to operating the two-lane auto-merge gate before the repository-as-unit model is proven in the field. This was a deferral in the plan rather than an option argued down in one thread: the main proposal already staged the index to [_Later phases_](../README.md#rollout), and the 1.7 marketplace epic tracks the package index as not-yet-built. It rests on that judgement, not on a hard constraint.
+- **Ship a default or official index repository now.** It would commit the maintainers to curating that repository and to operating the two-lane auto-merge gate before the repository-as-unit model is proven in the field. This was a deferral in the plan rather than an option argued down in one thread: the main proposal already staged the index to [_Later phases_](../README.md#rollout), and the 1.7 marketplace epic ([`cozystack/cozystack#4981`](https://github.com/cozystack/cozystack/issues/4981)) tracks the package index as not-yet-built. It rests on that judgement, not on a hard constraint.
 - **An in-cluster index resource or CRD.** The index is a publish-side artifact, a list of repositories, not cluster state; nothing running in the cluster needs it to be a resource. Keeping it out of the cluster avoids a CRD that would only mirror a file.
 
 ## Consequences
 
 - Discovery needs an index URL supplied out of band; there is no default catalog an operator lands on. A default catalog storefront is tracked separately and waits on the items above.
-- The publication template is not yet a working gate. Its pinned `cozypkg` version predates the `validate` subcommand it invokes, and its auto-merge lane does not yet compare entry name, pull-request author, or version order. These are recorded as open items in the 1.7 marketplace epic, not resolved here.
+- The publication template is not yet a working gate. As of 2026-10-20, its pinned `cozypkg` version predates the `validate` subcommand it invokes, and its auto-merge lane does not yet compare entry name, pull-request author, or version order. These are recorded as open items in the 1.7 marketplace epic ([`cozystack/cozystack#4981`](https://github.com/cozystack/cozystack/issues/4981)), not resolved here; this bullet is a snapshot and will go stale once the gate is fixed.
 - Because there is no default index, the trust model has no official-versus-community distinction to anchor on yet; that waits on an index existing.
 
 ## Revisit if
