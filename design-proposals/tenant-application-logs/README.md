@@ -9,7 +9,7 @@
 
 Clients running managed applications, databases, and VMs on Cozystack want to read their logs in the dashboard, including the logs of a pod or application that has already been deleted (post-mortem, for incident analysis), without opening Grafana and without deploying their own monitoring stack. The logs are collected into VictoriaLogs, but a tenant has no way to read them: the dashboard has no log viewer, and VictoriaLogs is reachable only through Grafana.
 
-This proposal serves the logs read path from the **same stateless authorizing proxy as the metrics proposal (cozystack/community#94)**, in front of `vlselect`. The client sends LogsQL; the proxy validates the bearer token with a `TokenReview`, authorizes the namespace with a `SubjectAccessReview` against the same `observability.cozystack.io` virtual group (a `*/log` subresource), forces the tenant's scope into the query, and returns VictoriaLogs' native NDJSON unchanged, flushing after every line on a live tail. There is no `cozystack-api` change, no new API group served, and no Kubernetes envelope. Metrics live under the sibling `.../metrics/api/v1/...` prefix of the same scope.
+This proposal serves the logs read path from the **same stateless authorizing proxy as the metrics proposal (cozystack/community#94)**, in front of `vlselect`. The client sends LogsQL; the proxy validates the bearer token with a `TokenReview`, authorizes the namespace with a `SubjectAccessReview` against the same `observability.cozystack.io` virtual group (a `*/log` subresource), forces the tenant's scope into the query, and returns VictoriaLogs' native response unchanged (NDJSON on the streaming endpoints), flushing after every line on a live tail. There is no `cozystack-api` change, no new API group served, and no Kubernetes envelope. Metrics live under the sibling `.../metrics/api/v1/...` prefix of the same scope.
 
 An earlier draft of this proposal (in this same PR) served logs as a top-level `logs.cozystack.io` virtual resource from `cozystack-api`. That shape was chosen because logs must survive their parent and a subresource cannot. Now that metrics (#94) is a proxy rather than a subresource, that asymmetry is gone: post-mortem survival comes from the collection change in §6, not from the resource shape, so logs join metrics behind the proxy. The previous shapes are in Alternatives.
 
@@ -51,7 +51,7 @@ Empty while the proposal is still intent. -->
 - A tenant can read the logs of a resource it owns, over a chosen time window, and follow them live, rendered in the dashboard, with the live tail surviving past 60 seconds.
 - Logs of a deleted pod or application remain readable (post-mortem) as long as they are within VictoriaLogs retention, through the namespace endpoint; application-scoped post-mortem additionally needs the §6 lineage labels or a resolvable pod, so for windows older than metrics retention and predating §6 it falls back to the namespace endpoint.
 - A tenant can never read another namespace's logs, enforced server-side by a forced scope the client cannot override.
-- The dashboard consumes the native VictoriaLogs NDJSON with a standard client, with no Kubernetes envelope around the stream.
+- The dashboard consumes VictoriaLogs' native responses with a standard client, with no Kubernetes envelope around the stream.
 - Minimal implementation: the same proxy as metrics, no `cozystack-api` change.
 
 ### Non-goals
@@ -146,14 +146,14 @@ Fluent Bit keeps the lineage labels `apps.cozystack.io/application.{group,kind,n
 
 ## User-facing changes
 
-- **Dashboard:** a log view on application / database / VM detail pages (application scope) and a namespace-level log view, with follow (live tail), rendered from the VictoriaLogs NDJSON. This is the first log viewer in `cozystack-ui`.
+- **Dashboard:** a log view on application / database / VM detail pages (application scope) and a namespace-level log view, with follow (live tail), rendered from VictoriaLogs' native responses. This is the first log viewer in `cozystack-ui`.
 - **API:** the same proxy as metrics, under the `log/` prefix; no `kubectl get --raw` and no new served API group.
 - **RBAC:** one aggregated rule (`*/log` in `observability.cozystack.io`) at `use`, reaching tenant groups automatically.
 
 ## Upgrade and rollback compatibility
 
 - Additive: proxy endpoints, one aggregated ClusterRole rule, and a Fluent Bit configuration change. `cozystack-api` is untouched; no new served API group.
-- The collection change (§6) alters where parsed JSON-log fields land (under `log_processed`); nothing in the current pipeline or charts reads them, so it is backward compatible for existing consumers.
+- The collection change (§6) moves parsed JSON-log fields under `log_processed`; in-repo charts and queries do not read them, but any external dashboard or LogsQL query reading a top-level JSON field (for example `level`) is a breaking field-schema change and needs migration to `log_processed.<field>` (see §6).
 - Rollback: remove the proxy endpoints and the rule; revert the Fluent Bit change. The dashboard degrades to "no logs" (today's state).
 
 ## Security
