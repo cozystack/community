@@ -12,7 +12,7 @@
 
 Section 5 keeps the GPU usage records under a `WorkloadMonitor` whose selector is a reserved label key, `gpu.cozystack.io/usage-monitor`, and has admission refuse that key on every object in a tenant namespace, on create and update, so no object can match the monitor and no tenant can shape the GPU usage records.
 
-Two cases were left open. First, the GPU admission policies render only where GPUs serve VMs ([0002](./0002-gpudevice-serves-vms-only-where-gpu-operator-serves-gpus-to-vms.md)). Had the reservation followed them, a tenant could label its objects on a cluster without GPUs, and they would match the monitor the day the hoster turns GPUs on. Second, an object can already carry the key when the policy first renders, from before the upgrade that brought it. A policy that refuses every write of an object carrying the key would refuse every update of that object that keeps the label, including the one in which a controller removes its finalizer, so its deletion would hang until someone drops the label by hand.
+Two cases were left open. First, the GPU admission policies render only where GPUs serve VMs ([0002](./0002-gpuclaim-serves-vms-only-where-gpu-operator-serves-gpus-to-vms.md)). Had the reservation followed them, a tenant could label its objects on a cluster without GPUs, and they would match the monitor the day the hoster turns GPUs on. Second, an object can already carry the key when the policy first renders, from before the upgrade that brought it. A policy that refuses every write of an object carrying the key would refuse every update of that object that keeps the label, including the one in which a controller removes its finalizer, so its deletion would hang until someone drops the label by hand.
 
 ## Decision
 

@@ -10,7 +10,7 @@
 
 ## Context
 
-The Security section lists three rights the GPU controller gains beyond its own kinds and the usage records: patching node labels, restricted by a policy to the GPU workload label and `gpu.cozystack.io/*`; restarting the device plugin pod on a node; and deleting unscheduled VMIs that reference its devices. Only the third is used by Rollout step 1. Node labels and plugin restarts belong to the node layout of section 6, which ships as Rollout step 4, and until then the hoster writes node labels by hand.
+The Security section lists three rights the GPU controller gains beyond its own kinds and the usage records: patching node labels, restricted by a policy to the GPU workload label and `gpu.cozystack.io/*`; restarting the device plugin pod on a node; and deleting unscheduled VMIs that reference its claims. Only the third is used by Rollout step 1. Node labels and plugin restarts belong to the node layout of section 6, which ships as Rollout step 4, and until then the hoster writes node labels by hand.
 
 ## Decision
 

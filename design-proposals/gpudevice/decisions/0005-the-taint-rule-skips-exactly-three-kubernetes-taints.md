@@ -18,13 +18,13 @@ The rule skips exactly `node.kubernetes.io/unschedulable`, `node.kubernetes.io/n
 
 ## Why not the alternatives
 
-- **Skip the whole `node.kubernetes.io/` prefix.** It binds devices onto nodes that the scheduler then refuses, and keeps their units in `free`, which is the failure the taint rule exists to prevent.
-- **Count the three as well.** Kubernetes sets `node.kubernetes.io/unschedulable` on every cordoned node, so a cordoned node would also read as tainted. A taint keeps a bound device where it is, so under `Move` a cordon would never move a device, and `onCordon` would stop meaning anything.
+- **Skip the whole `node.kubernetes.io/` prefix.** It binds claims onto nodes that the scheduler then refuses, and keeps their units in `free`, which is the failure the taint rule exists to prevent.
+- **Count the three as well.** Kubernetes sets `node.kubernetes.io/unschedulable` on every cordoned node, so a cordoned node would also read as tainted. A taint keeps a bound claim where it is, so under `Move` a cordon would never move a claim, and `onCordon` would stop meaning anything.
 
 ## Consequences
 
-- A node under memory, disk or PID pressure, one whose network is unavailable, and one tainted `out-of-service` get no binds, moves or gathers while the taint holds and virt-launcher pods do not tolerate it, and their units leave `free` and `maxFreePerNode`. Outside a gather at VMI creation, a device already bound there stays, as on any tainted node.
-- A pressure taint comes and goes with the node's condition, so `free` on a busy class can drop and return without any device moving.
+- A node under memory, disk or PID pressure, one whose network is unavailable, and one tainted `out-of-service` get no binds, moves or gathers while the taint holds and virt-launcher pods do not tolerate it, and their units leave `free` and `maxFreePerNode`. Outside a gather at VMI creation, a claim already bound there stays, as on any tainted node.
+- A pressure taint comes and goes with the node's condition, so `free` on a busy class can drop and return without any claim moving.
 
 ## Revisit if
 

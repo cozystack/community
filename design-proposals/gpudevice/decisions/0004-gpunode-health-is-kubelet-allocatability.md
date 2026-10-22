@@ -34,7 +34,7 @@ Not every GPU device ID maps to a PCI function. The GPU Operator's device plugin
 ## Consequences
 
 - An unhealthy device that no pod holds disappears from the allocatable list and looks the same as a missing one. Both lower `allocatable`, and both become lost capacity after the grace period once the node holds more units than remain.
-- `usedBy` traces only one pod per function. Section 1's "ownership is exact for running GPUs" holds per function for VFs and whole GPUs, and for an mdev parent only through the devices' own `status.attachedTo`.
+- `usedBy` traces only one pod per function. Section 1's "ownership is exact for running GPUs" holds per function for VFs and whole GPUs, and for an mdev parent only through the claims' own `status.attachedTo`.
 - The agent does not fill `profile` yet; writing and reading VF profiles is host-layer work (Rollout, step 4).
 
 ## Revisit if
