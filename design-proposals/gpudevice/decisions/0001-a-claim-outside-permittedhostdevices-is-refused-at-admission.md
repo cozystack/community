@@ -6,7 +6,7 @@
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99)
-- **Implemented in:** not yet
+- **Implemented in:** [`cozystack/cozystack#5013`](https://github.com/cozystack/cozystack/pull/5013) (the class condition), [`cozystack/cozystack#5030`](https://github.com/cozystack/cozystack/pull/5030) (the refusal at VMI admission)
 
 ## Context
 

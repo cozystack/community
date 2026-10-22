@@ -6,7 +6,7 @@
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99)
-- **Implemented in:** not yet
+- **Implemented in:** [`cozystack/cozystack#5030`](https://github.com/cozystack/cozystack/pull/5030); the controller-side creation and capacity check of [0012](./0012-the-vmi-webhook-checks-and-records-and-the-controller-prepares.md): not yet
 
 ## Context
 

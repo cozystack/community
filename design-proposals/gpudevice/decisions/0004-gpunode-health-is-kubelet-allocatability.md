@@ -6,7 +6,7 @@
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99)
-- **Implemented in:** [`cozystack/cozystack#4998`](https://github.com/cozystack/cozystack/pull/4998) (the fields); the node agent: not yet
+- **Implemented in:** [`cozystack/cozystack#4998`](https://github.com/cozystack/cozystack/pull/4998) (the fields), [`cozystack/cozystack#5013`](https://github.com/cozystack/cozystack/pull/5013) (the node agent)
 
 ## Context
 
