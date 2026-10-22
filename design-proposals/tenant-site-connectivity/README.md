@@ -25,6 +25,10 @@ Neither is a fallback for the other — a cluster admin can offer either or both
 - **[#7 ClusterMesh / Kilo](https://github.com/cozystack/community/pull/7).** Complementary and a different niche — a routed WireGuard node-to-node mesh between cooperative Kubernetes clusters. See [Alternatives considered](#alternatives-considered).
 - **Deferred here:** a platform-run (non-VM) managed variant; HTTP/L7 ingress (the existing tenant Ingress / Gateway API covers public HTTP); a per-tenant egress IP (future work — the gateway VM is its natural home later).
 
+## Decisions
+
+- [0001. Phase 1 is developed outside the Cozystack repositories, as an Aenix operator and catalog app](./decisions/0001-phase-1-is-developed-outside-the-platform.md) — why `site-router` is not an app of the platform and `site-gateway` was not made.
+
 ## Context
 
 Cozystack runs tenant workloads under a hardened networking model:
