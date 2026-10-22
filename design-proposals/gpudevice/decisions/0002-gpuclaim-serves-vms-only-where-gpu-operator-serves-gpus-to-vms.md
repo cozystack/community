@@ -16,7 +16,7 @@ The `vm-instance` chart renders only the reference, on the VMI template, and lea
 
 ## Decision
 
-The platform treats GPUs as serving VMs when the iaas bundle is on, `cozystack.gpu-operator` is enabled, and its variant is `default` or `vgpu`. Only there does it turn on the binder, the VMI and virt-launcher webhooks, the controller's watches on KubeVirt objects, the GPU admission policies other than the label reservation of [0003](./0003-the-usage-monitor-label-reservation-is-always-on-and-ratchets.md), the metrics scrape, and the tenant admin's write access to `GPUClaim`. Elsewhere:
+The platform treats GPUs as serving VMs when the iaas bundle is on, `cozystack.gpu-operator` is enabled, and its variant is `default` or `vgpu`. Only there does it turn on the binder, the VMI and virt-launcher webhooks, the controller's watches on KubeVirt objects, the GPU admission policies, the metrics scrape, and the tenant admin's write access to `GPUClaim`. Elsewhere:
 
 - `vm-instance` refuses to render `claim` and `claimTemplate` entries, through a cluster value the platform writes only where GPUs serve VMs, and `name` entries work as today.
 - The platform refuses `gpu.rawResourceNames: forbidden`, because the policy that enforces it does not render there.
