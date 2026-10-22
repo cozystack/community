@@ -16,7 +16,7 @@ In Cozystack more identities can write a `vm-instance` than can write a `GPUClai
 
 ## Decision
 
-A `claimTemplate` entry is part of the VM, so whoever can write the VM can order its template claims, and whoever can start it makes them exist and enter the usage records for as long as the VMI runs. The webhook applies the tenant's budgets, the vGPU entitlement and capacity to every template claim, as to any order, and does not check the identity behind the VM. Ordering a held `GPUClaim` directly stays with tenant admins and above.
+A `claimTemplate` entry is part of the VM, so whoever can write the VM can order its template claims, and whoever can start it makes them exist and enter the usage records for as long as the VMI runs. The webhook checks the vGPU entitlement for every template claim at VMI admission, the controller checks budgets and capacity when it creates and binds the claim, as for any order, and neither checks the identity behind the VM. Ordering a held `GPUClaim` directly stays with tenant admins and above.
 
 ## Why not the alternatives
 

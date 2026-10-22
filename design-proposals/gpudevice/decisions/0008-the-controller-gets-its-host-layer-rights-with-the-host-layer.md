@@ -23,6 +23,7 @@ Of the three, Rollout step 1 grants the controller only the VMI deletion. The no
 
 ## Consequences
 
+- The `update` and `delete` rights on tenant pods that the launcher pod gate of section 3 needs are a separate grant of step 1, not one of the three.
 - Between step 1 and step 4 the controller cannot change any node, so the GPU node labels that classes match are the ones the hoster writes.
 - The rights and their policy are reviewed in step 4, next to the code that uses them.
 
