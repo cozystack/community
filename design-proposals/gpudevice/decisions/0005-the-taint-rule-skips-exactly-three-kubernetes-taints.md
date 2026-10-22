@@ -2,7 +2,7 @@
 
 - **Number:** `0005`
 - **Date:** `2026-10-20`
-- **Status:** Accepted
+- **Status:** Superseded by [`0010`](./0010-gpuclass-carries-the-tolerations-binding-reads.md)
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99)
