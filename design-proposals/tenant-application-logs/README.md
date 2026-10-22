@@ -49,7 +49,7 @@ Empty while the proposal is still intent. -->
 ## Goals
 
 - A tenant can read the logs of a resource it owns, over a chosen time window, and follow them live, rendered in the dashboard, with the live tail surviving past 60 seconds.
-- Logs of a deleted pod or application remain readable (post-mortem) as long as they are within VictoriaLogs retention.
+- Logs of a deleted pod or application remain readable (post-mortem) as long as they are within VictoriaLogs retention, through the namespace endpoint; application-scoped post-mortem additionally needs the §6 lineage labels or a resolvable pod, so for windows older than metrics retention and predating §6 it falls back to the namespace endpoint.
 - A tenant can never read another namespace's logs, enforced server-side by a forced scope the client cannot override.
 - The dashboard consumes the native VictoriaLogs NDJSON with a standard client, with no Kubernetes envelope around the stream.
 - Minimal implementation: the same proxy as metrics, no `cozystack-api` change.
@@ -72,7 +72,7 @@ GET /namespaces/<ns>/log/select/logsql/{query,hits,stats_query_range,tail}
 GET /namespaces/<ns>/<plural>/<name>/log/select/logsql/{query,hits,stats_query_range,tail}
 ```
 
-The client sends LogsQL; the proxy adds the scope and returns VictoriaLogs' native NDJSON unchanged, flushing after every line on `tail`. No `cozystack-api` change, no new API group served, no Kubernetes envelope. Metrics live under the sibling prefix `.../metrics/api/v1/...` of the same scope.
+The client sends LogsQL; the proxy adds the scope and returns VictoriaLogs' native response unchanged, with each endpoint's own content type: `query` and `tail` stream JSON lines, `hits` returns a JSON object, and `stats_query_range` returns Prometheus-compatible matrix JSON. On `tail` the proxy flushes after every line. No `cozystack-api` change, no new API group served, no Kubernetes envelope. Metrics live under the sibling prefix `.../metrics/api/v1/...` of the same scope.
 
 ```mermaid
 flowchart TD
@@ -120,28 +120,29 @@ extra_filters=(cozystack_app_kind:=<Kind> cozystack_app_name:=<name>) or kuberne
 ```
 
 - `<pods>` are the application's pods over the request window, from the label values API on `kube_pod_labels` (same lookup as the metrics application scope), capped. The pod branch covers lines collected before the §6 change; an empty list is omitted.
-- The `<pods>` lookup reads `tenant-root`'s VictoriaMetrics even when the logs live in a tenant `VLCluster`; for windows beyond metrics retention only the `cozystack_app_*` branch applies.
-- `<plural>` must be a kind of `apps.cozystack.io`, `<name>` a DNS-1123 subdomain; values are quoted. Anything else is `400`.
+- The `<pods>` lookup reads `tenant-root`'s VictoriaMetrics even when the logs live in a tenant `VLCluster`; for windows beyond metrics retention only the `cozystack_app_*` branch applies. So application-scoped post-mortem has a bounded reach: a line written before the §6 labels existed and older than metrics retention carries neither `cozystack_app_*` nor a resolvable pod, and the application endpoint cannot select it. Such lines stay reachable through the namespace endpoint; the post-mortem guarantee is narrowed accordingly (see Goals and Failure cases).
+- `<plural>` must be a kind of `apps.cozystack.io`, `<name>` a DNS-1123 subdomain; values are quoted. Anything else is `400`. The proxy maps `<plural>` to the lineage `Kind` by reading the ApplicationDefinitions (the same mapping as #94's application scope) and uses the mapped value in `cozystack_app_kind`, never the raw plural.
 - The upstream request is built from scratch: only allowlisted parameters (`query`, `start`, `end`, `limit` (clamped), `step`, and on `tail` only `since` or `start_offset`, both capped) and no client headers. VictoriaLogs takes the tenant from `AccountID` / `ProjectID` headers; the proxy always sets them. Client `extra_filters` / `extra_stream_filters` are dropped. `/select/tenant_ids` and every non-allowlisted path are not proxied.
+- **Bounded time window.** For `query`, `hits`, and `stats_query_range` the proxy requires or derives a finite `[start, end]` and clamps the maximum span; VictoriaLogs otherwise uses the oldest stored timestamp when `start` is omitted and would scan the whole retention. Inverted ranges are rejected with `400`. The `tail` resume cap (§5) is a separate bound and does not restrict a client's `start`/`end` on the other endpoints.
 - Queries using `options(ignore_global_time_filter=true)` are rejected, detected by a plain substring match on `ignore_global_time_filter` anywhere in `query`, subqueries included: it disables the time bounds the proxy relies on, and on `tail` it rescans the whole retention every tick.
 - Platform sources are out of reach: kube-apiserver audit and Kubernetes events carry no `kubernetes_namespace_name` in the current pipeline, so the stream filter excludes them.
 
 ### 4. Store resolution
 
-As in #94: `namespace.cozystack.io/monitoring` names the `VLCluster`; empty means `tenant-root`. Logs of a tenant with its own monitoring are moved there, not copied, so exactly one store answers.
+As in #94: `namespace.cozystack.io/monitoring` names the `VLCluster`; empty means `tenant-root`. Logs of a tenant with its own monitoring are moved there, not copied, so exactly one store answers. If the label changes during the retention window, records already written to the previous `VLCluster` are not copied, so logs from before the change are not visible through the new store; routing should be treated as immutable for the retention period, or the proxy must keep routing history and query both stores (open question).
 
 ### 5. Live tail
 
 - `tail` is VictoriaLogs live tailing with the scope applied. VictoriaLogs rejects pipes that compute stats, reorder, or drop lines; the proxy passes its `400` through.
-- `tail` has no absolute start: it starts at `now - offset - start_offset`. To resume after a disconnect the client sends `since=<last _time>`; the proxy sets `start_offset = (now - offset) - since`, capped (proposed: 15 min). Client `start`/`end` on `tail` are ANDed into each tick as usual.
-- Lines around the resume point may repeat; clients deduplicate by `(_stream_id, _time)`. Queries whose pipes drop these fields (`fields`, `delete`) get no deduplication guarantee.
+- `tail` has no absolute start: it starts at `now - offset - start_offset`. To resume after a disconnect the client sends `since=<last _time>`; the proxy sets `start_offset = (now - offset) - since`, capped (proposed: 15 min). A reconnect later than the cap resumes at the cap, not at `since`: the older gap is not replayed on `tail` and needs a separate historical `query`. The proxy does not promise gap-free resume beyond the cap. Client `start`/`end` on `tail` are ANDed into each tick as usual.
+- Lines around the resume point may repeat. Delivery is at-least-once; VictoriaLogs does not define `(_stream_id, _time)` as a per-entry identity (entries in one stream can share a `_time`), so a client dedup on that pair is best-effort at the boundary, not a uniqueness guarantee, and a stable per-entry cursor is needed if exactly-once matters. Queries whose pipes drop these fields (`fields`, `delete`) get no deduplication at all.
 - `tail` goes through the proxy only, so there is no request-timeout cut. The proxy caps open tails per user and in total and closes a tail after a configurable idle period.
 
 ### 6. Filtering to an application, and the write-path hardening (collection change)
 
 Fluent Bit keeps the lineage labels `apps.cozystack.io/application.{group,kind,name}` as `cozystack_app_group`, `cozystack_app_kind`, `cozystack_app_name` (a second `nest` lift on `kubernetes_labels`, renamed before `Remove_wildcard kubernetes_`, like the three kept fields today) and adds them to `_stream_fields`. These give the application scope of §3 its labels. The webhook sets these labels on pods whose owning application it resolves.
 
-**Hardening.** `Merge_Log On` adds the JSON keys of an application's own log line to the top level of the record, ahead of the filter's own `kubernetes` map and without deduplication. A line such as `{"kubernetes":{"namespace_name":"<other>"}}` therefore yields a second `kubernetes` map; the `nest` lift lifts every map under that key, so a forged `kubernetes_namespace_name` (and `kubernetes_labels`) sits next to the real one, first, and `rewrite_tag` routes on it. `log_source`, `tenant`, and `cluster` can be forged the same way, since `Add` never overwrites. Set `Merge_Log_Key` (for example `Merge_Log_Key log_processed`) so a parsed line lands under one key and cannot add top-level keys; this also covers `K8S-Logging.Parser`. Trade-off: fields of JSON log lines searched at the top level today (for example `level`) become `log_processed.<field>` in VictoriaLogs; nothing in the current pipeline or charts reads them. A test asserts that a crafted line cannot appear under another namespace or application.
+**Hardening.** `Merge_Log On` adds the JSON keys of an application's own log line to the top level of the record, ahead of the filter's own `kubernetes` map and without deduplication. A line such as `{"kubernetes":{"namespace_name":"<other>"}}` therefore yields a second `kubernetes` map; the `nest` lift lifts every map under that key, so a forged `kubernetes_namespace_name` (and `kubernetes_labels`) sits next to the real one, first, and `rewrite_tag` routes on it. `log_source`, `tenant`, and `cluster` can be forged the same way, since `Add` never overwrites. Set `Merge_Log_Key` (for example `Merge_Log_Key log_processed`) so a parsed line lands under one key and cannot add top-level keys; this also covers `K8S-Logging.Parser`. This hardening is a read-isolation prerequisite and lands in Phase 1, before the proxy is exposed; it does not depend on the lineage labels or the application scope (which are Phase 2), because without it any pod can forge `kubernetes_namespace_name` and surface in another namespace's view that Phase 1 already serves. Trade-off, a breaking field-schema change: fields of JSON log lines searched at the top level today (for example `level`) become `log_processed.<field>` in VictoriaLogs; in-repo charts do not read them, but any external dashboard or LogsQL query that reads a top-level field must move to `log_processed.<field>` or run a dual-read during migration. A test asserts that a crafted line cannot appear under another namespace or application.
 
 ## User-facing changes
 
@@ -166,7 +167,7 @@ Fluent Bit keeps the lineage labels `apps.cozystack.io/application.{group,kind,n
 ## Failure and edge cases
 
 - Namespace has no dedicated store (empty label): resolves to `tenant-root` where the logs are; the common case, not a failure.
-- Target resource deleted: logs still stream (post-mortem) within retention; the SAR passes on permission, not existence; the application scope matches by `cozystack_app_*` labels and the earlier pods' names.
+- Target resource deleted: logs still stream (post-mortem) within retention; the SAR passes on permission, not existence; the application scope matches by `cozystack_app_*` labels and the earlier pods' names. For a window older than metrics retention and predating the §6 labels, the application endpoint cannot select those lines, but the namespace endpoint still returns them.
 - Caller lacks `get <res>/log` in `observability.cozystack.io`: 403 before any query.
 - Client tries to drop or widen the scope (`extra_filters`, `extra_stream_filters`, `AccountID` header, a `| union` / `:in(...)` subquery, `options(ignore_global_time_filter=true)`): impossible; the request is rebuilt from an allowlist and such queries are rejected.
 - `tail` resume with `since`: returns the lines after the cut, with duplicates only at the boundary.
@@ -179,12 +180,13 @@ Fluent Bit keeps the lineage labels `apps.cozystack.io/application.{group,kind,n
 - A `<name>` with LogsQL metacharacters is rejected with `400`.
 - A crafted JSON line from a host pod carrying another namespace's `kubernetes_namespace_name` does not show up under that namespace.
 - Logs of a deleted application, and of a restarted pod, are readable through the application scope within retention.
-- Resume with `since` returns the lines after the cut, with duplicates only at the boundary.
+- A query with an omitted, over-wide, or inverted `start`/`end` is clamped or rejected rather than scanning the whole retention.
+- Resume with `since` within the cap returns the lines after the cut, with duplicates only at the boundary; a resume older than the cap starts at the cap and does not replay the older gap.
 
 ## Rollout
 
-- **Phase 1: the proxy endpoints (namespace scope) and the RBAC rule.** Serve `/namespaces/<ns>/log/...` on the shared proxy with the forced `extra_stream_filters`, and ship the aggregated `*/log` rule at `use`. Land the write-path control before exposing the proxy.
-- **Phase 2: the collection change (§6) and the application scope.** The Fluent Bit lineage labels, `Merge_Log_Key` hardening, and the `/namespaces/<ns>/<plural>/<name>/log/...` endpoints.
+- **Phase 1: the proxy endpoints (namespace scope), the RBAC rule, and the `Merge_Log_Key` hardening.** Serve `/namespaces/<ns>/log/...` on the shared proxy with the forced `extra_stream_filters`, ship the aggregated `*/log` rule at `use`, and set `Merge_Log_Key` in Fluent Bit before exposing the proxy. `Merge_Log_Key` is a read-isolation prerequisite (without it a crafted line forges `kubernetes_namespace_name` and surfaces in another namespace's view) and depends on neither the lineage labels nor the application scope, so it belongs here, not in Phase 2. Land the guest-cluster write-path control in the same phase.
+- **Phase 2: the lineage labels (§6) and the application scope.** The Fluent Bit `cozystack_app_*` labels and the `/namespaces/<ns>/<plural>/<name>/log/...` endpoints.
 - **Phase 3: the dashboard log viewer** with live tail.
 
 ## Open questions
