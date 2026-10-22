@@ -9,13 +9,13 @@
 
 A hoster that sells NVIDIA GPUs wants tenants of Cozystack managed Kubernetes to give a worker pool GPUs, either a vGPU profile or a whole GPU in passthrough, with no driver work on the tenant side. This proposal gives each mode its own guest driver. A vGPU runs the NVIDIA vGPU guest driver, whose license client runs inside the guest. That driver is licensed per customer and may not be published, for example in a public image or repository. A passthrough GPU used for compute runs the regular NVIDIA data center driver and needs no license. Cozystack builds, ships and tests neither driver in CI.
 
-This proposal adds an extension point instead of a driver. Cozystack ships a build recipe that layers a hoster-supplied driver `.run` onto the platform's Kairos worker image, one image per mode. The hoster names the resulting images in platform values, and for vGPU also a license Secret. A Kairos pool takes GPUs through the GPUDevice proposal's `deviceSelector` or `deviceTemplate`, states its mode, boots the matching image, and for vGPU gets the license files at bootstrap.
+This proposal adds an extension point instead of a driver. Cozystack ships a build recipe that layers a hoster-supplied driver `.run` onto the platform's Kairos worker image, one image per mode. The hoster names the resulting images in platform values, and for vGPU also a license Secret. A Kairos pool takes GPUs through the GPUClaim proposal's `claimSelector` or `claimTemplate`, states its mode, boots the matching image, and for vGPU gets the license files at bootstrap.
 
 NVIDIA's vGPU stack changes quickly. Within the last few releases the driver branches, the way vGPUs are exposed (mediated devices or SR-IOV virtual functions), the KubeVirt device plugins and the licensing rules all changed. This proposal describes that stack as it was in October 2026. Expect it to be updated as NVIDIA and KubeVirt move, with a decision record under it for each change of course, and check the versions named here against your own before relying on them.
 
 ## Scope and related proposals
 
-- This proposal builds on the [GPUDevice proposal](../gpudevice/README.md) and is implemented after it. GPUDevice owns the host layer (host driver, VF profiles, device plugin), the GPU classes, per-tenant reservation and quotas, and usage records of allocated GPUs (model, count, owner) that an external billing system reads. Kairos pools take GPUs only through its `deviceSelector` or `deviceTemplate`; raw `gpus` entries by resource name are not accepted on Kairos pools.
+- This proposal builds on the [GPUClaim proposal](../gpudevice/README.md) and is implemented after it. GPUClaim owns the host layer (host driver, VF profiles, device plugin), the GPU classes, per-tenant reservation and quotas, and usage records of allocated GPUs (model, count, owner) that an external billing system reads. Kairos pools take GPUs only through its `claimSelector` or `claimTemplate`; raw `gpus` entries by resource name are not accepted on Kairos pools.
 - [`kubernetes-nodes-split`](../kubernetes-nodes-split/README.md) made worker pools a separate `KubernetesNodes` app. This proposal changes that app, the platform values, and `cozystack-controller`, which gets a Secret reconciler, and possibly the gpu-operator addon of the tenant `kubernetes` app (section 4).
 - Kairos pools come from [kairos-io/cluster-api-provider-kairos#141](https://github.com/kairos-io/cluster-api-provider-kairos/pull/141) (merged), which adds `distribution: kubeadm` and needs Cluster API 1.13.4 or newer. [cozystack/cozystack#4902](https://github.com/cozystack/cozystack/pull/4902) moves Cluster API to v1.13.7. [cozystack/cozystack#4911](https://github.com/cozystack/cozystack/pull/4911) (draft), stacked on it, adds Kairos pools to the `kubernetes-nodes` chart.
 - The [GPU virtual machines proposal](../vgpu-vms/README.md) (`vgpu-vms`) is a parallel consumer of the same host layer, for tenant virtual machines.
@@ -45,7 +45,7 @@ A Kairos pool refuses `gpus` today, so a hoster cannot offer GPUs on Kairos pool
 ## Goals
 
 - A hoster enables GPUs on Kairos pools, in vGPU mode, passthrough mode or both, through platform values, plus a license Secret for vGPU and registry credentials and a CA when the image registry needs them, without patching charts.
-- A tenant attaches GPUs to a Kairos pool through GPUDevice, held devices with `deviceSelector` or per-worker devices with `deviceTemplate`, and states the mode.
+- A tenant attaches GPUs to a Kairos pool through GPUClaim, held claims with `claimSelector` or per-worker claims with `claimTemplate`, and states the mode.
 - Cozystack copies the license token only to tenants with a vGPU entitlement, and the vGPU registry access too, so the vGPU guest driver reaches only them when the hoster's registry requires credentials. After a revocation, a token or registry credentials already delivered stay usable until the hoster rotates or revokes them on the license server or the registry, and on the interim path new machines of an applied template keep getting the token (section 3).
 - Cozystack's tree, CI, and registries never contain NVIDIA driver binaries.
 
@@ -123,13 +123,13 @@ The images reach workers the way the platform disk does: CDI on the management c
 
 #### Choosing the worker image by mode
 
-A Kairos pool takes its GPUs from GPUDevice and states its mode. It has one `deviceSelector` or one `deviceTemplate` entry in `gpus`, never both, and sets `kairos.gpuMode` to `vgpu` or `passthrough`. A selector picks devices the tenant holds, and a template makes GPUDevice create one device per worker VMI and delete it with the VMI. The chart picks the worker image by the mode and sets it as the `gpu.cozystack.io/mode` label on the worker VMI template. At VMI creation the GPUDevice webhook refuses a device, selected or from a template, whose class `mode` differs from that label, so a worker never boots the image of the other mode. The `maxReplicas` limit by matching devices applies to `deviceSelector` pools only.
+A Kairos pool takes its GPUs from GPUClaim and states its mode. It has one `claimSelector` or one `claimTemplate` entry in `gpus`, never both, and sets `kairos.gpuMode` to `vgpu` or `passthrough`. A selector picks claims the tenant holds, and a template makes GPUClaim create one claim per worker VMI and delete it with the VMI. The chart picks the worker image by the mode and sets it as the `gpu.cozystack.io/mode` label on the worker VMI template. At VMI creation the GPUClaim webhook refuses a claim, selected or from a template, whose class `mode` differs from that label, so a worker never boots the image of the other mode. The `maxReplicas` limit by matching claims applies to `claimSelector` pools only.
 
-The mode is a property of the devices' class, but the chart cannot take it from there. A selector names device labels, not a class; the chart renders the machine template, and with it the image, before any device is attached; and a lookup at render time is not repeated when devices change. A template does name a class, but a class's `mode` is frozen only while devices of it exist, and an idle template pool holds none, so the class could change its mode with no new render. So the pool states its mode, and the webhook keeps it honest.
+The mode is a property of the claims' class, but the chart cannot take it from there. A selector names claim labels, not a class; the chart renders the machine template, and with it the image, before any claim is attached; and a lookup at render time is not repeated when claims change. A template does name a class, but a class's `mode` is frozen only while claims of it exist, and an idle template pool holds none, so the class could change its mode with no new render. So the pool states its mode, and the webhook keeps it honest.
 
 The chart:
 
-1. Refuses raw `name` entries on a Kairos pool, `deviceSelector` together with `deviceTemplate`, and `gpus` without `kairos.gpuMode`.
+1. Refuses raw `name` entries on a Kairos pool, `claimSelector` together with `claimTemplate`, and `gpus` without `kairos.gpuMode`.
 2. Looks up `workerImages` for the pool's mode and minor. A missing entry or an empty field fails the render with a message naming the mode and the minor. For a `vgpu` pool, a `featureType` that is not a positive integer or an empty `licenseSecretName` fails it too. A `kubernetesVersion` that differs from the chart's pin fails the render with both versions in the message.
 3. Uses that image instead of the platform disk. `kairos.image` on a GPU pool is refused.
 4. For a `vgpu` pool, renders `/etc/nvidia/gridd.conf` with `FeatureType` into the `KairosConfigTemplate` files, and adds an entry for `/etc/nvidia/ClientConfigToken/client_configuration_token.tok` whose content comes from the license copy, as a `contentFrom` reference or filled in by the reconcile Job (below). The chart never sees the token.
@@ -137,7 +137,7 @@ The chart:
 
 #### vGPU entitlement
 
-vGPU is a yes-or-no grant that a tenant gets from its parent. It is the Tenant flag `gpu.vgpu`, as the Quotas section of the GPUDevice proposal defines. The parent's administrator sets it, or the hoster on a top-level tenant, and it holds only when it also holds on the parent. The root tenant takes it from platform values. The tenant chart stamps the effective value on the namespace as the label `namespace.cozystack.io/vgpu`. Class budgets only count devices and grant nothing.
+vGPU is a yes-or-no grant that a tenant gets from its parent. It is the Tenant flag `gpu.vgpu`, as the Quotas section of the GPUClaim proposal defines. The parent's administrator sets it, or the hoster on a top-level tenant, and it holds only when it also holds on the parent. The root tenant takes it from platform values. The tenant chart stamps the effective value on the namespace as the label `namespace.cozystack.io/vgpu`. Class budgets only count claims and grant nothing.
 
 The reconciler reads that label and copies the license token and the vGPU registry access only into namespaces where it is `"true"`. Any other value, or no label, means not entitled. A `vgpu` pool without a copy never gets its template applied (see the gate below), and the reconciler reports an Event. Passthrough needs no entitlement.
 
@@ -164,13 +164,13 @@ On Kairos the persistent partition is mounted on `/usr/local` and hides anything
 
 ### 5. Token rotation
 
-Since bootstrap files cannot be changed on a running node, rotating the token means replacing every vGPU machine. The hoster updates the Secret in `cozy-system`, then bumps `licenseRevision`. The revision is part of the `KairosConfigTemplate` name of every vGPU pool, so every entitled vGPU pool rolls, and each new machine boots with the token of the current revision. If the revision is bumped while the source is missing or empty, the copies keep their old revision, the new templates wait, and the rollout stalls without removing existing machines; fixing the Secret lets it continue. With no spare devices, a pool rolls one worker at a time, and surge machines are created but their VMIs are refused until an old worker frees a device (see the Attaching section of the GPUDevice proposal).
+Since bootstrap files cannot be changed on a running node, rotating the token means replacing every vGPU machine. The hoster updates the Secret in `cozy-system`, then bumps `licenseRevision`. The revision is part of the `KairosConfigTemplate` name of every vGPU pool, so every entitled vGPU pool rolls, and each new machine boots with the token of the current revision. If the revision is bumped while the source is missing or empty, the copies keep their old revision, the new templates wait, and the rollout stalls without removing existing machines; fixing the Secret lets it continue. With no spare claims, a pool rolls one worker at a time, and surge machines are created but their VMIs are refused until an old worker frees a claim (see the Attaching section of the GPUClaim proposal).
 
 The old token keeps working until the hoster revokes it on the license server, if the server supports that. Nodes not yet replaced still use it, so revoke it only after every vGPU pool has finished rolling.
 
 ## User-facing changes
 
-Hosters get `gpu.kairosGuest`, a build target with a mode, and documentation for building the images and rotating the token. To offer vGPU, the hoster sets the GPUDevice `gpu.vgpu` flag on the root and top-level tenants, and each parent's administrator sets it on its children. Tenants attach GPUs to a Kairos pool with `deviceSelector` or `deviceTemplate` and `kairos.gpuMode`. The `KubernetesNodes` schema and dashboard form gain `kairos.gpuMode`.
+Hosters get `gpu.kairosGuest`, a build target with a mode, and documentation for building the images and rotating the token. To offer vGPU, the hoster sets the GPUClaim `gpu.vgpu` flag on the root and top-level tenants, and each parent's administrator sets it on its children. Tenants attach GPUs to a Kairos pool with `claimSelector` or `claimTemplate` and `kairos.gpuMode`. The `KubernetesNodes` schema and dashboard form gain `kairos.gpuMode`.
 
 ## Upgrade and rollback compatibility
 
@@ -179,7 +179,7 @@ Hosters get `gpu.kairosGuest`, a build target with a mode, and documentation for
 - Changing an image rolls every GPU pool of its mode and minor, across all tenants. Changing `featureType` or `licenseRevision` rolls every entitled vGPU pool. Setting or clearing a mode's registry access rolls every GPU pool of that mode, because the disk source is part of the machine template.
 - Other changes to the platform worker image reach GPU pools only when the hoster rebuilds, so the hoster documentation says to rebuild for every Cozystack release.
 - Removing `gpu.kairosGuest` makes every GPU pool fail to render the same way; the copies stay.
-- Rolling back GPUDevice removes `deviceSelector` and `deviceTemplate` entries and `kairos.gpuMode` from Kairos pools. This happens in one phase, before the `gpu.vgpu` flag and the `namespace.cozystack.io/vgpu` label go. The pools keep running without GPUs on the platform image. With `kairos.gpuMode: vgpu` left in place, the pools' new templates would wait for a license copy once the label is gone.
+- Rolling back GPUClaim removes `claimSelector` and `claimTemplate` entries and `kairos.gpuMode` from Kairos pools. This happens in one phase, before the `gpu.vgpu` flag and the `namespace.cozystack.io/vgpu` label go. The pools keep running without GPUs on the platform image. With `kairos.gpuMode: vgpu` left in place, the pools' new templates would wait for a license copy once the label is gone.
 - Rolling Cozystack back to a release without this feature makes Kairos GPU pools hit the existing `gpus` refusal. The copies stay behind with no reconciler and have to be removed by hand.
 
 ## Security
@@ -206,7 +206,7 @@ The vGPU entitlement is a boundary set from above through the `gpu.vgpu` flag; a
 
 ## Testing
 
-- **Chart unit tests:** every refusal in section 3, including `deviceSelector` together with `deviceTemplate`; the image of each mode; the `gpu.cozystack.io/mode` label on the worker VMI template; both license files on a configured `vgpu` pool and none on a `passthrough` pool; a revision change renaming the template of a `vgpu` pool only; a Kairos pool without `gpus` rendering exactly as before; `secretRef` and `certConfigMap` on the disk source only when the hoster set them for the pool's mode.
+- **Chart unit tests:** every refusal in section 3, including `claimSelector` together with `claimTemplate`; the image of each mode; the `gpu.cozystack.io/mode` label on the worker VMI template; both license files on a configured `vgpu` pool and none on a `passthrough` pool; a revision change renaming the template of a `vgpu` pool only; a Kairos pool without `gpus` rendering exactly as before; `secretRef` and `certConfigMap` on the disk source only when the hoster set them for the pool's mode.
 - **Reconciler unit tests:** license copy and vGPU registry copies only in namespaces with the `namespace.cozystack.io/vgpu` label set to `"true"` and a vGPU pool, none when the label is missing or has any other value, whatever the class budgets, removal when it stops being `"true"`; passthrough registry copies in namespaces with a passthrough pool; refresh only on a revision change; keep copies when the source is missing or the setting is removed; a same-named Secret without the managed-by label and revision annotation ignored.
 - **Reconcile Job:** bats tests like `hack/kairos-reconcile-script_test.bats` for token substitution and the revision gate.
 - **Image:** the `test` stage from section 1 for both modes, run by the hoster at build time.
@@ -214,9 +214,9 @@ The vGPU entitlement is a boundary set from above through the `gpu.vgpu` flag; a
 
 ## Rollout
 
-This proposal is implemented after GPUDevice: its API, the `gpu.vgpu` flag, the webhook mode check, and `deviceSelector` and `deviceTemplate` in `kubernetes-nodes` (its Rollout steps 1 and 2) are prerequisites, and this proposal is the Kairos part of its step 3.
+This proposal is implemented after GPUClaim: its API, the `gpu.vgpu` flag, the webhook mode check, and `claimSelector` and `claimTemplate` in `kubernetes-nodes` (its Rollout steps 1 and 2) are prerequisites, and this proposal is the Kairos part of its step 3.
 
-1. Cluster API v1.13.7 (cozystack/cozystack#4902), Kairos pools in `kubernetes-nodes` (cozystack/cozystack#4911), and GPUDevice Rollout steps 1 and 2 land.
+1. Cluster API v1.13.7 (cozystack/cozystack#4902), Kairos pools in `kubernetes-nodes` (cozystack/cozystack#4911), and GPUClaim Rollout steps 1 and 2 land.
 2. Build recipe, image test, and documentation land. Hosters can build images, and nothing consumes them yet.
 3. `gpu.kairosGuest`, `kairos.gpuMode`, the Secret reconciler, and chart support land, on the interim token path unless the provider has released `contentFrom` by then.
 4. When the provider ships `contentFrom`, the chart switches to it.
@@ -236,7 +236,7 @@ This proposal is implemented after GPUDevice: its API, the `gpu.vgpu` flag, the 
 
 - **Cozystack ships the guest driver.** Not allowed for vGPU: the vGPU guest driver is licensed per customer and may not be published. This proposal does not ship the data center driver either; whether a later revision could is an open question.
 - **One image with the vGPU guest driver for both modes.** NVIDIA's vGPU software guest driver can run on a passthrough GPU, but then it is licensed as a physical GPU, with `FeatureType` 0 or 2. Compute passthrough with the data center driver needs no license, so one image would add a license and a token where none is needed.
-- **Raw `gpus` entries by resource name on Kairos pools.** A raw name does not carry its mode and reserves nothing. GPUDevice classes carry the mode, and the `gpu.vgpu` flag grants vGPU explicitly.
+- **Raw `gpus` entries by resource name on Kairos pools.** A raw name does not carry its mode and reserves nothing. GPUClaim classes carry the mode, and the `gpu.vgpu` flag grants vGPU explicitly.
 - **Driver container in the tenant cluster.** The gpu-operator driver container would put the guest driver into an image every tenant cluster pulls, so each tenant cluster, where the tenant is cluster-admin, would need pull access to the hoster's registry. With a node image only the management cluster pulls it. Running that container on musl Hadron has not been tried.
 - **Token in a ConfigMap or values.** Puts license material into non-Secret objects (a ConfigMap, or the platform Package that holds the values) and into every Helm release revision, where it outlives a rotation.
 - **`pullMethod: node` for the worker image.** The kubelet would pull the image, but the credentials would still have to reach every tenant namespace with a GPU pool as a pull Secret, unless every management cluster node got node-level credentials, in the container runtime configuration or through a kubelet credential provider, and Cozystack manages neither.
