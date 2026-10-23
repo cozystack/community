@@ -2,8 +2,6 @@
 
 - **Title:** `Record architectural decisions alongside the proposals they amend`
 - **Author(s):** `@myasnikovdaniil`
-- **Date:** `2026-08-20`
-- **Status:** Review
 
 ## Overview
 

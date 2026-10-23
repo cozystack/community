@@ -2,8 +2,6 @@
 
 - **Title:** `User secrets API: platform-generated credentials minted on request, shown once, stored as verifiers`
 - **Author(s):** `@myasnikovdaniil`
-- **Date:** `2026-09-28`
-- **Status:** Review
 
 ## Overview
 

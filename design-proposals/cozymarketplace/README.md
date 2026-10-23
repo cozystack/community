@@ -2,8 +2,6 @@
 
 - **Title:** `Cozymarketplace — a meta-repository index of community External-Apps repositories`
 - **Author(s):** `@kvaps`
-- **Date:** `2026-06-23`
-- **Status:** Accepted
 - **Amended:** `2026-10-20`: reconciled with the shipped implementation; see Decisions.
 
 ## Decisions

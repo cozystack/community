@@ -2,8 +2,6 @@
 
 - **Title:** `Distributed tracing for managed applications via OTLP`
 - **Author(s):** `@scooby87`
-- **Date:** `2026-07-16` (revised 2026-07-31)
-- **Status:** Review
 
 ## Overview
 

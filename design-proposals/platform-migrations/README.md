@@ -2,8 +2,6 @@
 
 - **Title:** `Platform migration engine: slug-keyed migrations, an applied-set ledger, and an authoring contract`
 - **Author(s):** `@myasnikovdaniil`
-- **Date:** `2026-08-12`
-- **Status:** Draft
 
 ## Overview
 

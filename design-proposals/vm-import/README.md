@@ -2,8 +2,6 @@
 
 - **Title:** `VM import: tenant self-service migration of VMware virtual machines into Cozystack`
 - **Author(s):** `@kvaps`
-- **Date:** `2026-08-21`
-- **Status:** Proposed
 
 ## Overview
 

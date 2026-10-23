@@ -2,8 +2,6 @@
 
 - **Title:** `Vendor neutrality of the default LoadBalancer announcer`
 - **Author(s):** `@lexfrei`
-- **Date:** `2026-08-19`
-- **Status:** Accepted
 - **Decision date:** `2026-07-17`
 
 <!-- Retrospective record. The decision was executed before this document was
