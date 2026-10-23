@@ -3,11 +3,9 @@
 
 - **Title:** `Your full title`
 - **Author(s):** `@your-github-handle, @coauthor`
-- **Date:** `YYYY-MM-DD`
-- **Status:** Draft | Review | Accepted | Rejected | Superseded
 
-<!-- Status transitions: Draft → Review (PR opened) → Accepted (merged),
-     Rejected, or Superseded (replaced by a later proposal; link it). -->
+<!-- Proposal status and dates come from the PR and Git history.
+     See README.md#proposal-status-and-dates in the parent directory. -->
 
 ## Overview
 

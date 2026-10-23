@@ -2,8 +2,6 @@
 
 - **Title:** `Cozymarketplace — Phase 1 backend, private repository support, and publication validation`
 - **Author(s):** `@IvanHunters`
-- **Date:** `2026-06-25`
-- **Status:** Accepted
 - **Amended:** `2026-10-20`: reconciled with the shipped implementation, and the dependency on the closed `#12` removed; see Decisions.
 - **Supplements:** [`cozystack/community#18`](https://github.com/cozystack/community/pull/18) by `@kvaps`
 - **Related code:** [`cozystack/cozystack#2472`](https://github.com/cozystack/cozystack/pull/2472) (merged), [`cozystack/cozystack#2455`](https://github.com/cozystack/cozystack/issues/2455)

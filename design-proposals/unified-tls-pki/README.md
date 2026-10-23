@@ -2,8 +2,6 @@
 
 - **Title:** `Unified TLS and PKI model for managed applications`
 - **Author(s):** `@lexfrei`
-- **Date:** `2026-06-24`; revised `2026-09-03` (the §5 delivery mechanism, revised after the review of `cozystack/cozystack#3299` and its split into `cozystack/cozystack#3407`, `#3408` and `#3411`, and with §3's engine table, §4's naming and separator rule, §6, Testing and Alternatives rewritten alongside it)
-- **Status:** Accepted
 
 ## Overview
 

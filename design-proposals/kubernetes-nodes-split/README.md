@@ -2,8 +2,6 @@
 
 - **Title:** `Migrate kubernetes workers to Talos and split control-plane from node pools`
 - **Author(s):** `@kvaps`
-- **Date:** `2026-05-04`
-- **Status:** Accepted
 
 ## Overview
 

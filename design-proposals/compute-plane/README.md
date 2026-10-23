@@ -3,8 +3,6 @@
 
 - **Title:** `ComputePlane: a managed, isolated environment for running code-executing apps`
 - **Author(s):** `@kvaps`
-- **Date:** `2026-06-23`
-- **Status:** Accepted
 - **Supersedes:** the preset-field revision (#27) — the delivery surface and why the preset fields were set aside are recorded in [decision 0001](./decisions/0001-computeplane-ships-as-an-operator-owned-module.md).
 
 ## Overview

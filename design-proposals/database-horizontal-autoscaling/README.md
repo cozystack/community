@@ -2,8 +2,6 @@
 
 - **Title:** `Database Horizontal Autoscaler for Cozystack`
 - **Author(s):** `@scooby87`
-- **Date:** `2026-07-08`; revised `2026-07-24` (mechanism), `2026-07-29` and `2026-07-31` (addressing @lllamnyp and @IvanHunters review on PR #44), with earlier review by @IvanHunters, Gemini, and CodeRabbit
-- **Status:** Draft
 - **PoC:** `2026-08-10` — live validation confirmed the mechanism and pinned a hard precondition: the CNPG `Cluster` `/scale` subresource must serve a non-empty `status.selector` (else the HPA rejects the target with `reason=InvalidSelector`) — a behavioural gate, not a version floor (carried by 1.28.4+, 1.29.2+, 1.30.0+ but absent from 1.29.0/1.29.1); see [PoC finding](#poc-finding-2026-08-10--cnpg-scale-subresource-selector-gate-for-hpa-actuation)
 
 ## Overview

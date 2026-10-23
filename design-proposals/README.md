@@ -33,7 +33,6 @@ By proposing designs up front, we aim to reduce risk and ensure the project evol
 
     - Title
     - Author(s)
-    - Date
     
 1.  As with all commits in CNCF projects, please sign the commit for a DCO check:
     
@@ -53,6 +52,33 @@ To bring attention to your proposal, share it in the Cozystack community:
 ## Approval Process
 
 Proposals are reviewed in GitHub PRs. Once a proposal receives consensus from core maintainers (via `/lgtm` and comments), it will be merged and considered accepted. Merged proposals serve as a reference, not a binding spec.
+
+### Proposal status and dates
+
+Do not keep `Status` or `Date` fields in proposals. Use the following conventions when reading proposals or building reports from them.
+
+Use the PR that introduces the proposal to `main`. Apply the first matching row:
+
+| Condition | Proposal status |
+|---|---|
+| The proposal is under `design-proposals/archive/` on `main` | Withdrawn |
+| The introducing PR was merged into `main` | Accepted |
+| The introducing PR is closed without being merged | Not accepted |
+| The introducing PR is open and draft | Draft |
+| The introducing PR is open, ready for review, and has no submitted human reviews | Ready for consideration |
+| The introducing PR is open, ready for review, and has at least one submitted human review | Under review |
+
+A submitted human review counts regardless of its verdict. Bot reviews, pending reviews and ordinary PR comments do not count. Returning an open PR to draft makes the proposal a draft again, even if it already has reviews. A PR that amends an accepted proposal does not reset its status.
+
+Use the introducing PR's creation date for submission and its merge date for acceptance. Use Git history for changes to the document. These are separate events; there is no single proposal date. Acceptance does not mean the proposal has been implemented.
+
+### Withdrawing an accepted proposal
+
+To withdraw a proposal already on `main`, open a PR moving its entire directory to `design-proposals/archive/<proposal-title>/`, including decision records and supporting materials. Create the archive directory when the first proposal is withdrawn. Update relative links in the moved files and links elsewhere in the repository that point to them.
+
+Explain the withdrawal in the PR and link the replacement proposal if there is one. The proposal becomes withdrawn when that PR is merged; use its merge date as the withdrawal date. Proposals closed without acceptance remain in their PRs and do not need an archive copy.
+
+These conventions apply to design proposals. Decision records keep their own [status and date rules](#decision-records).
 
 ## Proposal Drift
 
