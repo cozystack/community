@@ -33,7 +33,7 @@ The `kubernetes` package (`packages/apps/kubernetes/`) carries a top-level `node
 
 ## Goals
 
-- Workers are uniformly Talos-bootstrapped across all tenants. No Ubuntu + kubeadm path remains in the chart after Phase 1 lands.
+- Workers are uniformly Talos-bootstrapped across all tenants. No Ubuntu + kubeadm path remains in the chart after Phase 1 lands. [`kairos-tenant-worker-pools`](../kairos-tenant-worker-pools/) later adds opt-in Kairos pools that join with kubeadm; Talos stays the out-of-the-box default.
 - The migration is seamless: existing tenants pick up Talos via a CAPI MachineDeployment rolling update, with no operator intervention beyond a chart upgrade.
 - A tenant cluster's control-plane lifecycle is separable from its node-pool lifecycles. Adding, scaling or replacing a pool does not touch the HelmRelease that owns the control-plane.
 - The package shape is set up to accept future hybrid backends (Phase 3) without further restructuring.
@@ -91,7 +91,7 @@ Once Phase 1 has rolled out, the chart's internals are split into two sibling pa
 
 A tenant cluster is therefore described as `1 × kubernetes` HelmRelease + `N × kubernetes-nodes` HelmReleases. The control-plane holds no reference to its node pools — workers self-register against the apiserver via Talos bootstrap, as they already do after Phase 1.
 
-There is no `backend.type` field in `kubernetes-nodes` values: the only backend is "kubevirt-talos", since Phase 3 (which would introduce alternative backends) is out of scope. The field will be added when Phase 3 lands.
+There is no `backend.type` field in `kubernetes-nodes` values: the only backend is "kubevirt-talos", since Phase 3 (which would introduce alternative backends) is out of scope. The field will be added when Phase 3 lands. `backend.type` concerns the backend; [`kairos-tenant-worker-pools`](../kairos-tenant-worker-pools/) later selects the worker OS separately, through a `NodeGroupClass`, so of the name `kubevirt-talos` only the substrate stays a backend property.
 
 ```mermaid
 flowchart LR
