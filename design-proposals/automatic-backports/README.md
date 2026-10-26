@@ -47,7 +47,7 @@ Batcher takes PR from `main` into release line when all of these hold:
 3. it is not breaking (no `!`, no `BREAKING CHANGE`);
 4. it touches no platform migrations or `targetVersion`, changes no CRD document, and has no API change that API review gate calls sizeable (description-only API changes pass), those wait for next minor;
 5. it applies to line (clean pick, or conflict resolved) and batch CI passes with it;
-6. when two lines are supported, older line takes fix only if newer line already has it, so upgrade from older line to newer never loses a fix.
+6. when two lines are supported, older line takes fix only if newer line already has it merged (open batch PR doesn't count), so older line is never ahead of newer one and upgrade from older line to newer never loses a fix.
 
 `feat`, `chore` and deps don't go to patches by rule. If some class of fixes should wait for minor, it becomes new rule, not per-PR call.
 
@@ -79,14 +79,36 @@ Batcher has two parts.
 4. open or update one PR per line: originals, conflicts, skipped items with reasons, release notes of originals;
 5. `backport-batch check <line>` fails while some qualifying fix is neither on line nor in open batch PR, it replaces `backport-audit` as patch-cut gate.
 
+Each original lands in batch as one commit (`cherry-pick -x -m 1` of its merge commit), so dropping or reverting one original is one commit.
+
 Agent part handles what needs judgement:
 
 - conflict: agent resolves it as separate commit per original that touches only original's files (`backport-batch fold` validates that), PR body shows it with range-diff;
-- failed CI: TIA jobs map to packages, so commits that touch failing package get dropped, batch is rebuilt without them and they go to next batch with reason.
+- failed CI: agent drops commits that touch failing package and rebuilds batch, dropped ones go to next batch with reason.
 
 Batcher runs on Monday and Thursday. Twice a week is often enough that fix reaches release line in days, and rare enough that nobody spends time on backports every day. Both days leave working days after batch to cut rc, run rc-e2e and promote before weekend.
 
 Maintainer reviews batch PR and merges it, rc is cut from line with the same workflows as today.
+
+### LLM parts and fallback
+
+Conflict resolution is LLM-based already today: backport conflicts are resolved by LLM agents under maintainer supervision, commit trailers show it. Correctness of a merge depends on agent the same way as correctness of original code, human guides the model and builds test harness around it. So agent resolves conflicts by default, and maintainer reviews batch PR as any other PR.
+
+Title check on PR to `main` is LLM-based too: author writes title, check reports mismatch, then human or human's agent reviews PR. After merge title is trusted, batcher doesn't check it again.
+
+Model access is Copilot provided to the project by CNCF, the same way as CI runners.
+
+### Manual mode
+
+Each LLM step is defined as a task with fixed inputs, allowed output and a check in code, not as a call to a particular model. Instructions for each task live in the repo, so CI agent, maintainer's own agent (Claude Code, Codex and so on) or maintainer by hand get the same task and their result passes the same check:
+
+| Task | Input | Output | Check |
+|---|---|---|---|
+| Resolve conflict | conflict list in batch PR body, original commit | one commit on batch branch | `backport-batch fold`: one commit per original, only original's files, `-x` of original |
+| Failed batch CI | failing jobs of batch PR | original deferred to next batch | `backport-batch run --defer <N>` rebuilds batch without it |
+| Title check | PR diff, title | mismatch report on PR | review |
+
+Manual mode is the same flow with a different executor. It's used when model is unavailable, when CI agent result is worse than what maintainer's agent does, or when agent gives up on a task. Scheduled run still builds batch and opens PR, conflicts and failures stay listed in PR body and maintainers get alert. Maintainer checks out batch branch, gives task to own agent or does it by hand, runs the check and pushes. Switching between CI agent and manual mode is a repo setting, nothing else in the flow changes. Nothing critical happens while a task waits: red batch doesn't merge, red rc-e2e blocks promote.
 
 ### Contributors
 
@@ -106,12 +128,15 @@ Nothing changes in clusters, this is process only. Rollback is revert of the cha
 
 ## Security
 
-Batcher works only with commits already merged to `main`. Untrusted input is PR text: titles, bodies and release notes copied into batch PR body are neutralized (mentions, closing keywords, links outside the repo). Agent steps read PR text too, so their output is checked by code: conflict commit must pass `fold` containment, and PR check only reports status. Guard decides from event data and repo permission lookup and never checks out PR code.
+Batcher works only with commits already merged to `main`, the same code we review and ship, so its agent part reads nothing that didn't pass review. Text copied into batch PR body (titles, bodies, release notes) is neutralized: mentions, closing keywords, links outside the repo. Conflict commit must pass `fold` containment. Title check on PR is advisory and not the only check, review stays. Guard decides from event data and repo permission lookup and never checks out PR code.
 
 ## Failure and edge cases
 
-- Conflict agent can't resolve: original goes to next batch, PR body says why.
-- Batch CI fails: commits touching failing package are dropped and retried next batch.
+- Conflict agent can't resolve: original goes to next batch, PR body says why, maintainer can resolve it by hand.
+- Batch CI fails: agent drops commits touching failing package and retries them next batch. If it can't find the culprit, maintainer splits batch.
+- rc-e2e fails after batch merged: promote is blocked as today, maintainer reverts culprit original on line (one commit) and cuts new rc.
+- Previous batch PR is not merged by next run: batcher says so in the PR and alerts maintainers, alerting is set up together with scheduled run.
+- Change reached line without `-x` line (manual pick, squash): re-pick is either empty and counted as present, or conflicts and resolver sees change is already there. After rollout batch is the only way to release lines and always adds `-x`.
 - `fix` that is really a feature passes review: maintainer sets `backport/skip`, or reverts it on line.
 - Docs fix for old docs: maintainer sets `backport/include`.
 - Original depends on PR that is not merged yet: pick conflicts or CI fails, it waits for next batch.
@@ -132,7 +157,8 @@ Everything lands together: docs and policy, guard, batcher, check on original PR
 
 ## Open questions
 
-- Agent part of batcher and check on original PR are LLM-based. Agree?
+- Title check on PR to `main` is LLM-based and advisory, review stays the final call. Agree?
+- Conflict resolution in batch is done by LLM agent by default, with maintainer fallback and batch PR review. Agree?
 
 ## Alternatives considered
 
