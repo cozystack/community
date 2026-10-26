@@ -2,8 +2,6 @@
 
 - **Title:** `Proxmox tenant networks: platform-owned bridge, VLANs and IP pools`
 - **Author(s):** `@themoriarti`
-- **Date:** `2026-10-20`
-- **Status:** Review
 
 ## Overview
 
