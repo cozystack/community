@@ -21,7 +21,7 @@ Not every GPU device ID maps to a PCI function. The GPU Operator's device plugin
 ## Decision
 
 - A function is healthy when every plugin device on it is allocatable, and unhealthy when a pod that has not finished holds one of its devices that is not. A function no plugin device maps to has no health.
-- Each function reports `allocatable`, the number of its plugin devices kubelet lists as allocatable: 1 for a VF or a GPU passed through whole, N for an mdev parent. The controller sums it over healthy functions, and a node has lost capacity for a resource name when it holds more units than that sum, or when a function is unhealthy.
+- Each function reports `allocatable`, the number of its plugin devices kubelet lists as allocatable: 1 for a VF or a GPU passed through whole, N for an mdev parent. A plugin device that names a whole IOMMU group counts once, on the group's lowest-addressed GPU function, and 0 on its other functions. The controller sums it over the functions that carry the resource name and caps the sum at the node's allocatable count from kubelet, which alone counts for a held name no function carries. A node has lost capacity for a resource name when it holds more units than that.
 - `GPUNode.status.resourceNames` lists every resource name on the node whose devices are GPUs, including names whose device IDs are NVML UUIDs the agent cannot place under a function. The names join the cluster's GPU resource names of section 3.
 - A function serving several pods, such as an mdev parent, names one of them in `usedBy`, the smallest by namespace and name, so the report is stable.
 
