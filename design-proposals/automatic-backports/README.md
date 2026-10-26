@@ -45,11 +45,13 @@ Batcher takes PR from `main` into release line when all of these hold:
 1. it merged to `main` after line branched and line doesn't carry it yet;
 2. title type is `fix` or `security`, CI and e2e fixes included;
 3. it is not breaking (no `!`, no `BREAKING CHANGE`);
-4. it touches no platform migrations, `targetVersion`, `api/` or CRDs, those wait for next minor;
+4. it touches no platform migrations or `targetVersion`, changes no CRD document, and has no API change that API review gate calls sizeable (description-only API changes pass), those wait for next minor;
 5. it applies to line (clean pick, or conflict resolved) and batch CI passes with it;
 6. when two lines are supported, older line takes fix only if newer line already has it, so upgrade from older line to newer never loses a fix.
 
 `feat`, `chore` and deps don't go to patches by rule. If some class of fixes should wait for minor, it becomes new rule, not per-PR call.
+
+Line released before this policy keeps patch content its users chose it with: it takes only fixes merged after the day policy starts, older ones need `backport/include`. Today that is release-1.6. Every newer line starts at its fork point.
 
 ### Maintainer overrides
 
