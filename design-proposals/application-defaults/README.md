@@ -17,6 +17,8 @@ This proposal covers instance creation. Defaults for platform components, applic
 
 ## Decisions
 
+No decision records yet. This is a new proposal.
+
 ## Context
 
 Developer defaults come from chart values and application schemas. The aggregated API also exposes schema defaults when reading an application, so a schema default is not a default restricted to new instances.
@@ -38,7 +40,8 @@ The shared API creation path can supply that boundary. It discovers the applicat
 - Persist installation defaults only when a new instance is created, including creation through apply.
 - Leave existing instances unaffected by installation configuration changes.
 - Show the values to be submitted in the dashboard before creation.
-- Reject unreadable or malformed configuration before writing a HelmRelease.
+- Keep application creation available when installation defaults cannot be loaded or applied.
+- Implement the merge once in Go and use server-side dry-run for dashboard previews.
 
 ### Non-goals
 
@@ -73,19 +76,17 @@ The platform chart renders a separate ConfigMap named `cozystack-application-def
 
 The configuration identifies applications by plural. It does not inspect kinds or maintain a list of supported applications. Entries for catalogs not installed yet can remain in the configuration.
 
-### Validation of configured defaults
+### Configuration errors and validation
 
-The shared application storage in `cozystack-api` validates defaults using the target ApplicationDefinition's `spec.application.openAPISchema`. This is implemented once in the API server, with Kubernetes/OpenAPI validation libraries and a check for unknown field paths. Application authors provide their schema and do not write another validator for this mechanism.
+There is no admission-time validation of the ConfigMap payload against a catalog of applications. The payload is a JSON string, and external catalogs may be installed after the configuration is saved. Application names and schemas are discovered through ApplicationDefinitions at runtime.
 
-Validation runs on every create request, after reading the ConfigMap and selecting the application's entry, before merging it into the user spec, checking quotas, running validating admission or writing a HelmRelease. Creation through apply and server-side dry-run use this same path. Existing instance reads and updates do not consult or validate installation defaults.
+On an application create request, the API reads the configuration and selects the entry by the target application's plural. The shared Go path can check that partial spec against the target ApplicationDefinition's `spec.application.openAPISchema`, without application-specific validators or prior knowledge of external catalogs. Supplied names, types and constraints are checked; required object properties that a user can supply later may be absent, while arrays are checked as complete replacement values. Unknown fields require a declared dictionary or free-form schema.
 
-Defaults are a partial spec. Supplied field names, types and value constraints are checked, while object properties that the user may supply later can remain absent. Replacement values such as arrays are checked as whole values.
+These checks protect the merge. They do not make optional defaults a prerequisite for creation. If the ConfigMap cannot be read, its JSON or structure is invalid, the selected entry cannot be checked against its schema, or its values fail those checks, the API skips installation defaults and continues with the submitted spec. No part of a rejected entry is merged. The API logs the configuration problem and may return a warning; ordinary user-spec validation, quotas and admission still run and can reject the application.
 
-Unknown field paths are rejected, with the full configuration path in the error. Additional keys are accepted only where the schema declares a dictionary or free-form content through `additionalProperties` or `x-kubernetes-preserve-unknown-fields`. This is a stricter rule for installation configuration than ordinary JSON Schema validation, which permits extra properties when `additionalProperties` is omitted. It does not modify the ApplicationDefinition.
+Generic parsing and reserved-field checks apply to the complete configuration; schema checks concern only the selected application's entry. A malformed mapping can therefore prevent defaults from being used for that request, but cannot by itself prevent application creation. An unknown plural remains available for a catalog installed later.
 
-If a configured application's schema is missing or cannot be read, creation fails before writing a HelmRelease. Application-specific checks apply to the selected entry; the generic JSON and mapping-structure checks apply to the complete ConfigMap. An entry for a catalog not installed yet is checked against its schema once that application becomes available.
-
-Saving the ConfigMap does not run these checks: Kubernetes sees its JSON payload as a string. Operators can exercise the creation path with `dry-run=server` before using the defaults for real instances. A separate admission webhook for ConfigMap updates is outside this proposal.
+Operators can test the result with an application create using `dry-run=server`. A ConfigMap validating webhook is outside this design. A failed defaults lookup or check follows the same fallback during dry-run and actual creation.
 
 ### Merge rules
 
@@ -110,27 +111,31 @@ Top-level fields beginning with `_` remain reserved by the existing application 
 
 ### API creation
 
-The API reads the ConfigMap directly from Kubernetes for each create request. It uses an uncached reader so a creation does not depend on a stale informer snapshot.
+The ConfigMap is consulted only for application creation, including creation previews through server-side dry-run. Get, List, Watch, Update and Helm rendering do not read it. The baseline uses a direct Kubernetes reader; caching and its freshness behavior remain an open question below.
 
-The create path supplements the spec before quota checks and validating admission, then writes it to `HelmRelease.spec.values`. Admission sees the values being saved. A rejected request writes no HelmRelease. Dry-run follows the same defaulting and validation path without persisting a resource.
+The create path merges usable defaults before quota checks and validating admission, then writes the resulting spec to `HelmRelease.spec.values`. Admission sees the values being saved. Dry-run follows that same path without persisting a resource. A quota or admission rejection still writes no HelmRelease, including when a configured default contributed to that rejection.
 
-Creation through apply must use the same create path. Updating an existing application does not apply installation defaults, even when a field is removed from the update.
+A failed defaults read is an optional-configuration failure: creation continues without installation defaults. The underlying Kubernetes API may still fail the later HelmRelease write, independently of this lookup. There is no additional availability requirement that the defaults ConfigMap must be readable for an application to be created.
 
-Get, List, Watch and Helm rendering do not read this ConfigMap. Developer chart/schema defaulting keeps its existing behavior.
+Creation through apply uses the same create path. Updating an existing application does not apply installation defaults, even when a field is removed from the update. Developer chart/schema defaulting keeps its existing behavior.
 
 ### Dashboard
 
-The dashboard gets the same named ConfigMap through the Kubernetes API before showing a creation form. A namespaced Role grants only `get` on this object. It grants no list, watch or write access, and no access to other ConfigMaps in `cozy-system`.
+The merge is implemented only in Go. The dashboard does not read the ConfigMap, merge installation values, or calculate developer defaults locally. It uses the existing application creation endpoint with `dryRun=All` to obtain the spec prepared by the server. No additional ConfigMap RBAC grant is needed.
 
-Initial values follow the same priority order. The form uses a copy of the schema, leaving the ApplicationDefinition unchanged. RJSF must preserve explicit empty values and keep developer defaults working for rows and dictionary entries added after initialization.
+The preview uses the real application name and tenant namespace, so application-specific name constraints and admission run through the normal API path. The name can be entered before initial settings are loaded. A preview error leaves the editor available for correction. Errors in the defaults configuration follow the server fallback and do not become dashboard configuration-loading failures.
 
-The form and YAML editor share the prepared spec. Displayed defaults are submitted as fields in that spec, so a later configuration change does not silently replace those displayed values. A configuration refresh preserves user edits. Editing an existing application starts from its saved values and does not load installation defaults.
+The returned spec is used by both the form and YAML editor. The form renders a copy of the ApplicationDefinition schema with automatic default filling disabled, including nested objects, new array rows and dictionary entries. The ApplicationDefinition itself is unchanged. Subsequent previews also go to the server; there is no TypeScript version of the merge algorithm and no hardcoded application defaults in the dashboard.
+
+Displayed values are submitted as fields in the spec. Newer user edits invalidate older preview responses, so a slow request cannot overwrite what the user typed. A refreshed preview preserves values already supplied in the request. Editing an existing application starts from its saved values and does not request a creation preview.
 
 ### Client behavior and stored values
 
-Values sent by Terraform or another client count as user values, including defaults the client populated itself. They take precedence over installation defaults. A client must leave a field absent for installation defaulting to supply it.
+Values sent by Terraform or another client count as user values, including defaults the client populated itself. They take precedence over installation defaults. A client must leave a field absent for installation defaulting to supply it. The same applies to values displayed by a server preview and then submitted by the dashboard.
 
-Persisting installation defaults pins an application to those values. Changing a default is not a request to update its existing instances. The saved spec shows the effective values but does not record their source or the ConfigMap revision.
+Persisting installation defaults pins an application to those values. Changing a default is not a request to update existing instances. The saved spec does not record which fields came from defaults or which ConfigMap revision was used. Values alone cannot identify every instance created with a particular revision; investigating and repairing old choices requires inspecting saved specs and changing them deliberately. No provenance annotation or automatic repair of existing instances is introduced.
+
+An operator applying the platform configuration does not apply or reconcile application instances. The separate question about server-side apply concerns clients creating an application with an apply PATCH. The storage path distinguishes an absent instance from an existing one: only the create branch adds installation defaults. Reapplying an existing application does not reload them. No separate defaults field manager is introduced; tests must exercise actual apply creation and later reapplication, including the aggregated API's existing field-ownership behavior.
 
 ### Example: tenant Talos workers
 
@@ -144,7 +149,9 @@ Registry mirrors configure container image pulls inside the worker and are separ
 
 Operators get the platform `applicationDefaults` setting. Application manifests keep the same API shape. New instances created with an omitted field may have that field filled in their stored spec.
 
-Dashboard users see the prepared values before submitting a new instance. Operators change an existing instance by editing its spec.
+Dashboard users see server-prepared values before submitting a new instance. Omitting a nested object lets installation defaults supply it; writing that object as `{}` suppresses installation defaults inside it. Root `spec: {}` still permits defaulting of its fields. Operators change an existing instance by editing its spec.
+
+A configured default is part of the effective request for quota and admission checks. If it exceeds a quota or violates a policy, the user receives the normal rejection and can supply a different value. A configuration lookup or validation failure instead skips defaults and continues creation.
 
 ## Upgrade and rollback compatibility
 
@@ -156,30 +163,32 @@ This proposal does not freeze developer chart defaults. Their existing read and 
 
 ## Security
 
-Operators control the defaulting configuration. Application users may override its values, so this is a convenience mechanism, not an enforcement policy.
+Operators control the defaulting configuration. Application users may override its values.
 
-Authenticated dashboard readers can read the named ConfigMap. Its contents must not include credentials or other secrets. Existing secret reference fields remain the way to supply those where an application supports them.
+Credentials and other secrets do not belong in this ConfigMap, just as they do not belong in platform package values. Applications use their existing secret reference fields where supported. This proposal adds no heuristic detection of secret-shaped fields or values: external applications can define arbitrary schemas.
+
+The dashboard receives the prepared application spec through the application API. It needs no direct read access to the defaults ConfigMap, and this feature grants none. Values copied into an application are visible to readers of that application's spec.
 
 ## Failure and edge cases
 
-- Missing ConfigMap: use no installation defaults.
-- Forbidden or failed ConfigMap read: reject creation before writing a HelmRelease; the dashboard blocks creation and shows the error.
-- Invalid JSON, a non-object root or a non-object application entry: reject creation. Validate the complete configuration, including entries for other applications.
-- Reserved top-level fields: reject configuration.
-- An unknown field or an invalid configured value for the selected application: reject creation with its configuration path, before any HelmRelease write.
-- Missing or unreadable schema for an application with configured defaults: reject creation.
+- Missing, forbidden or failed ConfigMap read: continue without installation defaults.
+- Invalid JSON, a non-object root, a non-object application entry or reserved top-level fields: skip defaults, report the configuration problem and continue creation.
+- Unknown field, invalid configured value, or a missing or unreadable schema for the selected application: skip the selected defaults without merging a partial result; continue normal application validation and creation.
 - Unknown plural: retain the entry for a future catalog; it matches no current application.
-- Invalid user values or quota/admission rejection: preserve the existing rejection behavior, after considering installation defaults.
-- Configuration changes during an open dashboard form: retain the displayed values and user edits.
+- Invalid user values or quota/admission rejection: preserve the existing rejection behavior. A default that fails quota or admission does not trigger a retry with different values.
+- Configuration changes during an open dashboard form: retain displayed values and user edits. A later preview uses those values as user input.
+- A preview response arriving after newer edits: discard it.
 - Required nulls that existing normalization treats as unset: preserve that repair behavior, with ordering to be settled during review.
 
 ## Testing
 
-Go tests must cover merge precedence, nested objects, explicit empty values, configuration failures, quota and admission ordering, dry-run and creation through apply. Schema validation tests must reject unknown paths and wrong value types, allow partial objects and declared free-form dictionaries, and reject configured defaults when the target schema cannot be read. Lifecycle tests must verify that Get, List, Watch and Update do not use new installation defaults.
+Go tests cover merge precedence, nested objects, explicit empty values, quota and admission ordering, dry-run and creation through apply. Configuration failure tests must show that read, parsing, structure and schema-check failures leave the submitted spec untouched and still allow ordinary creation. Invalid configured values must never be saved as a partial merge. Separate tests preserve rejections for invalid user specs, quotas and admission.
 
-Helm tests cover the separate JSON ConfigMap, empty configuration, exclusion from shared chart values and the named-object RBAC grant.
+Schema checks cover unknown paths, wrong types, partial objects and declared free-form dictionaries without application-specific code. Lifecycle tests verify that Get, List, Watch and Update do not consult installation defaults. Server-side apply tests cover actual create and update requests, reapplication after configuration changes and field ownership.
 
-Dashboard tests cover initial values, form/YAML transitions, edits during configuration refresh, explicit empty objects and arrays, and developer defaults in dynamically added entries. Edit mode must not receive installation defaults.
+Helm tests cover the separate JSON ConfigMap, empty configuration and exclusion from shared chart values. The dashboard adds no ConfigMap read permissions.
+
+Dashboard tests use dry-run responses as the source of displayed values. They cover initial loading, new array and dictionary entries, form/YAML transitions, user edits while a request is pending, failed previews, and submission of the displayed spec. RJSF must not refill schema defaults independently. Edit mode must not issue creation previews.
 
 KubernetesNodes render tests cover factory URLs, installer repositories and mirrors from stored values. Both a pool with saved installation defaults and a pool created before the ConfigMap exists must keep their disk URL and template name after configuration changes and a later edit.
 
@@ -187,15 +196,14 @@ An unrelated application and an arbitrary application plural verify that the mec
 
 ## Rollout
 
-Ship the platform ConfigMap, API creation logic and dashboard support together. Install the named-object RBAC grant before the new dashboard needs to read it. Keep the configuration empty by default.
+Ship the platform ConfigMap, API creation logic and dashboard dry-run previews together. Keep the configuration empty by default. No additional dashboard ConfigMap RBAC is installed.
 
-Operators can then configure defaults for new instances. Documentation must state the create-only behavior, client default precedence and ConfigMap visibility. There is no automatic conversion of old settings or update of existing instances.
+Documentation must state the create-only behavior, user-value precedence, fallback when defaults are unavailable or invalid, and the difference between omitted and empty objects. It must also explain that values sent by clients count as user choices. There is no automatic conversion of old settings or update of existing instances.
 
 ## Open questions
 
+- Should the create path use a cached ConfigMap reader? A cache could reduce Kubernetes reads during creation and preview, but its freshness and behavior after a failed refresh need an agreed contract. This does not affect Get/List/Watch/Update, which never consult the defaults configuration.
 - Should required-null normalization happen before installation defaulting, so a repaired user null receives the installation value? The prototype currently applies installation defaults before the existing normalization step.
-- Should malformed configuration for an unrelated application block every create request, as proposed here, or only requests for that application?
-- Is a GET refresh on dashboard navigation or focus sufficient for configuration changes, while preserving the values already shown to the user?
 
 ## Alternatives considered
 
@@ -210,6 +218,10 @@ The API applies schema defaults on reads. Changing them reaches existing instanc
 ### Client-side defaults
 
 Clients can already send the chosen values, and keep that ability. Implementing the policy in each dashboard, Terraform provider and command-line workflow gives no shared behavior for clients that omit fields.
+
+### A dashboard merge implementation
+
+Reading the ConfigMap in the dashboard and implementing the merge in TypeScript duplicates the Go rules and requires extra access to configuration. Shared fixtures would test agreement between two implementations but would still leave two implementations to maintain. A server-side dry-run provides the preview through the same path used for creation.
 
 ### A new defaults API resource
 
