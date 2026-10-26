@@ -28,7 +28,7 @@ The VMI webhook reads the effective table from the KubeVirt CR, the resource nam
 
 - A tenant learns at start, from the webhook message, that the offer is not usable yet, and the claim stays unattached and moves by the usual rules.
 - The webhook and the controller condition read the same lists of the table, so the condition predicts the refusal. KubeVirt's own check also covers `usb` entries, which no GPU class uses.
-- Every VMI admission with claim references reads the KubeVirt CR, through the controller's cache.
+- Every VMI admission with claim references reads the KubeVirt CR from the API server, not from the controller's cache: the replicas serve admission and a lagging cache could admit what should be refused.
 
 ## Revisit if
 
