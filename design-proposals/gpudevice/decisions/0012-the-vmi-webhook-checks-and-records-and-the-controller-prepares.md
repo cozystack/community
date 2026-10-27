@@ -32,7 +32,7 @@ The VMI webhook resolves the claim references, runs the checks that need no plac
 - A set that cannot be placed is no longer an admission error. The VM shows `Starting`, the VMI waits in `Scheduling` with `PodScheduled=False`, reason `SchedulingGated`, and the claims carry a condition naming the reason while the VMI gets a `Warning` event with the same reason. The VM starts as soon as the set fits, with no per-item backoff of the VM controller in between.
 - The pod webhook is a fail-closed dependency of every start of a VM with class or claim entries, like the VMI webhook.
 - The cluster autoscaler does not scale up for a gated pod, and after the pin a new node cannot help that pod, so GPU node scale-up stays with the hoster.
-- A pin cannot be undone, so a node that refuses a pinned pod costs one failed VMI. Where the VM's `runStrategy` creates a next VMI after it, that VMI also waits for KubeVirt's start-failure backoff (the `runStrategy` table in the proposal's Failure and edge cases). The rejected-node rule keeps this from repeating.
+- A pin cannot be undone, so a node that refuses a pinned pod costs one failed VMI. Where the VM's `runStrategy` creates a next VMI after a VMI that failed before it ran, that VMI also waits for KubeVirt's start-failure backoff (the `runStrategy` table in the proposal's Failure and edge cases). The rejected-node rule keeps this from repeating.
 
 ## Revisit if
 
