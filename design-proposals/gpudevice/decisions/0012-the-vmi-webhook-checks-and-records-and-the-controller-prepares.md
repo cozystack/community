@@ -20,8 +20,8 @@ The VMI webhook resolves the claim references, runs the checks that need no plac
 
 ## Why not the alternatives
 
-- **Keep the work in the webhook.** A fail-closed admission call that writes several objects and waits on another controller is slow under load, needs its own request protocol between the two, and turns every slow move into a refused VMI and a KubeVirt backoff.
-- **Refuse the VMI whenever a gather is needed and let the controller move the claims before KubeVirt's retry.** It drops the handshake but keeps the backoff, so the start still comes up to the backoff limit after the claims are ready, and the tenant sees a refusal for a VM that will start.
+- **Keep the work in the webhook.** A fail-closed admission call that writes several objects and waits on another controller is slow under load, needs its own request protocol between the two, and turns every slow move into a refused VMI and the per-item backoff of KubeVirt's VM controller.
+- **Refuse the VMI whenever a gather is needed and let the controller move the claims before KubeVirt's retry.** It drops the handshake but keeps the VM controller's per-item backoff, so the start still comes up to that backoff's limit after the claims are ready, and the tenant sees a refusal for a VM that will start.
 - **Hold the VMI instead of the pod**, through a KubeVirt start strategy or a VM-level hold. KubeVirt v1.9.0 offers none that keeps the pod from being scheduled: `startStrategy: Paused` still schedules the pod and only pauses the guest. A scheduling gate is the hook Kubernetes provides for this, and KubeVirt neither touches it nor times it out.
 - **Write the pin into the VMI's node affinity.** Under `vmRolloutStrategy: LiveUpdate` KubeVirt rewrites a VMI's affinity from the VM template, and it never changes a launcher pod's affinity, so the pod is the place that keeps the pin.
 
@@ -29,10 +29,10 @@ The VMI webhook resolves the claim references, runs the checks that need no plac
 
 - The webhook is a pure check plus the attachment record, so its latency no longer depends on the binder, and a dry run only skips the record.
 - Template claims are created after the VMI exists, so the controller sets their owner at creation, and a template claim no longer needs a grace period for a VMI that never appears.
-- A set that cannot be placed is no longer an admission error. The VM shows `Starting`, the VMI waits in `Scheduling` with `PodScheduled=False`, reason `SchedulingGated`, and the claims carry a condition naming the reason while the VMI gets a `Warning` event with the same reason. The VM starts as soon as the set fits, with no KubeVirt backoff in between.
+- A set that cannot be placed is no longer an admission error. The VM shows `Starting`, the VMI waits in `Scheduling` with `PodScheduled=False`, reason `SchedulingGated`, and the claims carry a condition naming the reason while the VMI gets a `Warning` event with the same reason. The VM starts as soon as the set fits, with no per-item backoff of the VM controller in between.
 - The pod webhook is a fail-closed dependency of every start of a VM with class or claim entries, like the VMI webhook.
 - The cluster autoscaler does not scale up for a gated pod, and after the pin a new node cannot help that pod, so GPU node scale-up stays with the hoster.
-- A pin cannot be undone, so a node that refuses a pinned pod costs one failed VMI and KubeVirt's start-failure backoff, which the rejected-node rule keeps from repeating.
+- A pin cannot be undone, so a node that refuses a pinned pod costs one failed VMI. Where the VM's `runStrategy` creates a next VMI after it, that VMI also waits for KubeVirt's start-failure backoff (the `runStrategy` table in the proposal's Failure and edge cases). The rejected-node rule keeps this from repeating.
 
 ## Revisit if
 
