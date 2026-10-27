@@ -138,7 +138,7 @@ Nothing changes in clusters, this is process only. Rollback is revert of the cha
 
 ## Security
 
-Batcher works only with commits already merged to `main`, the same code we review and ship, so its agent part reads nothing that didn't pass review. Text copied into batch PR body (titles, bodies, release notes) is neutralized: mentions, closing keywords, links outside the repo. Conflict commit must pass `fold` containment. Title check on PR is advisory and not the only check, review stays. Guard decides from event data and repo permission lookup and never checks out PR code.
+Batcher works only with commits already merged to `main`, the same code we review and ship. Conflict agent still reads PR bodies and commit messages. That text was reviewed, but it can still carry instructions aimed at the agent, so the guard there is CI check on batch PR that every original changes only its own files, plus review of batch PR. Text copied into batch PR body (titles, bodies, release notes) is neutralized: mentions, closing keywords, links outside the repo. Title check on PR is advisory and not the only check, review stays. Guard decides from event data and repo permission lookup and never checks out PR code.
 
 ## Failure and edge cases
 
