@@ -2,8 +2,6 @@
 
 - **Title:** `GPUClaim: a GPU catalog, per-tenant GPU reservations for VMs and worker pools, and the host layer under them`
 - **Author(s):** `@lexfrei`
-- **Date:** `2026-10-14`
-- **Status:** Review
 
 ## Overview
 
