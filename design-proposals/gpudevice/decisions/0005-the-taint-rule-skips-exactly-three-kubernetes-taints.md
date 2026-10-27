@@ -10,7 +10,7 @@
 
 ## Context
 
-Section 2 keeps binds, moves, rebinds and gathers off nodes with a `NoSchedule` or `NoExecute` taint that virt-launcher pods do not tolerate, and leaves out "the `node.kubernetes.io/*` taints Kubernetes sets itself for a cordon or a node that is not `Ready`", because the cordon and readiness rules already cover those nodes. Read as a prefix, that sentence would also skip the other well-known taints Kubernetes defines under `node.kubernetes.io/`: `memory-pressure`, `disk-pressure`, `pid-pressure`, `network-unavailable` and `out-of-service`. None of them mirrors a cordon or readiness, and a node carrying one of them as `NoSchedule` or `NoExecute` would still be bound to, though the scheduler keeps a virt-launcher pod that does not tolerate it off the node.
+Section 2 kept binds, moves, rebinds and gathers off nodes with a `NoSchedule` or `NoExecute` taint that virt-launcher pods do not tolerate, and left out "the `node.kubernetes.io/*` taints Kubernetes sets itself for a cordon or a node that is not `Ready`", because the cordon and readiness rules already cover those nodes. Read as a prefix, that sentence would also skip the other well-known taints Kubernetes defines under `node.kubernetes.io/`: `memory-pressure`, `disk-pressure`, `pid-pressure`, `network-unavailable` and `out-of-service`. None of them mirrors a cordon or readiness, and a node carrying one of them as `NoSchedule` or `NoExecute` would still be bound to, though the scheduler keeps a virt-launcher pod that does not tolerate it off the node.
 
 ## Decision
 

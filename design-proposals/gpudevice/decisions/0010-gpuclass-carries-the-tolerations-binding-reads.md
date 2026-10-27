@@ -1,4 +1,4 @@
-# 0010. `GPUClass` carries the tolerations that binding and `free` read
+# 0010. `GPUClass` carries the tolerations that `free`, binding and the launcher pod read
 
 - **Number:** `0010`
 - **Date:** `2026-10-23`
@@ -14,7 +14,7 @@ Section 2 kept binds, moves, rebinds and gathers off nodes with a `NoSchedule` o
 
 ## Decision
 
-`GPUClass` has a `tolerations` field, in the shape of a pod's with the operators `Exists` and `Equal` only, which the hoster sets to the taints of the class's nodes that its VMs tolerate. A node counts for binding, moves, rebinds, gathers, capacity, `free` and `maxFreePerNode` of a class only if the class tolerates each of its `NoSchedule` and `NoExecute` taints, except the three that 0005 skips, `node.kubernetes.io/unschedulable`, `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable`, for the reasons 0005 gives. A set of claims of several classes takes a node only when every class of the set tolerates its taints. The virt-launcher pod of a VMI gets the tolerations of its claims' classes when it is created. The class admits only tolerations that pod validation admits, so a class can never produce a launcher pod the API server refuses. `tolerations` can change while claims are held, like `nodeSelector`.
+`GPUClass` has a `tolerations` field, in the shape of a pod's with the operators `Exists` and `Equal` only, which the hoster sets to the taints of the class's nodes that its VMs tolerate. A node counts for a class's capacity, `free` and `maxFreePerNode`, and in step 2 for its binds, moves, rebinds and gathers, only if the class tolerates each of its `NoSchedule` and `NoExecute` taints, except the three that 0005 skips, `node.kubernetes.io/unschedulable`, `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable`, for the reasons 0005 gives. A set of claims of several classes takes a node only when every class of the set tolerates its taints. The virt-launcher pod webhook adds the tolerations of the VMI's classes to the pod when it is created. The class admits only tolerations that pod validation admits, so a class can never produce a launcher pod the API server refuses. `tolerations` can change, also while the class is in use.
 
 ## Why not the alternatives
 
@@ -30,4 +30,4 @@ Section 2 kept binds, moves, rebinds and gathers off nodes with a `NoSchedule` o
 
 ## Revisit if
 
-Kubernetes lets a reservation be scheduled ahead of its pod, so tolerations can be checked against the pod that will use the GPU, for example through DRA (section 8).
+Kubernetes lets a reservation be scheduled ahead of its pod, so tolerations can be checked against the pod that will use the GPU, for example through DRA (section 10).

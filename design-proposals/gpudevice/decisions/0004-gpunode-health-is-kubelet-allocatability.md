@@ -2,7 +2,7 @@
 
 - **Number:** `0004`
 - **Date:** `2026-10-20`
-- **Status:** Accepted
+- **Status:** Superseded by [`0015`](./0015-node-allocatable-is-the-gpu-inventory.md)
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99)

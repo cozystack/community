@@ -1,4 +1,4 @@
-# 0001. A claim whose class resource name KubeVirt does not permit is refused at VMI admission
+# 0001. A class whose resource name KubeVirt does not permit is refused at VMI admission
 
 - **Number:** `0001`
 - **Date:** `2026-10-20`
@@ -12,11 +12,11 @@
 
 On the `default` and `vgpu` variants the platform writes a `permittedHostDevices` table into the KubeVirt CR whenever it has entries. The proposal assumed that KubeVirt refuses a GPU outside that table when the VMI is admitted. It does not. In KubeVirt v1.9.0 no admitter refuses a GPU or host-device name the table leaves out; the GraceIOVirtualization admitter reads the table only to apply its rules to names listed there, and the refusal is `validatePermittedHostDevices` in [`renderresources.go`](https://github.com/kubevirt/kubevirt/blob/v1.9.0/pkg/virt-controller/services/renderresources.go), which runs when virt-controller renders the virt-launcher pod. A render error creates no pod, and the VMI stays `Pending` with `Synchronized=False`, reason `FailedCreate`, retried with backoff. It never reaches a final phase.
 
-That defeats the attachment rules of section 2. A claim leaves `Attached` only when its VMI is final or removed, so a claim of a class whose `resourceName` the table leaves out would stay attached to a VMI that never runs, held and in the usage records, until someone deletes the VMI by hand. A hoster gets there easily: a class is created for a new resource name before the table lists it, or the table is edited and drops an entry.
+A VM that names such a class would start and never run, with nothing telling the tenant why at start. With held claims (step 2) it is worse: a claim leaves `Attached` only when its VMI is final or removed, so a claim of a class whose `resourceName` the table leaves out would stay attached to a VMI that never runs, held and in the usage records, until someone deletes the VMI by hand. A hoster gets there easily: a class is created for a new resource name before the table lists it, or the table is edited and drops an entry.
 
 ## Decision
 
-The VMI webhook reads the effective table from the KubeVirt CR, the resource names of its `pciHostDevices` and `mediatedDevices` entries, and refuses a VMI whose claim set includes a class whose `resourceName` is not in it, with a message naming the class and the name. An unset table means KubeVirt checks nothing, and then neither does the webhook. The controller also sets a `ResourceNameNotPermitted` condition on such a class, so the hoster sees the gap before a tenant hits it.
+The VMI webhook reads the effective table from the KubeVirt CR, the resource names of its `pciHostDevices` and `mediatedDevices` entries, and refuses a VMI with a class entry or a claim of a class whose `resourceName` is not in it, with a message naming the class and the name. An unset table means KubeVirt checks nothing, and then neither does the webhook. The controller also sets a `ResourceNameNotPermitted` condition on such a class, so the hoster sees the gap before a tenant hits it.
 
 ## Why not the alternatives
 
@@ -26,9 +26,9 @@ The VMI webhook reads the effective table from the KubeVirt CR, the resource nam
 
 ## Consequences
 
-- A tenant learns at start, from the webhook message, that the offer is not usable yet, and the claim stays unattached and moves by the usual rules.
+- A tenant learns at start, from the webhook message, that the offer is not usable yet; in step 2 the claim stays unattached and moves by the usual rules.
 - The webhook and the controller condition read the same lists of the table, so the condition predicts the refusal. KubeVirt's own check also covers `usb` entries, which no GPU class uses.
-- Every VMI admission with claim references reads the KubeVirt CR from the API server, not from the controller's cache: the replicas serve admission and a lagging cache could admit what should be refused.
+- Every VMI admission with class or claim entries reads the KubeVirt CR from the API server, not from the controller's cache: the replicas serve admission and a lagging cache could admit what should be refused.
 
 ## Revisit if
 

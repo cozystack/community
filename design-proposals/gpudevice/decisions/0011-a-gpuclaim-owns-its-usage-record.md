@@ -16,7 +16,7 @@ Section 5 kept each claim's `Workload` usage record under a `WorkloadMonitor` th
 
 ## Decision
 
-Each GPU usage record carries an ownerReference to its `GPUClaim` and no monitor label. The GPU controller keeps it while the claim holds GPUs, as section 5 defines, and garbage collection removes it with the claim. The `Workload` controller leaves a record owned by a `GPUClaim` to its owner instead of deleting it for a missing monitor. There is no GPU `WorkloadMonitor`, no reserved label key and no admission policy for it.
+Each GPU usage record carries an ownerReference to its `GPUClaim` and no monitor label. The GPU controller keeps it while the claim holds GPUs, as section 9 defines, and garbage collection removes it with the claim. The `Workload` controller leaves a record owned by a `GPUClaim` to its owner instead of deleting it for a missing monitor. There is no GPU `WorkloadMonitor`, no reserved label key and no admission policy for it.
 
 ## Why not the alternatives
 
