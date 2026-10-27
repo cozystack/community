@@ -2,8 +2,6 @@
 
 - **Title:** `GPU virtual machines: vGPU and passthrough with hoster-supplied guest images`
 - **Author(s):** `@lexfrei`
-- **Date:** `2026-10-14`
-- **Status:** Review
 
 ## Overview
 
