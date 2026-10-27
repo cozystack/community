@@ -30,7 +30,7 @@ The VMI webhook resolves the claim references, runs the checks that need no plac
 - The webhook is a pure check plus the attachment record, so its latency no longer depends on the binder, and a dry run only skips the record.
 - Template claims are created after the VMI exists, so the controller sets their owner at creation, and a template claim no longer needs a grace period for a VMI that never appears.
 - A set that cannot be placed is no longer an admission error. The VM shows `Starting`, the VMI waits in `Scheduling` with `PodScheduled=False`, reason `SchedulingGated`, and the claims carry a condition naming the reason while the VMI gets a `Warning` event with the same reason. The VM starts as soon as the set fits, with no KubeVirt backoff in between.
-- The pod webhook is a fail-closed dependency of every start of a VM with claim references, like the VMI webhook.
+- The pod webhook is a fail-closed dependency of every start of a VM with class or claim entries, like the VMI webhook.
 - The cluster autoscaler does not scale up for a gated pod, and after the pin a new node cannot help that pod, so GPU node scale-up stays with the hoster.
 - A pin cannot be undone, so a node that refuses a pinned pod costs one failed VMI and KubeVirt's start-failure backoff, which the rejected-node rule keeps from repeating.
 
