@@ -1,4 +1,4 @@
-# 0007. Whoever can write a VM uses the GPUs of its class entries, while held claims stay with tenant admins
+# 0007. Whoever can write a VM uses the GPUs of its class entries, while ordered claims stay with tenant admins
 
 - **Number:** `0007`
 - **Date:** `2026-10-20`
@@ -16,7 +16,7 @@ In Cozystack more identities can write a `vm-instance` than can write a `GPUClai
 
 ## Decision
 
-A class entry is part of the VM, so whoever can write the VM uses its GPUs within the tenant's budget, as with the VM's CPU and memory, and whoever can start it makes them run and enter the usage records for as long as the VMI runs; in step 2 the start also makes the entry's template claims exist. The budget is checked when the VM is written (section 5), the vGPU entitlement at every VMI admission, and in step 2 capacity when the controller creates and binds the template claims; none of these checks the identity behind the VM. Ordering a held `GPUClaim` directly stays with tenant admins and above.
+A class entry is part of the VM, so whoever can write the VM uses its GPUs within the tenant's budget, as with the VM's CPU and memory, and whoever can start it makes them run and enter the usage records for as long as the VMI runs; in step 2 the start also makes the entry's template claims exist. The budget is checked when the VM is written (section 5), the vGPU entitlement at every VMI admission, and in step 2 capacity when the controller creates and binds the template claims; none of these checks the identity behind the VM. Ordering a `GPUClaim` directly stays with tenant admins and above.
 
 ## Why not the alternatives
 
@@ -26,7 +26,7 @@ A class entry is part of the VM, so whoever can write the VM uses its GPUs withi
 ## Consequences
 
 - A tenant admin who hands out a tenant ServiceAccount also hands out the ability to use GPUs through class entries, up to the tenant's budget, and the `use` role lets its holder start VMs that already carry class entries. The budget, the class keys and the vGPU entitlement are the controls that limit both.
-- A held claim, which holds GPUs and is recorded while it is `Bound` or `Attached` whether or not anything runs on it, still needs a tenant admin.
+- An ordered claim, which holds GPUs and is recorded while it is `Bound` or `Attached` whether or not anything runs on it, still needs a tenant admin.
 
 ## Revisit if
 

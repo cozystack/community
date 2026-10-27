@@ -21,7 +21,7 @@ Section 1 froze a class's `mode` only while its finalizer was present, that is w
 ## Why not the alternatives
 
 - **Keep the pool's mode field and the label check.** Two fields say the same thing, one of them can be wrong, and the webhook has to refuse the mismatch at every worker start instead of the chart getting it right once. A VMI without the label was a third state nobody had defined.
-- **Freeze `mode` only while claims exist, as section 1 had it.** A class without claims could switch mode, and a pool that names it would then render workers for the other mode, so the chart could not rely on the name. The hoster loses nothing by the stricter rule: a different mode is a new class with a new name, which a tenant has to order against anyway because budgets and prices are per class.
+- **Freeze `mode` only while claims exist, as section 1 had it.** A class without claims could switch mode, and a pool that names it would then render workers for the other mode, so the chart could not rely on the name. The hoster loses nothing by the stricter rule: a different mode is a new class with a new name, which a tenant has to name anyway because budgets and prices are per class.
 
 ## Consequences
 

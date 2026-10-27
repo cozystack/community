@@ -16,7 +16,7 @@ When this was decided, VEP 344 was open and its implementation, kubevirt/kubevir
 
 ## Decision
 
-Holding is step 2 of the proposal, in a section of its own, and none of its kinds, fields or phases enter the API before it: `GPUClaim`, `onCordon` and the class finalizer, `claim` and `claimSelector` entries, the binder, moves, `Lost` and rebind, the gather, the launcher pod gate and pin, template claims for class entries, the claim order webhook and tamper policy, the usage records of held claims, and `gpu.rawResourceNames: forbidden`.
+Holding is step 2 of the proposal, in a section of its own, and none of its kinds, fields or phases enter the API before it: `GPUClaim`, `onCordon` and the class finalizer, `claim` and `claimSelector` entries, the binder, moves, `Lost` and rebind, the gather, the launcher pod gate and pin, template claims for class entries, the claim order webhook and tamper policy, the usage records of ordered claims, and `gpu.rawResourceNames: forbidden`.
 
 Holding stays GPU-specific and does not become a generic reservation. CPU and memory are interchangeable across nodes, so a reservation of them is a count the scheduler can meet on any node with room. A GPU hold is a whole unit on a specific node that does not migrate, since KubeVirt cannot live-migrate a VM with a passthrough GPU or an SR-IOV VF, and that is the reason for the binder, `Lost`, the gather and `onCordon`. A DRA path does not exist today: VEP 344 is open and unimplemented, and the vGPU VF is handed out by a device plugin, not by a DRA driver.
 

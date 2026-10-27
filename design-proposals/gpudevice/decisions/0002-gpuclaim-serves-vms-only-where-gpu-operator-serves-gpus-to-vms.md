@@ -20,7 +20,7 @@ The platform treats GPUs as serving VMs when the iaas bundle is on, `cozystack.g
 
 - `vm-instance` and `kubernetes-nodes` refuse to render class and claim entries, through a cluster value the platform writes only where GPUs serve VMs, and `name` entries work as today.
 - In step 2 the platform refuses `gpu.rawResourceNames: forbidden`, because the policy that enforces it does not render there.
-- In step 2 the controller still adds and removes the finalizers of `GPUClass` and `GPUClaim` and keeps the usage records of claims, so deleting a class, a claim or a tenant namespace never hangs.
+- In step 2 the controller still adds and removes the finalizers of `GPUClass` and `GPUClaim` and keeps the usage records of ordered claims, so deleting a class, a claim or a tenant namespace never hangs.
 
 ## Why not the alternatives
 
