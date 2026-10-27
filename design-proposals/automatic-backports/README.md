@@ -9,6 +9,8 @@ Backports stop being a per-PR decision. Everything that can go to patch release 
 
 ## Decisions
 
+- [`0001`: Each original reaches the release line as a merge commit with its own commits](decisions/0001-each-original-reaches-the-line-as-a-merge-with-its-own-commits.md)
+
 ## Context
 
 Today maintainer labels original PR with `kind/backport` (newest line) or `kind/backport-previous` (previous line), `backport.yaml` opens one PR per original, conflicts are ported by hand, and `backport-audit` checks before rc that nothing labelled is missing. Numbers below are from v1.6.1 to v1.6.5: 103 originals, 90 of them came through backport PRs.
@@ -46,7 +48,7 @@ Batcher takes PR from `main` into release line when all of these hold:
 2. title type is `fix` or `security`, CI and e2e fixes included;
 3. it is not breaking (no `!`, no `BREAKING CHANGE`);
 4. it touches no platform migrations or `targetVersion`, changes no CRD document, and has no API change that API review gate calls sizeable (description-only API changes pass), those wait for next minor;
-5. it applies to line (clean pick, or conflict resolved) and batch CI passes with it;
+5. its commits apply to line (clean picks, or conflict resolved) and batch CI passes with it;
 6. when two lines are supported, older line takes fix only if newer line already has it merged (open batch PR doesn't count), so older line is never ahead of newer one and upgrade from older line to newer never loses a fix.
 
 `feat`, `chore` and deps don't go to patches by rule. If some class of fixes should wait for minor, it becomes new rule, not per-PR call.
@@ -73,18 +75,26 @@ Batcher has two parts.
 
 `cmd/backport-batch` (Go) is deterministic part:
 
-1. scan: merges to `main` since line branched, what line already carries (`-x` trailers and "Backport of #N" in line history, or pick that changes nothing), override labels;
+1. scan: merges to `main` since line branched, what line already carries (trailer or `-x` line naming original's merge commit, `-x` lines of PR's commits or "Backport of #N" in line history, or picks that change nothing), override labels;
 2. select by rules and overrides;
-3. build `backport-batch/<line>-<date>` off line head, one `cherry-pick -x` commit per original in merge order;
+3. build `backport-batch/<line>-<date>` off line head, one merge commit per original in merge order;
 4. open or update one PR per line: originals, conflicts, skipped items with reasons, release notes of originals;
 5. `backport-batch check <line>` fails while some qualifying fix is neither on line nor in open batch PR, it replaces `backport-audit` as patch-cut gate.
 
-Each original lands in batch as one commit (`cherry-pick -x -m 1` of its merge commit), so dropping or reverting one original is one commit.
+Each original lands in batch the way it sits on `main`, as merge commit with PR's own commits inside. For original merged to `main` as M, batcher picks every commit of the PR in order (`git rev-list --reverse --no-merges M^1..M^2`) on top of batch head with `cherry-pick -x`, then adds merge commit: first parent is batch head before the picks, second parent is last pick. Merge commit carries message of M and a trailer naming M. Commits that merged `main` into PR branch are skipped, they bring changes of other PRs. Original merged as single-parent commit (squash) is one plain pick. Batch PR is merged into line with merge commit as today, so on line each PR looks the same as on `main`.
+
+Picks keep author and `Signed-off-by` of every commit. Reverting one original after batch merged is one command, `git revert -m 1` of its merge commit on line.
 
 Agent part handles what needs judgement:
 
-- conflict: agent resolves it as separate commit per original that touches only original's files (`backport-batch fold` validates that), PR body shows it with range-diff;
-- failed CI: agent drops commits that touch failing package and rebuilds batch, dropped ones go to next batch with reason.
+- conflict: agent resolves original that batcher couldn't pick (below), PR body shows resolved picks with range-diff against PR's commits;
+- failed CI: agent drops originals that touch failing package and rebuilds batch, dropped ones go to next batch with reason.
+
+If any commit of the PR doesn't apply, batcher aborts whole original and none of its commits stay in batch. Agent resolves it on top of batch, or it goes to next batch. This shape costs more conflicts than one squashed pick: intermediate commit can fail to apply even when PR's final diff would apply.
+
+`backport-batch fold` is the check resolver runs on resolved original before pushing it to batch branch. Resolution passes when it is one merge commit with current batch head as first parent, commits it brings through second parent are only picks of PR's commits, each with `-x` line of the PR commit it came from, and together they change only files the PR changes. For squashed original it is one pick with `-x` of M that changes only M's files.
+
+Batch PR has CI check that runs the same rule for every original in batch, clean picks included. `fold` runs only where conflict was resolved, so agent misled by PR text could skip it, and without this check nothing would look at the result again after push.
 
 Batcher runs on Monday and Thursday. Twice a week is often enough that fix reaches release line in days, and rare enough that nobody spends time on backports every day. Both days leave working days after batch to cut rc, run rc-e2e and promote before weekend.
 
@@ -104,7 +114,7 @@ Each LLM step is defined as a task with fixed inputs, allowed output and a check
 
 | Task | Input | Output | Check |
 |---|---|---|---|
-| Resolve conflict | conflict list in batch PR body, original commit | one commit on batch branch | `backport-batch fold`: one commit per original, only original's files, `-x` of original |
+| Resolve conflict | conflict list in batch PR body, PR's commits | one merge commit per original on batch branch | `backport-batch fold`, same rule in batch PR CI check |
 | Failed batch CI | failing jobs of batch PR | original deferred to next batch | `backport-batch run --defer <N>` rebuilds batch without it |
 | Title check | PR diff, title | mismatch report on PR | review |
 
@@ -133,10 +143,10 @@ Batcher works only with commits already merged to `main`, the same code we revie
 ## Failure and edge cases
 
 - Conflict agent can't resolve: original goes to next batch, PR body says why, maintainer can resolve it by hand.
-- Batch CI fails: agent drops commits touching failing package and retries them next batch. If it can't find the culprit, maintainer splits batch.
-- rc-e2e fails after batch merged: promote is blocked as today, maintainer reverts culprit original on line (one commit) and cuts new rc.
+- Batch CI fails: agent drops originals touching failing package and retries them next batch. If it can't find the culprit, maintainer splits batch.
+- rc-e2e fails after batch merged: promote is blocked as today, maintainer reverts culprit original on line (`git revert -m 1` of its merge commit) and cuts new rc.
 - Previous batch PR is not merged by next run: batcher says so in the PR and alerts maintainers, alerting is set up together with scheduled run.
-- Change reached line without `-x` line (manual pick, squash): re-pick is either empty and counted as present, or conflicts and resolver sees change is already there. After rollout batch is the only way to release lines and always adds `-x`.
+- Change reached line without `-x` line (manual pick, squash): re-pick is either empty and counted as present, or conflicts and resolver sees change is already there. After rollout batch is the only way to release lines and always adds `-x` lines and trailer naming original.
 - `fix` that is really a feature passes review: maintainer sets `backport/skip`, or reverts it on line.
 - Docs fix for old docs: maintainer sets `backport/include`.
 - Original depends on PR that is not merged yet: pick conflicts or CI fails, it waits for next batch.
@@ -146,14 +156,14 @@ Batcher works only with commits already merged to `main`, the same code we revie
 
 - Rules: table tests per rule, plus replay on real merges from v1.6.1 to v1.6.5 window as fixtures: every `feat`, breaking and api/CRD change there must be skipped, fixes picked, overrides respected.
 - Policy and code stay in sync: rules on policy page are machine-readable block, test fails if code and page differ.
-- Batcher: assembly, presence, `--onto` continuation, `fold` containment and `check` exit codes on synthetic git repos.
+- Batcher on synthetic git repos: assembly (PR with several commits, PR that merged `main` in, squashed original), presence, `--onto` continuation, `check` exit codes. `fold` and batch PR check have to refuse commit from outside the PR, pick without `-x` and change outside PR's files.
 - Check on original PR: evaluation set of past PRs with known correct type (including mislabeled ones), check has to agree with it before it starts reporting status.
 - Guard: bats tests for every condition, including private org members with write access.
 - Every batch PR body lists skipped items by rule, so maintainer sees what rules decided on each run.
 
 ## Rollout
 
-Everything lands together: docs and policy, guard, batcher, check on original PR, removal of `backport-audit`, `backport.yaml` and backport labels. First batch runs on next Monday or Thursday after merge.
+Everything lands together: docs and policy, guard, batcher with batch PR check, check on original PR, removal of `backport-audit`, `backport.yaml` and backport labels. First batch runs on next Monday or Thursday after merge.
 
 ## Open questions
 
