@@ -445,12 +445,12 @@ Some cases depend on whether KubeVirt creates a next VMI for the VM. In KubeVirt
 
 | `runStrategy` | VMI failed before it ever ran | VMI failed after it ran | Controller deleted an unscheduled VMI |
 | --- | --- | --- | --- |
-| `Always` | next VMI after the start-failure backoff (`vm.go` L987, L1025, L1580) | next VMI, no backoff (`vm.go` L987, L1539) | next VMI (`vm.go` L1025; the VMI goes `Failed` first, `vmi/lifecycle.go` L447, L456) |
+| `Always` | next VMI after the start-failure backoff (`vm.go` L987, L1025, L1580) | next VMI, no backoff (`vm.go` L987, L1539) | next VMI after the start-failure backoff (`vm.go` L1025, L1580; the VMI goes `Failed` first, `vmi/lifecycle.go` L447, L456) |
 | `RerunOnFailure` | next VMI after the start-failure backoff (`vm.go` L1050, L1074, L1580) | next VMI, no backoff (`vm.go` L1050, L1539) | none until the tenant starts the VM (`vm.go` L1050, L1070; `rest/lifecycle.go` L120) |
 | `Once` | none (`vm.go` L1141) | none (`vm.go` L1141) | next VMI (`vm.go` L1141) |
 | `Manual` | none until the tenant starts the VM (`vm.go` L1104, `rest/lifecycle.go` L120) | the same | the same |
 
-The start-failure backoff grows with each failure that happens before a VMI runs, up to five minutes, and resets once a VMI runs. A VMI that a drain evicts ends on its own, and [`vgpu-vms`](../vgpu-vms/README.md) gives what each `runStrategy` does then.
+The start-failure backoff grows with each failure that happens before a VMI runs, up to five minutes, and resets once a VMI runs. During the backoff the VM shows `CrashLoopBackOff`, and so does a `Once` VM whose VMI failed before it ran, although it does not retry (`vm.go` L2526-L2546, L2572-L2575). A VMI that a drain evicts ends on its own, and [`vgpu-vms`](../vgpu-vms/README.md) gives what each `runStrategy` does then.
 
 Step 1:
 
