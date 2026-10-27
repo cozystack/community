@@ -80,8 +80,8 @@ flowchart TD
   UI["cozystack-ui / tenant Grafana<br/>Authorization: Bearer <same kube token>"] --> P["authorizing proxy (shared with #94)"]
   P --> T["TokenReview + SubjectAccessReview from the path"]
   P --> R["force extra_stream_filters, rebuild from allowlist, set AccountID/ProjectID"]
-  P --> VLS["vlselect for the resolved store"]
-  FB["Fluent Bit (DaemonSet)"] -->|"collect container logs"| VLS
+  P -->|"read via vlselect"| VLS[("VictoriaLogs VLCluster (resolved store)")]
+  FB["Fluent Bit (DaemonSet)"] -->|"write via vlinsert"| VLS
 ```
 
 ### 2. Authorization
