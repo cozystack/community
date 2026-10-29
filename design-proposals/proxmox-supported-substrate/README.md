@@ -2,8 +2,6 @@
 
 - **Title:** `Proxmox VE as a supported substrate: scope, support tiers and maintenance model`
 - **Author(s):** `@themoriarti`
-- **Date:** `2026-10-14`
-- **Status:** Draft
 
 ## Overview
 
