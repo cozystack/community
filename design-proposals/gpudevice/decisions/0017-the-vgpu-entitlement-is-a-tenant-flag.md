@@ -12,7 +12,7 @@
 
 A vGPU needs a license, counted per unit, and a tenant that may use vGPU at all gets the vGPU guest driver and the license token. The proposal gave the yes-or-no part to a Tenant field, `gpu.vgpu`, which the tenant chart combines with the parent's value and stamps on the namespace as `namespace.cozystack.io/vgpu`. It lived inside the quota section. @kvaps [asked](https://github.com/cozystack/community/pull/99#pullrequestreview-5616164700) whether a `gpu.cozystack.io/vgpu` budget key, 0 by default, would cover it, since it goes down the subtree like the other GPU keys and can cap the license pool. In Cozystack a missing quota key means no limit. He later [agreed](https://github.com/cozystack/community/pull/99#pullrequestreview-5653244822) that the entitlement is a yes or no, not a quota, and that a Tenant field stamped as a namespace label is the pattern of `namespace.cozystack.io/etcd` and the other module labels, and asked for the flag in its own section with a record that says when to revisit it.
 
-`kairos-vgpu-workers` copies the hoster's license and registry Secrets into the namespaces of entitled tenants, and uses the same label to decide where.
+The license delivery of this proposal copies the hoster's license Secret into the namespaces of entitled tenants, and uses the same label to decide where (section 6).
 
 ## Decision
 
@@ -30,4 +30,4 @@ The vGPU entitlement stays the Tenant field `gpu.vgpu`, off by default, effectiv
 
 ## Revisit if
 
-`kairos-vgpu-workers` stops copying Secrets into tenant namespaces, for example once a hoster-side worker class reads the hoster's Secrets directly, so the flag guards nothing but the use of vGPU classes and a budget over those classes could replace it.
+The platform stops copying license Secrets into tenant namespaces (License delivery in section 6), for example once a license reaches the guest without a copy per tenant, so the flag guards nothing but the use of vGPU classes and a budget over those classes could replace it.
