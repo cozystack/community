@@ -1,216 +1,175 @@
-# GPU virtual machines with hoster-supplied guest images
+# vGPU licensing for virtual machines
 
-- **Title:** `GPU virtual machines: vGPU and passthrough with hoster-supplied guest images`
+- **Title:** `vGPU licensing for virtual machines: the licensee, token delivery, license server reachability, usage and revocation`
 - **Author(s):** `@lexfrei`
 
 ## Overview
 
-A hoster that sells GPUs wants a tenant to order a virtual machine with either a vGPU profile or a whole GPU in passthrough, and to boot it from an image that already has a working guest driver. For vGPU, the guest half is the NVIDIA vGPU guest driver, and its license client runs inside the guest. That driver is licensed per customer and may not be published, for example in a public image or repository, so Cozystack cannot build, ship or test such an image. Passthrough used for compute runs the NVIDIA data center driver, which has no license check, but the guest still needs that driver.
+A vGPU in a virtual machine works only when the NVIDIA guest driver inside it holds a license, and the license comes from an NVIDIA license server that the guest reaches over the network with a client configuration token. Today nothing in Cozystack says whose license that is, how the token gets into a tenant's guest, how a guest on a tenant network reaches the server, how license use maps back to tenants, or what happens on rotation and revocation. The usual answer, a token baked into a shared guest image, hands the token to every tenant that can clone the image.
 
-This proposal keeps the image on the hoster's side and makes the platform able to carry it. The hoster adds its own images to the golden image collection, marks them as GPU guest images, and can fetch them from a private source. The image picker in the dashboard shows that marking. A tenant creates a disk from such an image and names a GPU class in the VM.
+This proposal settles licensing for vGPU VMs on top of [`gpudevice`](../gpudevice/README.md). The hoster's license is the default: a vGPU class names the hoster's token Secret, and the platform puts the token on a disk of each VM that uses the class, in entitled tenants only, as section 6 of `gpudevice` and its record 0018 define. A hoster can also offer classes without a license for tenants that bring their own. The proposal gives the guest-side contract, the network path to the license server, how a hoster reconciles license use with the usage records, rotation and revocation, and what a tenant sees when its guest is not licensed.
 
-NVIDIA's vGPU stack changes quickly. Within the last few releases the driver branches, the way vGPUs are exposed (mediated devices or SR-IOV virtual functions), the KubeVirt device plugins and the licensing rules all changed. This proposal describes that stack as it was in October 2026. Expect it to be updated as NVIDIA and KubeVirt move, with a decision record under it for each change of course, and check the versions named here against your own before relying on them.
+NVIDIA's vGPU stack changes quickly: within the last few releases the driver branches, the way vGPUs are exposed, and the licensing rules all changed. This proposal describes that stack as it was in October 2026; check the versions named here against your own before relying on them.
 
 ## Scope and related proposals
 
-- [`gpudevice`](../gpudevice/README.md) adds the host layer, the GPU catalog of `GPUClass` objects and per-class budgets in its step 1, and `GPUClaim` objects that hold GPUs for a stopped VM in its step 2. This proposal builds on its step 1 and is implemented after item 2 of its Rollout.
-- [`kairos-vgpu-workers`](../kairos-vgpu-workers/README.md) covers GPUs in Kairos worker pools of tenant Kubernetes clusters, vGPU and passthrough.
-- [Node fencing](../node-fencing/README.md) restarts VMs of a dead node automatically when its optional package is enabled and the node's BMC answers. A GPU VM whose `runStrategy` creates a next VMI after a VMI that ran fails restarts that way once another node has room for its GPUs. Design §5 gives the details and the exception for a claim of a `Stay` class on a cordoned node, and points at the `runStrategy` table of `gpudevice` for the other run strategies.
-
-These proposals are written in parallel, so the links to them work only once they are merged.
-
-## Decisions
+- [`gpudevice`](../gpudevice/README.md) defines GPU classes, class entries in `vm-instance`, the vGPU entitlement and the license delivery this proposal builds on (its section 6 and [record 0018](../gpudevice/decisions/0018-a-vgpu-license-reaches-each-vm-as-a-secret-volume.md)). This proposal adds no API of its own.
+- [Kairos tenant worker pools](https://github.com/cozystack/community/pull/115) (cozystack/community#115) is where worker pools on Kairos are proposed. A Kairos GPU worker image follows the same guest contract (section 2).
+- Getting a GPU guest image into the golden image collection is not part of this proposal; hosters already have two ways (Context). Recognising golden images by a label instead of a name prefix would help every image and belongs in a generic golden-image proposal.
 
 ## Context
 
 ### What exists
 
-Golden images live in `packages/system/vm-default-images`. Its `images` list renders one CDI `DataVolume` per entry in `cozy-public`, named `vm-default-images-<name>`, with the OS, architecture and description stored as `vm-default-images.cozystack.io/*` annotations. The only source is an HTTP URL, with no credentials and no custom CA. The package is optional, and its values can be overridden through the `cozystack.vm-default-images` Package. The documentation also describes `hack/cdi_golden_image_create.sh`, which creates such a `DataVolume` by hand, and the picker lists it like any other golden image.
+A hoster can already offer a GPU guest image in two ways. It overrides `images[]` of the `cozystack.vm-default-images` Package, or it creates a CDI `DataVolume` named `vm-default-images-<name>` in `cozy-public` by hand (`hack/cdi_golden_image_create.sh`), with any CDI source, `secretRef` and `certConfigMap` included. The image picker and `vm-disk` match golden images by that name, so a hand-made image is a full golden image. CDI's importer runs inside the cluster, so a `url` reachable only from the cluster network works with either way.
 
-A tenant creates a disk with `vm-disk`, either from a golden image by name, which `vm-disk` clones from `cozy-public`, or from their own image by upload, HTTP URL or a clone of another disk. The dashboard fills the golden image picker from the `image` option source (`pkg/registry/core/option/providers.go`). That provider returns only names: it strips the PVC prefix and drops images whose import failed. The picker in `SourceField.tsx` reads only the value.
+`gpudevice` gives a VM its GPUs through a class entry naming a `GPUClass`. A vGPU class can carry a `license`: the name of the hoster's token Secret in `cozy-system` and the `FeatureType`. The GPU controller copies that Secret into every entitled namespace, and the VMI webhook gives each VMI of the class a KubeVirt `secret` volume with the volume label `GPULICENSE`.
 
-A VM takes its GPUs in the `gpus` field of `vm-instance`. Today each entry is `{name: <resource name>}`, the name of a device-plugin resource in the KubeVirt `permittedHostDevices`. `gpudevice` adds `{className: <class>}` entries that name a `GPUClass`, and in its step 2 `{claim: <name>}` entries that reference a tenant's `GPUClaim`.
+NVIDIA licenses vGPU through the NVIDIA License System. A license server is either NVIDIA's Cloud License Service (CLS) or a Delegated License Service (DLS) instance the hoster runs. A guest needs the client configuration token, which names the server, and reaches it over TCP 443 by default; a Windows guest also uses TCP 80 to return its license at shutdown, and a DLS running as a container can listen on other ports ([NVIDIA License System user guide](https://docs.nvidia.com/license-system/latest/nvidia-license-system-user-guide/index.html)). The server leases a license to each guest for a period the allocation's lease settings set or bound; a lease a guest does not return, because the VM stopped without a clean shutdown, stays taken until it expires. For a vGPU guest, NVIDIA documents `FeatureType=1`, which picks the license from the vGPU type ([client licensing guide](https://docs.nvidia.com/vgpu/latest/grid-licensing-user-guide/configuring-nls-licensed-client.html)).
+
+A tenant namespace allows egress to destinations outside the cluster, to its own tenant and to a fixed list of platform services, and to no other namespace of the cluster (`packages/apps/tenant/templates/networkpolicy.yaml`). A `vm-instance` VM's first interface is on the pod network.
 
 ### The problem
 
-A tenant who orders a GPU VM expects a guest that works on first boot, and the hoster is the one with the driver entitlement and the license server. Today the hoster can offer such an image only by hand:
-
-- the package's `images` list cannot authenticate, and a public URL is not an option for an image whose driver may not be published;
-- adding images to that list means restating the whole default list, because Helm replaces lists instead of merging them;
-- a hand-made `DataVolume` lives outside the platform values, the package health check does not cover it, and nothing reconciles it;
-- the image picker shows bare names, so a tenant cannot tell a GPU guest image from a plain one.
+- Nobody says who the licensee is: the hoster's NVIDIA entitlement, the tenant's own, or both.
+- The token has no defined path into a guest. A token baked into a shared golden image is readable by every tenant that can clone it, and rotating it means rebuilding the image and every disk cloned from it.
+- A guest on a tenant network may not reach the license server.
+- The hoster cannot map its NVIDIA license count to tenants.
+- Rotation, revocation and the state of an unlicensed guest are not described.
 
 ## Goals
 
-- A hoster adds GPU guest images to the golden image collection through Package values, without restating the default list and without a public URL.
-- A tenant sees in the image picker which images are GPU guest images, for which mode, and for which driver branch.
-- A tenant gets a VM with a vGPU profile or with whole GPUs from `vm-disk` and `vm-instance` with a class entry.
-- Golden images stay a shared catalog, and tenant images stay `vm-disk` sources.
-- The document states what happens to a GPU VM on node maintenance and on node failure.
-- This proposal adds no NVIDIA driver or guest image to Cozystack's tree, CI or registries.
+- The hoster's license is the default, delivered by the platform to the VMs of entitled tenants only, with no token in any shared image.
+- A tenant can bring its own license on a class the hoster offers for that.
+- A guest image knows exactly where to find the token and the license settings.
+- The hoster knows where to put the license server so that tenant VMs reach it.
+- The hoster can reconcile license use with the usage records per tenant.
+- Rotation, revocation and an unlicensed guest have defined, visible outcomes.
 
 ### Non-goals
 
-- Building, shipping or testing guest images. The image and its contents are the hoster's.
-- Licensing on the tenant's behalf. The guest licenses itself, and the hoster decides how the token gets in.
-- The GPU catalog, quotas, usage records and the host layer. These belong to `gpudevice`.
-- Enforcing that a GPU VM boots from a GPU guest image (Design §3).
-- Making GPU VMs survive a node failure without a restart.
+- Golden image plumbing: list overrides, private sources, per-tenant visibility of images, and markings in the picker.
+- Building, shipping or testing guest images or drivers. The images and the driver are the hoster's.
+- Running the license server. The hoster runs a DLS instance or uses CLS.
+- Licensed passthrough GPUs for graphics. `gpudevice` gives a `license` only to vGPU classes.
 
 ## Design
 
-### 1. Golden image entries for GPU guest images
+### 1. The licensee
 
-Each golden image entry gets four optional fields, and the hoster gets a second list for its own entries:
+The hoster's NVIDIA entitlement is the default licensee. A vGPU class with a `license` names the hoster's token Secret, and every VM of the class in an entitled tenant gets that token. The hoster's license server counts these guests against the hoster's entitlement, and the hoster charges tenants for them through its billing system (section 4).
 
-```yaml
-extraImages:
-  - name: hoster-ubuntu-24.04-vgpu-r595
-    url: https://images.hoster.example/ubuntu-24.04-vgpu-r595.qcow2
-    storage: 30Gi
-    os:
-      family: Linux
-      name: Ubuntu
-      version: "24.04"
-    architecture: amd64
-    description: "Ubuntu 24.04 with the NVIDIA vGPU guest driver"
-    gpu:
-      vendor: nvidia
-      mode: vgpu
-      driverBranch: "R595"
-    secretRef: images-hoster-example
-    certConfigMap: images-hoster-example-ca
-```
+A tenant with its own NVIDIA entitlement brings its own license on a vGPU class without a `license`, which the hoster publishes for that purpose. The platform delivers nothing for such a class: the tenant puts its own token into its guest, for example through its image or cloud-init, and its guest reaches the tenant's own license server. Such an image does not run the reference boot unit or script of section 2: the boot unit points the license client at an empty token directory and the script empties the default token folder at every boot. The tenant still needs the vGPU entitlement of `gpudevice`, because that flag decides who may use a vGPU class at all.
 
-- The `gpu` field marks the image. `mode` is `vgpu` or `passthrough`, because a guest image is built for one of the two device types. `vendor` is a free string, so later vendors need no schema change. When `gpu` is set, `vendor` and `mode` are required and the chart fails on any other `mode`. `driverBranch` is optional free text shown to tenants. The chart writes the three as `vm-default-images.cozystack.io/gpu-vendor`, `gpu-mode` and `gpu-driver-branch` annotations.
-- The `secretRef`, `secretExtraHeaders` and `certConfigMap` fields go to the CDI `http` source unchanged. `secretRef` names one Secret with the basic auth user name in the key `accessKeyId` and the password in `secretKey`, the keys CDI v1.66.1 reads for an HTTP source; a Secret without them stops the importer pod from starting. `secretExtraHeaders` is a list of Secret names, each value a whole header line such as `Authorization: Bearer <token>`, with no trailing newline. Basic auth through `secretRef` and an `Authorization` header are alternatives: when both are set, CDI v1.66.1 sends a different one on different requests, so an entry uses one of them. The hoster keeps the CA under the key `tls.crt` of the `certConfigMap`. The transfer trusts every key of it, but CDI v1.66.1 passes only `<certDir>/tls.crt` to the nbdkit curl plugin it uses to probe the image ([`pkg/image/nbdkit.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.66.1/pkg/image/nbdkit.go)). CDI requires the Secrets and the ConfigMap in the namespace of the `DataVolume`, `cozy-public`, where the hoster creates them. Tenants have no read access to Secrets there.
-- The `extraImages` list has the same entry type as `images`. The chart renders both and fails if a name appears twice, in both lists or within one. A hoster adds images without copying the defaults, and a later change of the default list still reaches them.
+Both kinds of class can exist on one cluster, and the hoster decides per class. A change of a class's `license` reaches each VM at its next start.
 
-A tenant can still upload an image with their own driver and boot a GPU VM from it, unmarked.
+### 2. The token in the guest
 
-### 2. Image picker
+The platform puts the token on a disk of each VMI that uses a licensed vGPU class, as section 6 of `gpudevice` defines. The guest finds a disk with the volume label `GPULICENSE` that holds two files: `client_configuration_token.tok`, the token, and `gridd.conf`, which sets the class's `FeatureType`. A guest image with the vGPU guest driver applies them at boot:
 
-The `image` option provider reads the marking from the `DataVolume` of each golden image, which it already lists to filter out failed imports. For an image with `gpu` it sets `Label` to the name followed by the marking, for example `hoster-ubuntu-24.04-vgpu-r595 (nvidia vgpu, driver R595)`, and leaves out an empty `driverBranch`. The picker in `SourceField.tsx` renders `Label` when it is set and the value otherwise, so an image without `gpu` shows as before. A tooltip is not enough, because the dashboard renders `Description` only as the `title` of an `<option>`, which a native select does not show in every browser.
+- On Linux, before the license client starts, it mounts the disk by its label, copies the token into a directory on a memory file system such as `/run`, with the file modes NVIDIA's licensing guide asks for, and puts a `ClientConfigTokenPath` line naming that directory and the `FeatureType` line of the disk's `gridd.conf` into `/etc/nvidia/gridd.conf`, keeping any other settings the image carries there. The token never reaches the root disk, so a guest restarted without the `GPULICENSE` disk has none ([NLS user guide](https://docs.nvidia.com/license-system/latest/nvidia-license-system-user-guide/index.html), section 5.1.3.2).
+- On Windows, it empties `%SystemDrive%\Program Files\NVIDIA Corporation\vGPU Licensing\ClientConfigToken` at every boot, also without the disk, and copies the token into it when the disk is there. A Windows guest keeps its other license settings in the registry, and NVIDIA's current guide does not require the `FeatureType` value there for a vGPU. It then restarts the `NvDisplayContainer` service, as NVIDIA's procedure does (NLS user guide, section 5.1.1). This folder is on the system disk, and this proposal names no folder in memory for Windows: the `ClientConfigTokenPath` registry value can point elsewhere (NLS user guide, section 5.1.3.1), but the guide wants that folder to hold the token only, which rules out the `GPULICENSE` disk itself. The license service can start before the script and read the token of the previous boot, and what it does with a license so acquired once the script empties the folder and restarts it is not documented.
 
-When the provider cannot list `DataVolume`s, it already shows every image unfiltered, and then shows no marking. The PVC is not a fallback, because CDI copies the annotations to it only once, at creation, so it can carry a marking the hoster has since changed.
+The Cozystack documentation carries a reference boot unit for Linux and a reference script for Windows that do this. They contain nothing from NVIDIA's packages. A Kairos GPU worker image follows the same contract.
 
-### 3. No enforcement
+The earlier Kairos GPU proposal, cozystack/community#101, put the token into each pool's bootstrap data. VMs do not reuse that, because bootstrap data cannot change on a running node, so a rotation would replace every machine.
 
-The chart and the dashboard do not refuse a GPU VM that boots from an image without the marking. A disk may come from an upload, an HTTP URL or a clone, which carry no marking, and a tenant with their own driver would lose a configuration that works. A wrong pairing harms only that VM: the device is there and unusable without a driver. The marking is a hint to the tenant.
+The token reaches the guest only through that disk: it is in no image, no `vm-instance` value and no cloud-init data. A tenant that turns the VM off and on again gets the token of the moment, so rotation is a restart (section 5).
 
-### 4. GPUs for the VM
+### 3. Reaching the license server
 
-A VM names a `GPUClass` in `gpus`. The class is the offer of a model, a mode and, for vGPU, a profile:
+A licensed guest opens TCP 443 to the address in its token, and a Windows guest also TCP 80, unless the hoster's DLS listens on other ports. A tenant namespace allows egress to destinations outside the cluster and to a fixed list of platform services only, and a VM's first interface is on the pod network, so a guest reaches a license server at an address outside the cluster, which is neither a pod nor a node address: NVIDIA's CLS, when the cluster has internet egress, or a DLS instance the hoster runs as an appliance on a network the cluster's egress routes to. The hoster puts that address into the token it downloads, so every guest uses it.
 
-```yaml
-gpus:
-  - className: l40s-24c
-    count: 1
-```
+A VM whose only route out is a tenant subnet without egress does not reach the server, and its guest stays unlicensed (section 6). A tenant that isolates its VM keeps an egress path to the license server's address.
 
-The VMI webhook of `gpudevice` resolves the class when the VM starts and writes the class's resource name into the `gpus` of the VM's instance. One VM takes vGPUs of only one class, and no more GPUs of a class than its `maxCount` (GPU classes section of `gpudevice`). The tenant's GPU budget is checked when the VM is written, and the GPUs show up in the usage record of the VM's launcher pod (Budgets and Usage records sections). Nothing is held between starts: a stopped VM's GPUs are free for other VMs to take, while its class entries keep counting against the budget.
+A DLS running in a namespace of the management cluster is not reachable from tenant namespaces as they are. Allowing it would need an egress rule from every entitled namespace to that namespace, which this proposal does not add (Alternatives).
 
-Step 2 of `gpudevice` adds holding. A tenant who wants GPUs kept for the VM while it is stopped orders them as `GPUClaim` objects of the class and references them instead:
+### 4. Usage and the license count
 
-```yaml
-gpus:
-  - claim: train-0
-```
+The usage records of `gpudevice` show, per tenant, which VM ran how many units of which class and for how long: the launcher pod's `Workload` carries the class's resource name while the pod exists. NVIDIA's license server counts licensed clients under the hoster's terms and shows the leases it has granted. The two counts differ: a VM that stopped without a clean shutdown keeps its lease, and so its place in NVIDIA's count, until the lease expires, while its `Workload` record is gone with its pod. Cozystack does not read the license server. The hoster reconciles the two on its side: the license count is what it pays NVIDIA, and the `Workload` records are what it charges each tenant. For a class without a `license` the tenant's own license server counts, and the hoster charges only for the GPU.
 
-The VM is then pinned to the node of its claims, and an ordered claim counts against the budget and has its own usage record from the moment it is bound. A vGPU VM normally takes one claim of `count: 1`, and a passthrough VM one claim with the number of GPUs it needs.
+### 5. Rotation and revocation
 
-Existing `{name: <resource name>}` entries and `gn1.*` instance types keep their current behaviour and move to class entries as the Migration of existing `gpus` section of `gpudevice` describes. A `vgpu` cluster that adopts the node layout of the Host layer section renames its vGPU resources. In the same maintenance window the hoster moves raw entries and raw quota keys to the new names, or the VMs move to class entries first, and a VM left on an old name stays Pending. Guest images from this proposal need no change for that.
+A client configuration token names the license allocation that serves it, and NVIDIA's license system documents no way to revoke a token before its expiry ([NLS user guide](https://docs.nvidia.com/license-system/latest/nvidia-license-system-user-guide/index.html), section 4.4). The expiry is chosen when the token is generated, 12 years if none is chosen, and a DLS token can be made never to expire (NLS user guide, sections 4.4.1 and 4.4.2).
 
-### 5. Node maintenance and node failure
+To rotate the token, the hoster generates a new one on a new allocation or license server instance, replaces it in its Secret, and the controller refreshes every copy. A running guest keeps the token it booted with, and each VM gets the new one at its next start. Once the VMs have restarted, the hoster disables leasing on the old allocation, which then serves no licenses (NLS user guide, section 4.6); a new instance has an address of its own, which guests reach as section 3 describes. A guest still on the old token keeps its lease at most for the maximum lease duration set on that allocation (NLS user guide, section 4.7).
 
-A GPU VM does not live-migrate:
+To revoke a tenant, the parent's administrator or the hoster clears its `gpu.vgpu` flag. The controller deletes the namespace's copies, and the VMI webhook refuses the next start of every VM on a vGPU class there. A running guest renews its lease while the allocation serves its token, and a client released on the license server can check a license out again while the token is served (NLS user guide, section 4.9.1). A hoster or parent administrator that must cut a tenant off at once therefore also stops the tenant's vGPU VMs.
 
-- Whole GPUs in passthrough are not live-migratable in KubeVirt.
-- KubeVirt v1.9, the release Cozystack ships, has live migration for one vGPU per VM as an alpha feature behind the `VGPULiveMigration` gate, and treats a GPU as migratable only when its resource name is listed under `mediatedDevices` in `permittedHostDevices` ([`pkg/virt-handler/vm.go`](https://github.com/kubevirt/kubevirt/blob/v1.9.0/pkg/virt-handler/vm.go), `isMdevGPU`). An SR-IOV vGPU is a virtual function advertised under `pciHostDevices`, so it never migrates. This proposal does not enable the gate.
+Releasing leases on the license server frees the licenses of guests that stopped without a clean shutdown. Single clients are released by hand, within a rolling daily limit of 10% of the licenses allocated to the server (NLS user guide, section 4.9.1). A bulk release on CLS frees every lease of an allocation. On DLS it frees the leases the hoster selects, filtered by client hostname, IP or MAC address, so the hoster can pick one tenant's guests on a shared allocation if it recognises them; a bulk release can be done five times before its limit has to be reset (NLS user guide, section 4.9.2).
 
-On a node drain, the GPU VM is evicted instead of blocking the drain, because Cozystack sets the `LiveMigrateIfPossible` eviction strategy. A VMI keeps the eviction strategy it was created with, so a VM started before Cozystack set it blocks the drain until it is restarted. What happens next depends on `runStrategy`, per KubeVirt v1.9.0 ([`pkg/virt-controller/watch/vm/vm.go`](https://github.com/kubevirt/kubevirt/blob/v1.9.0/pkg/virt-controller/watch/vm/vm.go)):
+A guest's root user can read the token and keep a copy, and only a rotation stops such a copy from working. One token serves every tenant of a class, and every entitled namespace gets a copy for every licensed class, so a token does not tell tenants apart and the platform cannot give one tenant a token of its own.
 
-- `Always`, the default, starts a new instance.
-- `Manual` stays stopped.
-- `Once` stays stopped while the finished instance remains, and starts a new one if it is deleted.
-- `RerunOnFailure` starts again only for an instance in `Failed` without a deletion timestamp. An evicted guest that shuts down within its grace period ends in `Succeeded` and stays stopped; one destroyed after it ends in `Failed` and starts again. An instance that a controller deletes leaves it stopped.
+### 6. What a tenant sees
 
-A VM on class entries holds nothing between instances. Where it gets a new instance, that instance goes to any node with a free unit of its class, and waits in `Scheduling`, with its launcher pod `Pending`, while there is none. What the rest of this section says about claims applies to VMs with `claim` entries, once step 2 of `gpudevice` ships, except the last paragraph, which covers class entries in step 2.
+- Without the vGPU entitlement, a VM on a vGPU class does not start: the VirtualMachine shows the refusal in a `FailedCreate` event that names the class and the entitlement.
+- With the entitlement but before the namespace has its copy, the VM shows `Starting`, and its launcher pod waits in `ContainerCreating` with a `FailedMount` event naming the Secret; the class shows `LicenseSecretMissing` when the hoster's Secret is gone or has no token.
+- A guest that cannot get a license, because it does not reach the server, its leases were released or its image does not follow section 2, starts with the GPU at full capability and then degrades, by profile series:
+  - A C-series (compute) profile, licensed through NVIDIA AI Enterprise: after 20 minutes without a license, compute drops to an idle level until a license is acquired; a licensed VM that loses contact with the license server keeps full capability for 7 days by default on CLS, a period a DLS can configure, and then degrades ([NVIDIA AI Enterprise 8 licensing](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/licensing.html)).
+  - A Q-series (graphics) profile, licensed through NVIDIA vGPU software: performance drops after 20 minutes without a license and drops further after 24 hours ([client licensing guide, release 20](https://docs.nvidia.com/vgpu/latest/pdf/grid-licensing-user-guide.pdf)); the release 17 guide gives the figures, 15 frames per second with slower CUDA after 20 minutes, and 3 frames per second with failing CUDA calls after 24 hours ([release 17](https://archive.docs.nvidia.com/vgpu/17.0/pdf/grid-licensing-user-guide.pdf)).
 
-Where the VM gets a new instance, it is pinned to the node of its claims, and the class's `onCordon` policy decides where that is. Under `Move`, the default, the claim of an evicted VM moves to another node of its class with room and keeps its hold, and the new instance starts there. With no room elsewhere the claim stays, and the new instance waits in `Scheduling` with its launcher pod gated until a node has room. Under `Stay` the claim keeps its node, and the new instance is pinned to the cordoned node and waits there. When the node is deleted, the claims of a gated instance are gathered elsewhere, while a pinned instance is deleted by the controller of `gpudevice`, and the VM follows the rules above for a deleted instance. A drain for a node layout change moves the claim under either policy, and the VM can start on another node that has room, or waits while the claim is `Lost`. The Binding and capacity part of the step 2 section of `gpudevice` holds the rules.
+  Full capability returns once the guest gets a license, although applications started while it was degraded may need a restart. Inside the guest, `nvidia-smi -q` shows the license status. NVIDIA AI Enterprise 8 is the release the guide in section 7 names, and release 20 is NVIDIA vGPU software's current release; check both against the releases you run.
+- On a class without a `license`, the platform delivers nothing, and the guest is licensed only when the tenant licenses it.
 
-On a node failure, the virt-launcher pod on a node that lost power stays `Terminating`, and KubeVirt does not fail the VMI while that pod exists. Recovery needs someone to force-delete the pod, delete the Node, or set the `out-of-service` taint, which the [node fencing](../node-fencing/README.md) package does after its BMC fence succeeds. A VM whose disks are all on the `replicated` StorageClass may already be released by the Piraeus HA Controller that Cozystack ships; that is its documented behaviour, not verified end to end with virt-launcher pods on Cozystack, and for a VM with other volumes the controller's volume rules decide ([`pkg/agent/reconcile_failover.go`](https://github.com/piraeusdatastore/piraeus-ha-controller/blob/v1.3.1/pkg/agent/reconcile_failover.go)). Meanwhile the claim goes to `Lost` once the Node has been `NotReady` longer than a grace period, and is bound to another node after KubeVirt fails the old instance. The guest then boots fresh on that node if the VM's `runStrategy` creates a next VMI after a VMI that ran fails. If the old instance ends before that grace period, through the fence, the HA Controller or a forced pod delete, its claims are no longer attached. The next instance of a VM whose `runStrategy` creates one after a VMI that ran fails gathers them onto a `Ready` node with room when it is created and starts there at once. The exception is a claim of a `Stay` class on a cordoned node. When all of the VM's claims are on that node, the instance is pinned there, and if the node stays down past the grace period the controller of `gpudevice` deletes the unscheduled instance, and the VM follows its `runStrategy` for a deleted instance. Otherwise the claims cannot be gathered, and the instance waits in `Scheduling` with its launcher pod held at a scheduling gate (the step 2 section of `gpudevice`). After a `Node` deletion the VM starts the same way, once the controller of `gpudevice` has moved the claims. When no node fits, the instance waits gated, with a condition on its claims naming the reason, and starts as soon as a node has room for its claims; KubeVirt's create backoff does not apply, because nothing is refused. The Failure and edge cases section of `gpudevice` holds the details, with what each `runStrategy` does after an instance fails or is deleted. Neither this proposal nor `gpudevice` keeps spare GPUs free for this case.
+### 7. Guide for guest images
 
-The claim paragraphs above describe VMs whose GPU entries are all `claim` entries. In step 2 a VM whose GPU entries are all class entries still holds nothing between instances. The claims the controller makes for its class entries are deleted when the instance ends, so neither `onCordon` nor the rebind above applies. The next instance gets a new claim on a `Ready`, uncordoned node with room, or waits gated, with a condition naming the reason, while there is none. For a VM with more than one claim, which move together and only to a node with room for all of them, or that mixes class entries and ordered claims, the step 2 section of `gpudevice` decides where the claims go and when the instance waits gated.
+The Cozystack documentation gets a page for hosters on what a vGPU guest image needs. It names no binaries and contains nothing from the driver packages.
 
-### 6. Guide for guest images
-
-The Cozystack documentation gets a page for hosters that describes what a GPU guest image needs. It names no binaries and contains nothing from the driver packages.
-
-For vGPU:
-
-- The guest driver must be compatible with the host vGPU Manager. NVIDIA supports a guest driver from any release of the host's branch, from the previous branch, and from the previous long-term support branch on a long-term support host. A guest driver from a later branch than the host is not supported, and with an incompatible guest driver the vGPU fails to load. The release notes of the host release list the exact combinations, so an upgrade of the host vGPU Manager has to be checked against the `driverBranch` of every vGPU image.
-- The guest license client reads a client configuration token from `/etc/nvidia/ClientConfigToken/` and the feature type from `/etc/nvidia/gridd.conf`. For a vGPU guest, NVIDIA documents `FeatureType=1`, which picks the license from the vGPU profile. The `gridd.conf` template also lists `4`, for NVIDIA Virtual Compute Server, now named NVIDIA vGPU for Compute, but NVIDIA's licensing guide does not list `4` for a vGPU guest. A Windows guest takes the token in `%SystemDrive%\Program Files\NVIDIA Corporation\vGPU Licensing\ClientConfigToken` and keeps its other license settings in the registry. The hoster runs or rents the license server and decides whether the token is baked into the image or injected at boot, for example through cloud-init. Either way, root inside the guest can read it.
+- The guest driver must be compatible with the host vGPU Manager. A guest driver comes from the host's release or an earlier release of its branch, or from the previous branch ([release notes for Linux with KVM, release 20](https://docs.nvidia.com/vgpu/latest/pdf/grid-vgpu-release-notes-generic-linux-kvm.pdf), section 1.2.1). Section 1.2.1 also lists a later release of the same branch and, on a long-term support host, a driver from the previous long-term support branch. The release 20 table in section 1.2.2 lists every 18.x and earlier guest driver as incompatible, and known issue 3.10 lists a driver from a later release than the vGPU Manager, or from two or more branches back, as incompatible, so this guide keeps to the reading all three allow. A guest driver from a later branch than the host is not supported (section 1.2.2), and with an incompatible guest driver the vGPU fails to load. The release notes of the host release list the exact combinations, so an upgrade of the host vGPU Manager has to be checked against the driver of every vGPU image.
+- The image applies the token and `gridd.conf` from the `GPULICENSE` disk at boot as section 2 describes.
+- A token that never expires, or expires more than 12 years after it is generated, is not recognised by NVIDIA vGPU releases 13.0 through 13.7 and 15.0 through 15.2, so an image with a guest driver from those releases needs a token with an earlier expiry (NLS user guide, section 4.4.2).
 - On vGPU, NVIDIA disables Unified Memory and debuggers by default, and profiling apart from GPU workload trace. Enabling them is a host-side parameter of each vGPU, which none of the GPU proposals sets.
-
-For C-series (compute) profiles, the driver, license and version rules come from NVIDIA AI Enterprise: the vGPU for Compute guest driver is downloaded from the NGC catalog, its license is the NVIDIA AI Enterprise license, and the NVIDIA AI Enterprise support matrix lists the Virtual GPU Manager and guest driver versions of each release, for example 595.91.04 on the host and 595.91.07 in a Linux guest for release 8.2 ([NVIDIA AI Enterprise licensing](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/licensing.html), [NVIDIA AI Enterprise guest driver](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/installation/guest-driver.html), [support matrix 8.2](https://docs.nvidia.com/ai-enterprise/release-8/latest/support/support-matrix-8/8.2.html)). NVIDIA AI Enterprise supports vGPU for Compute on a KVM host only in limited setups, which the Host layer section of `gpudevice` names, so support for a compute image on such a host is a matter between the hoster and NVIDIA. The token path, `gridd.conf` and the Windows registry stay as NVIDIA's [licensing guide](https://docs.nvidia.com/vgpu/latest/grid-licensing-user-guide/) describes.
-
-For passthrough used for compute, the guest uses the NVIDIA data center driver, which has no license check. Graphics passthrough runs the vGPU software guest driver and is licensed, typically with `FeatureType=2`, NVIDIA RTX Virtual Workstation. Its image follows the token and license settings above, but not the points on the host vGPU Manager and Unified Memory, because a passthrough GPU bypasses the vGPU Manager.
-
-For both, the image needs room for the driver and its kernel module build, so `storage` must be larger than for a plain cloud image. The hoster prefixes the names of its entries, so that a default image added in a later release cannot take the same name.
+- For C-series (compute) profiles, the driver, license and version rules come from NVIDIA AI Enterprise: the vGPU for Compute guest driver is downloaded from the NGC catalog, its license is the NVIDIA AI Enterprise license, and the NVIDIA AI Enterprise support matrix lists the Virtual GPU Manager and guest driver versions of each release, for example 595.91.04 on the host and 595.91.07 in a Linux guest for release 8.2 ([NVIDIA AI Enterprise licensing](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/licensing.html), [NVIDIA AI Enterprise guest driver](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/installation/guest-driver.html), [support matrix 8.2](https://docs.nvidia.com/ai-enterprise/release-8/latest/support/support-matrix-8/8.2.html)). NVIDIA AI Enterprise supports vGPU for Compute on a KVM host only in limited setups, which the Host layer section of `gpudevice` names, so support for a compute image on such a host is a matter between the hoster and NVIDIA.
+- The vGPU guest driver is licensed per customer and may not be published. A hoster whose NVIDIA terms require the driver to stay with entitled tenants keeps vGPU guest images out of the shared golden images and gives them to entitled tenants only, for example as images in their own namespaces.
+- The image needs room for the driver and its kernel module build, so its disk must be larger than for a plain cloud image. A hoster that adds golden images by hand prefixes their names, so that a default image added in a later release cannot take the same name.
 
 ## User-facing changes
 
-- Hosters: `extraImages`, and `gpu`, `secretRef`, `secretExtraHeaders`, `certConfigMap` per image in `vm-default-images` values. A documentation page for GPU guest images.
-- Tenants: the image picker shows the GPU marking next to the name of a marked image. GPU VMs take class entries, and `claim` entries once step 2 of `gpudevice` ships, as `gpudevice` defines.
+- Hosters: a documentation page for vGPU guest images and licensing, with the reference boot unit and script. The `license` field of `GPUClass` and the vGPU entitlement come from `gpudevice`.
+- Tenants: a VM on a licensed vGPU class gets its license without any action of its own. A tenant that brings its own license uses a class without `license` and licenses its guest itself.
 
 ## Upgrade and rollback compatibility
 
-All new fields are optional, and an entry without them renders the same `DataVolume` as before. The new annotations are added to existing `DataVolume`s in place and do not cause a new import. On rollback Helm removes them again, `extraImages` entries are no longer rendered, and Helm deletes their `DataVolume`s. Disks already cloned from them are separate PVCs and stay, and a clone that has not started copying yet can lose its source. An entry of `images` that uses `secretRef`, `secretExtraHeaders` or `certConfigMap` blocks the rollback, because the old chart renders it without those fields and CDI refuses the change to the `DataVolume` spec. The hoster moves such entries to `extraImages` or removes them before rolling back, and either way their golden images are deleted.
+This proposal adds documentation and reference scripts, no API and no chart change. A guest image built before it keeps working as before: an image that does not read the `GPULICENSE` disk ignores it and is licensed the way it was, or not at all. Rolling back `gpudevice` removes the disk, as its Upgrade and rollback compatibility section describes, so the hoster first puts the license token into private images it gives entitled tenants only. Such a private image does not run the reference boot unit or script of the guest contract, since the boot unit points the license client at an empty token directory and the script empties the token folder at every boot. An existing VM whose image follows section 2 keeps no token across boots, so it stays unlicensed after the rollback restarts it until it is recreated from such a private image, or its tenant disables the reference boot unit or script, removes the `ClientConfigTokenPath` line from `gridd.conf` on Linux, and licenses the guest itself.
 
 ## Security
 
-- `secretRef` and `secretExtraHeaders` point to Secrets the hoster creates in `cozy-public`. Tenants cannot read Secrets there, and the chart only passes the names to CDI.
-- A GPU guest image contains the guest driver, and an image with the vGPU guest driver may contain the hoster's license token. Golden images in `cozy-public` are open to every tenant: any tenant can clone one and boot it as root. The vGPU entitlement of `gpudevice`, the Tenant flag `gpu.vgpu`, which an entitled namespace shows as the label `namespace.cozystack.io/vgpu: "true"`, decides who can use a vGPU class, but not who gets the driver and the token from a shared image. The label holds the effective value, the tenant's flag combined with its parent's entitlement, and any other value, or no label, means no entitlement. The golden image collection has no per-tenant visibility, unlike the per-tenant registry access of `kairos-vgpu-workers`. A hoster whose NVIDIA terms require the driver to stay with entitled tenants keeps vGPU guest images out of the shared catalog and uploads them into the namespace of each entitled tenant instead. Such a hoster also keeps the token out of any shared image. A license server reachable only from tenant networks limits where a token that leaks out of the cluster can check out licenses.
-- CDI v1.66.1 sends the basic auth credentials and the extra headers again on every HTTP redirect, whatever host it points to. A hoster whose image server redirects, for example to a CDN, sends them there too.
-- No new tenant input. The marking is set by the hoster and only displayed.
+- The token reaches only the guests of entitled tenants, where the guest's root user can read it, which licensing a guest needs. It is in no shared image, so a tenant without the entitlement cannot read it by cloning a golden image.
+- A tenant super-admin who writes a VirtualMachine directly can mount its namespace's copy into it, which is still within an entitled tenant.
+- A token that leaks out of a guest can lease licenses from wherever it reaches the license server, until it expires, which on DLS can be never. A DLS reachable only from the cluster's egress addresses limits where; a short expiry chosen when the token is generated limits how long.
+- A tenant that brings its own license keeps its token in its own image or cloud-init data, under its own control.
 
 ## Failure and edge cases
 
-- The credentials for an image URL are wrong, or the Secret is missing → CDI does not treat this as fatal. The import retries without end, or the importer never starts, and the `DataVolume` never reaches `Failed`. The package stays not Ready, the image stays in the picker, and a tenant disk cloned from it waits, as for any golden image with a broken source today.
-- A name appears twice, in both lists or within one → rendering fails and names it. This also happens when a later Cozystack release adds a default image with the name of a hoster entry, so the guide tells hosters to prefix their names.
-- An `extraImages` name matches a hand-made `DataVolume` in `cozy-public` → helm-controller takes ownership of the existing object. If the specs differ, CDI refuses the change and the release fails; if they are equal, the release adopts it and deletes it with its PVC when the entry leaves `extraImages` or on rollback. The hoster deletes the hand-made one or picks another name.
-- `gpu` is set without `vendor` or `mode`, or with a `mode` other than `vgpu` or `passthrough` → rendering fails and names the image.
-- The hoster changes the source of an image whose `DataVolume` already exists → CDI refuses the change to the `DataVolume` spec and the upgrade of the package fails, as for a changed `url` today. The hoster adds the image under a new name instead.
-- A GPU VM boots from an image without a matching guest driver → the VM runs and the device is unusable.
+- A vGPU VM is refused at start → the tenant has no vGPU entitlement; the parent's administrator sets `gpu.vgpu`, or the hoster on a top-level tenant.
+- A vGPU VM stays `Starting` with a `FailedMount` event → the namespace has no license copy yet; check the class's `LicenseSecretMissing` condition and the hoster's Secret.
+- A guest runs but is unlicensed → `nvidia-smi -q` in the guest shows the status; the guest does not reach the license server on its port, TCP 443 by default (and 80 on Windows), the image does not follow section 2, or its lease was released. Fix the route, the image, or the token, then restart the guest's license client or the VM.
+- A guest keeps the old token after a rotation → it has not restarted since; restart it before the old token expires or its allocation stops leasing.
 - The vGPU guest driver is incompatible with the host vGPU Manager, for example after a host upgrade → the vGPU fails to load in the guest. The hoster publishes an image with a compatible driver, and tenants rebuild their VMs from it.
-- The node of a GPU VM is drained or fails → Design §5.
 
 ## Testing
 
-- Helm unit tests in `vm-default-images`: annotations from `gpu`, the secret and CA fields in the `http` source, rendering of `extraImages`, an entry without the new fields rendering the same `DataVolume` as before, and the failures on a duplicate name, on a `gpu` without `vendor` or `mode`, and on an unknown `mode`.
-- Go unit tests for the `image` option provider: the label from `DataVolume` annotations, the label without `driverBranch`, no label when listing `DataVolume`s fails even if the PVC carries a marking, and unchanged output for images without a marking.
-- Dashboard unit test for the image picker showing the label when it is set and the value otherwise.
-- Manual on hosts with GPUs: import an image from an authenticated HTTP source, create a disk and a VM on a vGPU class, check that the guest is licensed. Repeat with a passthrough class. CI cannot do this, because it has no GPU, no driver and no license.
+- The platform side, the copies and the `GPULICENSE` volume, is tested in `gpudevice`.
+- Tests for the reference boot unit and script: the files land in the right paths with the right modes, and a Linux guest without the disk has no token, and a Windows guest without it has an empty token folder.
+- Manual on hosts with vGPU: a VM on a licensed class gets licensed on first boot; after a token rotation and a restart it uses the new token; an unentitled tenant is refused; a guest without a route to the license server shows as unlicensed. CI cannot do this, because it has no GPU, no driver and no license.
 
 ## Rollout
 
-This proposal is implemented after item 2 of the Rollout of `gpudevice`, which adds class entries to `vm-instance`; it is item 3 of that Rollout, and waits neither for item 1 nor item 4 nor for step 2. One release ships Design §1 and §2 and the guide.
+This proposal ships with the license delivery of `gpudevice`, item 2 of its Rollout, and is its item 3 for VMs: the documentation page and the reference scripts. It does not wait for step 2 of `gpudevice`.
 
 ## Open questions
 
-- Should a registry source (`registry` in CDI) also be supported for golden images, for hosters who keep images in an OCI registry?
-- Should the image picker show the import state, so that a tenant does not clone an image whose import is stuck?
-- Should a GPU VM show a warning in the dashboard when none of its disks comes from a marked image?
-- Should the image picker and the clone of a golden image marked `mode: vgpu` be limited to namespaces whose label `namespace.cozystack.io/vgpu` is `"true"`? The label gives the signal. What is open is whether a cloning rule in `cozy-public` keyed on it is worth its cost.
-- Should tenants be able to mark their own uploaded images, so the picker treats them the same way?
+- Should the platform optionally allow egress from entitled namespaces to an in-cluster DLS, for hosters that run DLS as a container in the management cluster?
+- Should Cozystack read lease counts from DLS to show license use per tenant next to the usage records, or leave that entirely to the hoster's billing system?
 
 ## Alternatives considered
 
-A new package or CRD only for GPU images was rejected: the golden image collection already does everything except authentication and marking, and a second catalog would need its own picker and its own clone path in `vm-disk`.
+A token baked into a shared guest image. Anyone who can clone the image reads the token, every tenant can clone a golden image, and rotation means rebuilding the image and every disk cloned from it. Rejected, as in record 0018 of `gpudevice`.
 
-Cozystack could build the image from a hoster-supplied driver, as `kairos-vgpu-workers` does with a build recipe. That was rejected for VMs: a VM guest is a full OS that the tenant owns, and hosters will want different distributions, versions and extra software. A recipe would cover one of them and leave the rest to the hoster.
+A license server reachable only from tenant networks, with the token in the image, the way KMS serves Windows images. It limits where a leaked token can lease licenses, but the token still reaches every tenant that clones the image, and the network rule has to follow every tenant network. Rejected for the same reason; a DLS outside the pod network gives the same limit without putting the token into images.
 
-A `DataVolume` created by hand already accepts any CDI source and could carry the marking annotations. It was not used as the base, because it is not declarative, not covered by the package health check, and not reconciled.
+The token in `vm-instance` cloud-init, written by the hoster. The values belong to the tenant, who reads them, and every VM would need the hoster to edit it. Rejected; cloud-init stays the tenant's own path for a license it brings.
 
-Restating the default list instead of adding `extraImages` works today without a change, but the hoster's copy of the defaults goes stale with every Cozystack release that changes them.
+A DLS inside the management cluster with an egress rule from every entitled namespace to it. It keeps the server off the hosts' network, but it adds a platform-managed exception to tenant isolation for one vendor's service. Left as an open question rather than the default.
+
+Golden image changes for GPUs: an `extraImages` list, a `gpu` marking in the picker, and per-tenant visibility of vGPU images. Dropped: hosters already add images by hand or through the `images[]` override, a marking enforces nothing, and visibility by namespace label departs from the standard RBAC model. A generic golden-image proposal can take up label-based discovery.
