@@ -2,8 +2,6 @@
 
 - **Title:** `Proxmox-backed VPC subnets: Proxmox VLANs as transport for Kube-OVN VPC subnets`
 - **Author(s):** `@themoriarti`
-- **Date:** `2026-10-07`
-- **Status:** Review
 
 ## Overview
 
