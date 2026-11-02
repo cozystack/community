@@ -7,7 +7,7 @@
 
 Installation defaults provide a shared configuration layer for every application registered through an ApplicationDefinition. The API applies these values when an application is created and stores the result in its HelmRelease. The order is user values, installation defaults, then developer chart/schema defaults.
 
-Changing installation defaults affects future applications. It does not add installation defaults to existing applications on reads, updates or Helm rendering. This changes the behavior of application creation, even though it adds no fields or resources to the Cozystack API. Once an entry exists for an application kind, every client that omits a field of that kind takes the installation value instead of the chart default. That includes kubectl, Terraform, CI jobs and GitOps repositories, and it applies to the whole cluster. Values a client sets keep precedence.
+Changing installation defaults affects future applications. It does not add installation defaults to existing applications on reads, updates or Helm rendering. This changes the behavior of application creation, even though it adds no fields or resources to the Cozystack API. Once an entry exists for an application kind, every client that omits a field of that kind takes the installation value instead of the chart default. That includes kubectl, CI jobs and GitOps repositories, and it applies to the whole cluster. Values a client sets keep precedence.
 
 ## Scope
 
@@ -118,7 +118,7 @@ Top-level fields beginning with `_` remain reserved by the existing application 
 
 ### API creation
 
-The ConfigMap is consulted only for application creation, including creation previews through server-side dry-run. Get, List, Watch, Update and Helm rendering do not read it. The create path reads the ConfigMap from a cache that the API server fills with a watch on that single object, and the API starts serving only after the cache has synced. A transient Kubernetes API error therefore does not reach the create path, and a saved change becomes visible to creates shortly after.
+The ConfigMap is consulted only for application creation, including creation previews through server-side dry-run. Get, List, Watch, Update and Helm rendering do not read it. The create path reads the ConfigMap from a cache that the API server fills with a watch on that single object. The API waits for the first sync only for a bounded time, and a create that cannot read the cache continues without installation defaults and returns the warning. A transient Kubernetes API error therefore does not reach the create path, and a saved change becomes visible to creates shortly after.
 
 The create path merges usable defaults before quota checks and validating admission, then writes the resulting spec to `HelmRelease.spec.values`. Admission sees the values being saved. Dry-run follows that same path without persisting a resource. A quota or admission rejection still writes no HelmRelease, including when a configured default contributed to that rejection.
 
