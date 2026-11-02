@@ -346,9 +346,11 @@ What a catalog declares so the console shows its applications without a console 
 
 Enforced from step 0:
 
-- New standalone applications are not added to `cozystack/cozystack`. They live in a separate catalog repository, following the external apps model, and get installed through external apps and the marketplace.
+- The project maintains the platform, virtualization and services. A new application either joins one of our catalogs or stays in author's own catalog.
+- Application joins our catalog when all of these hold: a maintainer or reviewer takes it in CODEOWNERS, licenses of the application and its operator are acceptable for a CNCF project, it has e2e test, its upstream operator is maintained, and more than one user needs it.
+- Until step 3 our catalogs live in `cozystack/cozystack`, so accepted application goes into its catalog directory there, under the coupling rule below, and moves together with the catalog later. We don't create interim repository for it.
+- Any other application is published by its author as a catalog from author's own repository and installed through the marketplace. The project does not host such catalogs and has no separate organization for them.
 - Recommended layout for such repository is `PackageSource` with `cozypkg`, the same format our own catalogs use after step 2. The older layout from `cozystack/external-apps-example`, a Git repository with a bootstrap `HelmRelease`, keeps working but is not recommended for new catalogs.
-- Community applications live in a separate GitHub organization, for example `cozystack-community`, which is not part of the CNCF project and does not carry the project's governance requirements. People who bring an application there review and maintain it. The project itself maintains only the platform, virtualization and services.
 - New platform components are accepted at maintainers' discretion.
 - There is no grace period. Once the policy is accepted it applies to open pull requests and issues too.
 - Changes that couple applications tighter to the platform are rejected in review. This covers platform code that names an application's kind, API group, namespace or release name, and core RBAC, backups, option providers, the dashboard or monitoring learning about a specific application.
@@ -356,7 +358,7 @@ Enforced from step 0:
 
 The policy text goes into `CONTRIBUTING.md` of `cozystack/cozystack` after this proposal is accepted.
 
-**Is the marketplace ready to be the only path?** Not yet. On `main` a third party can already run `cozypkg init`, `validate` and `push`, connect the artifact with `cozypkg tap` or from the dashboard, and get a new kind with schema-driven forms. All of this came in [cozystack#3940](https://github.com/cozystack/cozystack/pull/3940), which is only in the 1.7 pre-releases. On 1.6 the only paths are the old `external-apps-example` layout or a hand-written `PackageSource` with `cozypkg add`. Before the policy can send everyone to the marketplace, the following must be in place, as part of step 0:
+**Is the marketplace ready to carry third-party applications?** Not yet. On `main` a third party can already run `cozypkg init`, `validate` and `push`, connect the artifact with `cozypkg tap` or from the dashboard, and get a new kind with schema-driven forms. All of this came in [cozystack#3940](https://github.com/cozystack/cozystack/pull/3940), which is only in the 1.7 pre-releases. On 1.6 the only paths are the old `external-apps-example` layout or a hand-written `PackageSource` with `cozypkg add`. Before the policy can send third-party applications to the marketplace, the following must be in place, as part of step 0:
 
 1. **1.7.0 released** with [cozystack#3940](https://github.com/cozystack/cozystack/pull/3940) and [cozystack#4424](https://github.com/cozystack/cozystack/pull/4424).
 2. **A package cannot take over another package's `HelmRelease`.** `createOrUpdateHelmRelease` in `internal/operator/package_reconciler.go` overwrites any `HelmRelease` with the same namespace and name, owner references included. `cozypkg init postgres` scaffolds `cozy-system/postgres-rd`, which is the platform's own release name. The fix is the guard [cozystack#3940](https://github.com/cozystack/cozystack/pull/3940) added for `PackageSource` after [cozystack#4001](https://github.com/cozystack/cozystack/issues/4001): refuse a `HelmRelease` that belongs to a different `Package`.
@@ -389,7 +391,7 @@ The marketplace ships enabled in 1.7.0, and items 2 to 7 land in 1.7 patch relea
 ## Security
 
 - RBAC moves from one central list into the catalogs. Each catalog grants roles for its own kinds through aggregation, so the platform no longer grants rights for kinds it doesn't install.
-- New applications arrive from separate catalog repositories through the marketplace, so anyone who publishes a catalog can reach its defects. Today connecting a catalog installs the publisher's chart as `cluster-admin`, a package can take over a platform `HelmRelease`, and artifact names can collide with the platform's. These get fixed in step 0, before the policy relies on the marketplace, see [Is the marketplace ready](#contribution-policy-for-new-applications).
+- Applications the project does not take come from authors' catalogs through the marketplace, so anyone who publishes a catalog can reach its defects. Today connecting a catalog installs the publisher's chart as `cluster-admin`, a package can take over a platform `HelmRelease`, and artifact names can collide with the platform's. These get fixed in step 0, before the policy relies on the marketplace, see [Is the marketplace ready](#contribution-policy-for-new-applications).
 
 ## Failure and edge cases
 
