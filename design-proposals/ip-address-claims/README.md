@@ -51,6 +51,10 @@ pattern, and the overlap is worth naming up front so reviewers are not surprised
   shape, but only ever wired to **Machine** addressing, never Services, and with no
   reclaim policy or association. We mint our own (*Alternatives considered*); the shared
   names are an acknowledgement that the shape is not novel.
+- **`Service.spec.externalIPs`** is the older, unrelated mechanism — a Service claiming an
+  address by value with no allocator behind it, the field behind CVE-2020-8554 — and
+  `ExternalIP*` kinds, proposed in review, would invite confusion with it. One more reason
+  the kinds are not named that way.
 
 Kinds are qualified by API group, so the short-name overlap is not a collision. The
 kinds live in `local.sdn.cozystack.io` (see *Positioning*).
@@ -224,8 +228,9 @@ being restored, only something being added.
 
 ## Goals
 
-- A tenant can request an address and receive one, without an admin pre-creating a
-  pool object for them.
+- A tenant can request an address and receive one — or, in a brokered deployment, have
+  one requested on their behalf and attach it — without an admin pre-creating a pool
+  object for them.
 - An address **survives** the deletion of the workload it was attached to (reclaim
   policy `Retain`), and can be attached to a different workload afterwards.
 - An operator can enumerate every address the cluster owns, and see who holds it.
@@ -333,6 +338,8 @@ spec:
   loadBalancerClass: metallb.io/public   # the implementation that announces it;
                                          # empty => the cluster's default implementation
   reclaimPolicy: Retain                  # Retain | Delete   (default Retain)
+  # releaseDelay: 720h                   # optional, Retain only: Released -> Available
+  #                                      # after this long (Failure and edge cases)
   parameters:                            # opaque to the core controller
     addresses: ["203.0.113.0/24"]
 ---
@@ -393,6 +400,13 @@ naming one names an object outside its own namespace. Neither this field nor
 `spec.className` — equally free-text, and equally unable to be gated by namespace RBAC —
 decides which classes a namespace may draw from. That gap is identical with or without
 `addressName`, and closing it belongs above this controller; see *Security*.
+
+This is precisely how Kubernetes treats `volumeName`: any claim may name any `Available`
+volume of its class, nothing authorizes the name, and the admin's lever for a volume meant
+for one tenant is to **pre-bind** it by setting its `claimRef` first. Pre-provisioned
+addresses work the same way — an admin who wants an address to go to one namespace binds
+it before anyone can name it. Where a deployment wants the field gated rather than merely
+narrowed, *Security* says how.
 
 `IPAddressClaim.status.addresses` is a **list** deliberately: a `Dual` claim binds a
 v4 and a v6 `IPAddress` and must report both, and a scalar `address` field could not.
@@ -673,10 +687,25 @@ cluster.
 - **Tenants** gain one kind: `IPAddressClaim`. Create it, read `status.addresses[].address`,
   put that in DNS, reference the claim by name from a Service. They never see `IPAddress`,
   `IPAddressClass`, MetalLB, or a pin annotation.
+- **Two operating modes, decided by RBAC alone.** In **self-service** mode tenants create
+  and delete their own claims, bounded by quota. In **brokered** mode tenants hold *read*
+  access to claims, and platform machinery — a billing integration, a portal, a tenant
+  controller — creates them on the tenant's behalf: the tenant may attach and detach the
+  address, through the §5 annotation or the held-before-minted rule of §6, but cannot
+  release it, and an address moved between namespaces is moved by the machinery through
+  `spec.addressName`. Nothing in the model differs between the two. A hosting provider
+  that sells addresses on a minimum term runs the second; a platform team with internal
+  tenants runs the first.
 - **Admins** gain `IPAddressClass` (one per address source) and `IPAddress` (a read-mostly
   inventory: `kubectl get ipaddresses` finally answers "what do we own and who has it").
 - **Quota** works with no new machinery: `count/ipaddressclaims.<group>` in a stock
-  `ResourceQuota`.
+  `ResourceQuota`. (A distribution that renders quotas from its own tenant object has to
+  pass `count/` keys through; Cozystack's tenant chart does not yet.)
+- **Metering follows the claim.** A platform that meters `type: LoadBalancer` Services
+  today meters the wrong thing once addresses are claims: a held address is held whether
+  or not a Service wears it, and a placeholder in the driver's namespace is nobody's
+  workload. The `IPAddress` ledger is the unit of accounting — its `claimRef` says whose,
+  its conditions say since when — and a platform that bills addresses bills claims.
 
 ## Upgrade and rollback compatibility
 
@@ -688,6 +717,16 @@ cluster.
 - **Rollback.** Deleting the CRDs with `reclaimPolicy: Retain` leaves the backend objects
   and the live Services untouched; addresses stay where they are. With `Delete`, it does
   not — flagged as the irreversible case.
+- **Adopting Services that are already pinned.** A cluster that enables the fence with
+  hand-pinned Services in place does not break them: an unchanged pin always passes, since
+  the policy compares old against new. To bring such an address under the ledger, an admin
+  creates its `IPAddress` pre-bound to a claim (`claimRef` set, exactly as a pre-provisioned
+  PV), then adds the claim annotation to the Service; the driver's pin equals the existing
+  one and nothing moves. Removing a pin is a change and is gated, so unpinning a legacy
+  Service is an allowlisted operation.
+- **Turning the fence on.** The policy ships with `validationActions` configurable, so a
+  deployment runs `Warn` or `Audit` first, reads what would have been denied, extends the
+  allowlist, and only then switches to `Deny`.
 
 ## Security
 
@@ -717,14 +756,25 @@ to an RBAC-gated object:
    `metallb.io/address-pool` and `metallb.io/loadBalancerIPs`, plus the §1.2 equivalents
    for other backends — on a Service.
 
-*Identifying the controller, and not breaking the platform.* The policy must not rely on
-a hardcoded username. It matches the controller's **ServiceAccount** by name and
-namespace (`system:serviceaccount:<ns>:<sa>`), configured at install time. And it must
-carry an **allowlist**: real clusters have non-tenant principals that legitimately write
-these annotations — GitOps reconcilers (Flux/Argo SAs) and system controllers (system
-Istio Services ship with pool annotations already set). A naive "reject everyone but the
-controller" breaks reconciliation on day one, so the policy denies the write only for
-principals **outside** an explicit, admin-configurable allowlist.
+*Identifying the driver, and not breaking the platform.* The policy must not rely on a
+hardcoded username. It matches the driver's **ServiceAccount** by name and namespace
+(`system:serviceaccount:<ns>:<sa>`), configured at install time, and it must carry an
+**allowlist**: real clusters have non-tenant principals that legitimately write these
+annotations — GitOps reconcilers applying content their operators authored, and system
+components whose own Services ship with pool annotations pre-set (an Istio installation,
+say). A naive "reject everyone but the driver" breaks reconciliation on day one, so the
+policy denies the write only for principals **outside** an explicit, admin-configurable
+allowlist of usernames and groups, and it ships with `Warn`/`Audit` modes for rollout
+(*Upgrade and rollback compatibility*).
+
+*The fence covers every input the backend honours.* Not only the current annotation: a
+backend's deprecated spellings are still parsed, and so may be a core field. For MetalLB
+the gated set is `metallb.io/loadBalancerIPs`, `metallb.io/address-pool` and
+`metallb.io/allow-shared-ip`, the same three under the legacy `metallb.universe.tf/`
+prefix, **and `Service.spec.loadBalancerIP`**, which MetalLB still reads despite the
+field's deprecation in Kubernetes 1.24. Omit any one and the fence has a door. The
+comparison is old-versus-new, not presence: the driver pins the tenant's own Service, and
+the tenant must stay able to edit the rest of it.
 
 *The allowlist's hard case: trusted principals applying untrusted content.* An identity
 allowlist assumes a trusted principal writes content it authored, and that assumption fails
@@ -732,14 +782,18 @@ wherever a privileged controller applies material some user supplied. Two shapes
 ordinary rather than exotic: a GitOps reconciler that applies user-authored releases under
 its **own** identity instead of impersonating the user, and a cloud-controller-manager that
 copies Service annotations from a user-controlled cluster into an infrastructure Service
-verbatim. Allowlist such a deputy and every user behind it inherits the ability to write a
-pin annotation; deny it and legitimate reconciliation breaks. So **annotation filtering at
-the deputy is a precondition of layer 1, not a hardening extra**: a strip-list for the gated
-keys in any controller that forwards user-supplied annotations, and impersonation rather
-than ambient authority in any reconciler applying user-authored content. Until those hold
-for a given deputy, layer 1 is **partial** for the users behind it and layer 2 is what
-covers them. The design says so rather than assuming a trusted identity implies trusted
-content.
+verbatim. So **not every platform controller belongs on the allowlist**. A deputy that
+forwards user content is *denied*, like the users behind it, and the Services it creates
+get their addresses through the one path the fence leaves open: the claim annotation, or
+the auto-claim of §6, whose class-selection and opt-out annotations are exactly the ones a
+deputy may safely copy. Allowlist such a deputy instead and every user behind it inherits
+the ability to write a pin; deny it without that path and legitimate Services stay
+`Pending`. Where a deputy must forward gated keys for some other reason, **annotation
+filtering at the deputy is a precondition of layer 1, not a hardening extra**: a strip-list
+for the gated keys, and impersonation rather than ambient authority in any reconciler
+applying user-authored content. Until those hold for a given deputy, layer 1 is
+**partial** for the users behind it and layer 2 is what covers them. The design says so
+rather than assuming a trusted identity implies trusted content.
 
 **Layer 2 — reconciliation, for everyone admission cannot bind.** Layer 1 is keyed on
 identity, so it is defeated by anyone who can impersonate an allowlisted ServiceAccount —
@@ -759,22 +813,45 @@ visible faults instead of quiet theft.
 Landing layer 1 is worth doing on its own, independent of the rest of the model: the
 theft window it closes is live in any cluster running a shared auto-assign pool today.
 
-**Where this component stops.** The two layers above cover the surface a reservation can
-be *stolen* through. They do not close field-level authorization in general: a tenant who
-can create an `IPAddressClaim` can consume an address, may name any `spec.className`, and
-may name a specific `IPAddress` through `spec.addressName` (§2). `ResourceQuota` bounds how
-many addresses they hold; nothing here decides *which class* a namespace is entitled to
-draw from.
+**Where this component stops, and the entitlement it leaves room for.** The two layers
+above cover the surface a reservation can be *stolen* through. They do not decide *which
+class* a namespace may draw from: a tenant who can create an `IPAddressClaim` can consume
+an address and may name any `spec.className`. `ResourceQuota` bounds how many addresses
+they hold, not from where. Kubernetes has the same gap for `StorageClass` — any namespace
+may name any class — and closes it, where it bothers to, with per-class quota scoping.
 
 That is deliberate rather than unfinished. This component's job is the **capability** —
-reserve an address, hold it, attach it, detach it, release it — and a capability that also
-tried to be its own policy engine would have to encode a tenancy model it does not have and
-cannot see. The gating belongs where the tenancy model lives: a `ValidatingAdmissionPolicy`
-restricting which classes a namespace may name (the same mechanism as layer 1, with a
-different subject), or platform machinery that mints claims on a tenant's behalf instead of
-letting tenants write claims directly. **`spec.className` and `spec.addressName` are the two
-fields such a policy must cover** — naming them here is the point, so that a deployment
-hardening this does not have to discover them.
+reserve an address, hold it, attach it, detach it, release it — and encoding a tenancy
+model it cannot see belongs above it. Three things are stated here so that whoever closes
+the gap does not have to discover them:
+
+1. **The check keys on the namespace, never on the requesting principal.** Platform
+   machinery that mints claims on a tenant's behalf — community #45's attachment
+   controller, a billing integration — creates them under its *own* identity, so a policy
+   keyed on the requester never sees the tenant. A namespace-keyed check covers
+   tenant-authored and machinery-minted claims alike, and a `ValidatingAdmissionPolicy`
+   can express it synchronously, since `paramRef` resolves a parameter object in the
+   request's namespace.
+2. **The empty `className` is a decision, not a convenience.** "Empty means the default
+   class" is the documented path, so a rule of the form *empty or entitled* admits every
+   namespace to the default class. Whether the default class is entitled is a separate
+   boolean.
+3. **`spec.addressName` cannot be checked in CEL**, because resolving an address to its
+   class needs a second object read. A deployment that gates it either refuses the field
+   to tenant principals outright — the reference policy's choice, and the right one where
+   platform machinery is what moves specific addresses — or checks it in a webhook.
+
+The natural home for the data is an **optional entitlement object in the core**: per
+namespace, per class, the number of claims that namespace may hold of that class, with
+zero meaning not entitled and absence meaning unrestricted — the per-class quota scoping
+Kubernetes applies to storage, which gives entitlement and a per-tenant ceiling in one
+object. When present, the core refuses a claim that exceeds it with a condition, and the
+reference admission policy enforces the same bound synchronously on the tenant-facing
+path. The object's shape is **deferred** (*Open questions*); what is fixed is that it is
+namespace-keyed and that the distribution, not the tenant, writes it. In Cozystack the
+`Tenant` object is the obvious source and the tenant chart the obvious renderer, which is
+also how a brokered deployment (*User-facing changes*) expresses "this tenant owns three
+addresses of the public class".
 
 ## Failure and edge cases
 
@@ -809,6 +886,19 @@ hardening this does not have to discover them.
   the claim, not an admission-time rejection.
 - **Address adopted from a provider, then released provider-side** → `IPAddress` goes
   `Lost`. It must not silently re-allocate.
+- **Controllers down while a namespace holding claims is deleted** → the claim finalizer
+  holds the namespace until the core returns, exactly as PVC protection does; a controller
+  outage never leaks an address, at the cost of a deletion that waits.
+- **Class deleted while addresses of it are bound** → refused, not cascaded. The rendered
+  pool and advertisement are owned by the class, so letting the deletion through would
+  withdraw every address of the class at once; a finalizer holds the class until its
+  addresses are gone.
+- **`Released` addresses accumulate under `Retain`** → by default an admin clears
+  `claimRef`, PV semantics. A class may set an optional **`releaseDelay`**: once it
+  elapses the controller clears `claimRef` itself and the address returns to `Available`,
+  so a release followed by a cooling-off period before reuse needs no operator. An
+  address marked held — an annotation the controller honours — is exempt, which is how an
+  operator quarantines an address they do not want reissued.
 
 ## Testing
 
@@ -819,7 +909,8 @@ hardening this does not have to discover them.
 - **e2e (per backend):** MetalLB and Cilium, on a real cluster: an external client reaches
   the workload on the reserved address, and still reaches it after the workload is
   rebuilt behind the same claim.
-- **Admission:** a tenant writing a raw pool-select or pin annotation is rejected; a tenant
+- **Admission:** a tenant writing a raw pool-select or pin annotation, a legacy-prefixed
+  one, or `spec.loadBalancerIP` is rejected; a tenant
   reserving an address and a second tenant attempting to pin it directly is rejected; an
   allowlisted GitOps/system principal writing a pool annotation is **admitted** (the
   allowlist does not over-block).
