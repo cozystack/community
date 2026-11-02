@@ -2,8 +2,6 @@
 
 - **Title:** `Tenant-managed site-to-site connectivity via gateway VMs (site-router and site-gateway)`
 - **Author(s):** `@myasnikovdaniil`
-- **Date:** `2026-07-08`
-- **Status:** Accepted
 
 ## Overview
 

@@ -3,11 +3,9 @@
 
 - **Title:** `Your full title`
 - **Author(s):** `@your-github-handle, @coauthor`
-- **Date:** `YYYY-MM-DD`
-- **Status:** Draft | Review | Accepted | Rejected | Superseded
 
-<!-- Status transitions: Draft → Review (PR opened) → Accepted (merged),
-     Rejected, or Superseded (replaced by a later proposal; link it). -->
+<!-- Proposal status and dates come from the PR and Git history.
+     See README.md#proposal-status-and-dates in the parent directory. -->
 
 ## Overview
 
@@ -19,6 +17,18 @@ A reader who stops here should know what you're asking for and roughly why. -->
 <!-- Sibling or follow-up proposals and anything deliberately deferred.
 Link them by repo path or URL. If this proposal must land before or after
 another, say so. Omit the section if there are no related proposals. -->
+
+## Decisions
+
+<!-- Leave this empty in the initial PR; fill it in as implementation
+proceeds. Records live in this proposal's own directory, numbered from
+0001. Link each one here, newest first:
+
+- [0001. Short statement of what was decided](./decisions/0001-short-slug.md) — one clause on what it settled.
+
+Where implementation changed the design, the record is what explains why
+— this section is how a reader of the proposal finds that out.
+See ../README.md#decision-records. -->
 
 ## Context
 

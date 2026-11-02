@@ -8,7 +8,13 @@ contact_links:
     about: Concrete, scoped features go in the main cozystack repo.
   - name: 📐 Design proposal / RFC
     url: https://github.com/cozystack/community/tree/main/design-proposals
-    about: Architectural or cross-cutting changes — open a design-proposal PR (markdown) in this repo. Open a blank issue here only for governance, process, or community topics.
+    about: Architectural or cross-cutting changes — open a design-proposal PR (markdown) in this repo.
   - name: 💬 Question or early idea
     url: https://github.com/cozystack/cozystack/discussions
     about: Usage questions and half-formed ideas — use the cozystack Discussions tab or Telegram (https://t.me/cozystack).
+  - name: 🧭 First time contributing?
+    url: https://github.com/cozystack/community/blob/main/contributors/README.md
+    about: How to pick a task, what environment you need, and how to get a first pull request merged.
+  - name: 🗓️ Community meeting
+    url: https://github.com/cozystack/community/blob/main/community_meeting.md
+    about: Every second Thursday, 18:00 CET, open to everyone — joining link, agenda and past recordings.
