@@ -90,8 +90,11 @@ kinds live in `local.sdn.cozystack.io` (see *Positioning*).
 
 ## Decisions
 
-<!-- Empty in the introducing PR. Records go under ./decisions/, numbered from 0001,
-     and are linked here newest first. See ../README.md#decision-records. -->
+Implementation ran ahead of this document, and two of its findings changed the design
+rather than merely filling it in. Each is recorded where the reasoning can be found again:
+
+- [0002. The ledger does not adopt assignments; the core claims on behalf of Services that cannot](./decisions/0002-the-ledger-does-not-adopt-the-core-claims-on-behalf-of-services.md) — why §6's backwards inventory was dropped and the opt-in auto-claim took its place.
+- [0001. The backend allocates; the ledger records what it assigned](./decisions/0001-the-backend-allocates-and-the-ledger-records.md) — why the reference driver reserves through placeholder Services instead of carving addresses itself, and what that costs.
 
 ## Positioning
 
