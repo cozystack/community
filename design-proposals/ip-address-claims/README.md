@@ -2,8 +2,6 @@
 
 - **Title:** `IP addresses as a first-class resource: IPAddress, IPAddressClaim, IPAddressClass, and a provisioner contract`
 - **Author(s):** `@lllamnyp`
-- **Date:** `2026-07-15`
-- **Status:** Draft
 
 > **The shape is settled and implemented; the contract details are not.** The problem
 > statement, the primitives survey, and the object model are worked out, and phase 1 of
@@ -84,6 +82,11 @@ kinds live in `local.sdn.cozystack.io` (see *Positioning*).
   CNI concern, tracked separately. **This proposal is the allocation half; that is
   the forwarding half.** They are independent: allocation is useful with a stock
   LoadBalancer Service and no 1:1 NAT at all.
+
+## Decisions
+
+<!-- Empty in the introducing PR. Records go under ./decisions/, numbered from 0001,
+     and are linked here newest first. See ../README.md#decision-records. -->
 
 ## Positioning
 
@@ -179,9 +182,9 @@ Service, at the moment the Service is created, and freed when it is deleted.**
 
 > *"I gave my customer this IP address. It is in their firewall allow-list. I need to
 > rebuild the VM behind it, and I need the address to still be mine afterwards."*
-
+>
 > *"I want to move this address from the old VM to the new one during a cutover."*
-
+>
 > *"I want to reserve four addresses now, because the range is nearly full, and attach
 > them over the next month."*
 
