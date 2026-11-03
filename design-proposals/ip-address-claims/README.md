@@ -404,9 +404,9 @@ metadata:
 spec: {type: LoadBalancer, ...}
 ```
 
-The driver resolves the claim to its address, checks that the claim is in the Service's
-namespace, and writes the backend's pin annotation (§1.2). The backend then allocates and
-announces that address.
+The driver reads the annotation, looks up a claim of that name in the Service's own
+namespace, resolves it to its address, and writes the backend's pin annotation (§1.2). The
+backend then allocates and announces that address.
 
 **The class determines the `loadBalancerClass`.** A class names a pool and a provisioner,
 which determines the LB implementation that announces its addresses, so a class implies
@@ -461,16 +461,16 @@ earlier design.
 
 **Auto-claim.** Some Services should draw from a class but cannot name a claim, because
 the component that renders them does not know about claims. The case that forced this is
-a cloud-controller-manager for tenant Kubernetes clusters: it creates a host-side
-`type: LoadBalancer` Service for each LoadBalancer Service in the guest and copies the
-guest's annotations once, at creation. Under `autoAssign: false` these Services stay
+cloud-provider-kubevirt, the cloud-controller-manager of tenant Kubernetes clusters: it
+creates a host-side `type: LoadBalancer` Service for each LoadBalancer Service in the
+guest and copies the guest's annotations once, at creation. Under `autoAssign: false` these Services stay
 `Pending`. The core therefore has an opt-in path, enabled per class by an annotation on
 the `IPAddressClass`: for a LoadBalancer Service with no claim annotation, no
 `loadBalancerClass`, no pin and no assigned address, the core creates an `IPAddressClaim`
 with the Service's name in the Service's namespace, owned by the Service, and writes the
 §5 annotation on the Service. The driver associates as usual. A Service can name a class
-or opt out through annotations the core defines; a deputy may copy these from a guest
-Service. The auto-claim class is independent of the default class.
+or opt out through annotations the core defines; cloud-provider-kubevirt copies these
+from the guest Service. The auto-claim class is independent of the default class.
 
 Two rules follow:
 
@@ -504,7 +504,10 @@ For MetalLB, once per cluster:
 - one `IPAddressPool` for the reserved range, with `autoAssign: false`;
 - one `L2Advertisement` or `BGPAdvertisement` selecting it.
 
-The `IPAddressClass` carries the range and the provisioner renders both objects.
+The `IPAddressClass` carries the range and the provisioner renders both objects. For the
+MetalLB driver, `parameters.addresses` lists the CIDRs of the pool it renders. The driver
+does not adopt an existing `IPAddressPool`, and MetalLB rejects overlapping pools, so a
+range moved into a class must leave its old pool first.
 `autoAssign: false` stops MetalLB from assigning a reserved address automatically. It does
 not stop a Service from naming the pool (`metallb.io/address-pool`) or pinning an address
 (`metallb.io/loadBalancerIPs`); §8 and *Security* cover that.
@@ -635,11 +638,11 @@ pins the tenant's own Service and the tenant must be able to edit the rest of it
 *Deputies.* An identity allowlist assumes the principal authored what it writes. A
 privileged controller that applies user-supplied content breaks that assumption. Two
 common cases: a GitOps reconciler that applies user-authored releases under its own
-identity instead of impersonating the user, and a cloud-controller-manager that copies
-Service annotations from a user-controlled cluster into an infrastructure Service. Such a
+identity instead of impersonating the user, and cloud-provider-kubevirt, which copies
+Service annotations from the tenant cluster into the host Service it creates. Such a
 deputy is denied, like the users behind it, and is not allowlisted. Its Services obtain
 addresses through the inputs the policy leaves writable: the claim annotation and the
-auto-claim annotations of §6, which a deputy may copy from a guest Service. Where a deputy
+auto-claim annotations of §6, which cloud-provider-kubevirt copies from the guest Service. Where a deputy
 must forward gated inputs, filtering at the deputy is a precondition of layer 1: a
 strip-list for the gated keys, or impersonation instead of ambient authority in the
 reconciler. Until a deputy filters, layer 1 is partial for the users behind it and layer 2
