@@ -41,7 +41,7 @@ Service with no claim annotation, no `loadBalancerClass`, no pin and no assigned
 the core creates an `IPAddressClaim` with the Service's name in the Service's namespace,
 owned by the Service, and writes the association annotation on the Service. The driver
 then associates as usual. A Service can name a class or opt out through annotations the
-core defines, which a deputy such as a cloud-controller-manager may copy. A claim with a
+core defines, which cloud-provider-kubevirt copies from the guest Service. A claim with a
 controller owner follows its owner, not the class reclaim policy: when the Service is
 deleted, its claim and addresses are deleted even under `Retain`. Removing the owner
 reference makes it an ordinary held claim.
@@ -75,8 +75,9 @@ reference makes it an ordinary held claim.
   Service in a namespace that holds an unattached claim wears that address, and a second
   Service with no spare claim stays `Pending`. This is the attach surface of the brokered
   mode.
-- Deputies copy annotations at creation only, so class selection and opt-out must be on
-  the guest Service before it is created.
+- cloud-provider-kubevirt copies annotations at creation only, so class selection and
+  opt-out must be on the guest Service before it is created. Syncing annotations on update
+  in cloud-provider-kubevirt would remove this constraint.
 
 ## Revisit if
 
