@@ -4,8 +4,9 @@
 - **Author(s):** `@lllamnyp`
 
 > The object model, the problem statement and the survey of existing primitives are
-> settled, and phase 1 of *Rollout* is implemented. *Implementation status* lists where
-> the text is ahead of the code. Open: the provisioner contract's own API (capabilities
+> settled. The controllers of phase 1 of *Rollout* exist and are pending review;
+> *Implementation status* lists what phase 1 still lacks and where the text is ahead of
+> the code. Open: the provisioner contract's own API (capabilities
 > are not modelled), the entitlement object of *Security*, sequencing after phase 1, and
 > *Open questions*.
 
@@ -113,7 +114,8 @@ considered*).
 
 ## Implementation status
 
-Phase 1 of *Rollout* exists under the Cozystack organisation:
+The controllers of phase 1 of *Rollout* exist under the Cozystack organisation, pending
+review:
 
 - **[address-controller](https://github.com/cozystack/address-controller)**: the core.
   The three kinds, claim–address binding, status, reclaim, and the driver contract. It
@@ -140,7 +142,8 @@ This tests the association seam only. The allocation seam, a second provisioner,
 untested (*Rollout*).
 
 **Specified here and not yet implemented:** the `loadBalancerClass` check and the
-serviceability check of §5; the pool-or-pin exclusion of §6; pinning
+serviceability check of §5; the pool-or-pin exclusion and the auto-claim class
+constraint of §6; pinning
 only the families a Service carries (§2); conditions on `IPAddress` (§2) and the
 `Associated` condition on a claim (§5); per-class conflict adjudication (§8); the
 held-before-minted rule of §6; the release delay and the class-deletion guard (*Failure
@@ -148,8 +151,8 @@ and edge cases*); Gateway as an association target (§5); the entitlement object
 (*Security*).
 
 **In the code and not in this text:** `claimRef.uid`, `status.className` on the claim,
-claim conditions, a `Lost` claim phase, a `Pending` address phase, the provisioner stamp
-annotation, the finalizers. The implementation's design document is the reference for
+the claim's `conditions` field with `ClassResolved` and `Bound`, a `Pending` address
+phase, the provisioner stamp annotation, the finalizers. The implementation's design document is the reference for
 these. None changes the model.
 
 ## Context
@@ -240,9 +243,9 @@ Five findings shape the design:
    is the IP, with a generic `spec.parentRef`) and named "any generalization onto
    something like an IPAM API" a non-goal. Nothing upstream will provide this.
 
-2. **Every backend pins a specific address through an annotation.**
-   `Service.spec.loadBalancerIP` was deprecated in Kubernetes 1.24 with no replacement, so
-   each implementation defined its own:
+2. **Every backend can pin a specific address.** `Service.spec.loadBalancerIP` was
+   deprecated in Kubernetes 1.24 with no replacement, so each implementation defined its
+   own annotation, and one still reads the field:
 
    | backend | pin mechanism |
    |---|---|
@@ -252,7 +255,7 @@ Five findings shape the design:
    | OpenELB | `eip.openelb.kubesphere.io/v1alpha1` |
    | AWS LB Controller | `service.beta.kubernetes.io/aws-load-balancer-eip-allocations` |
    | GCP / GKE | `networking.gke.io/load-balancer-ip-addresses` |
-   | PureLB | **none found** — see *Open questions* |
+   | PureLB | `spec.loadBalancerIP`, the deprecated core field; no annotation ([purelb#132](https://gitlab.com/purelb/purelb/-/issues/132)) |
 
    The semantics are identical. This is the seam the design rests on: a backend that can
    pin can bind a reserved address to a workload.
@@ -299,7 +302,7 @@ spec:
   family: IPv4               # IPv4 | IPv6 | Dual
   # addressName: ip-203-0-113-7   # optional: bind this specific address (see below)
 status:
-  phase: Bound
+  phase: Bound               # Pending | Bound | Lost
   addresses:                 # a list, so a Dual claim can report v4 + v6
     - name: ip-203-0-113-7   # the IPAddress object
       address: 203.0.113.7   # what the tenant reads, and puts in DNS
@@ -377,7 +380,14 @@ is not ours. The claim does not expose the difference.
 ### 4. The provisioner contract
 
 `IPAddressClass.spec.provisioner` names a controller, as `StorageClass` names a CSI driver.
-Each provisioner declares capabilities, and the core refuses what a backend cannot do:
+The contract as implemented is two things. The core stamps the provisioner name onto each
+claim as an annotation, and a driver selects its claims by it. The driver fills the
+`IPAddress` source union with `fromClass` or `providerRef`. Nothing declares capabilities;
+the core has no registry to consult, and a driver that cannot serve a claim leaves it
+`Pending` and reports why on the claim.
+
+The intended shape is a declaration per provisioner, with the driver refusing what it
+cannot do:
 
 | capability | meaning | consequence if absent |
 |---|---|---|
@@ -387,7 +397,8 @@ Each provisioner declares capabilities, and the core refuses what a backend cann
 
 `Pin` is the capability the model depends on. A backend that cannot be told which address
 to use cannot attach a reserved one, so a class over such a backend rejects claims instead
-of allocating an address it cannot bind. PureLB may be this case (*Open questions*).
+of allocating an address it cannot bind. No surveyed backend lacks it (§1.2). The
+declaration is deferred with the registration object it would live on (*Open questions*).
 
 Whether provisioners are in-tree (a switch in one controller) or out-of-tree (separate
 deployments with a CRD contract, as CSI did) is open. In-tree suffices for three
@@ -485,6 +496,12 @@ input (*Security* lists them): such a Service has chosen its address source. The
 placeholders carry the pool annotation, so this rule excludes them without the opt-out
 annotation and without knowledge of the driver's namespace. The auto-claim class is
 independent of the default class.
+
+An auto-claimed Service has no `loadBalancerClass`, and the core does not set one: the
+field is immutable and the Service already exists. The Service is therefore served by the
+implementation that handles unclassed Services, the cluster default (§1.5), and an
+auto-claim class must have an empty `loadBalancerClass`. The core ignores the auto-claim
+annotation on a class with a non-empty value and reports it with an event.
 
 Two rules follow:
 
@@ -785,7 +802,7 @@ Sequencing is open:
 2. Gateway as an association target (§5), with `Gateway.spec.addresses` fenced. The
    accepted external-database-exposure proposal puts a tenant's database traffic on the
    tenant Gateway's single address, so this is the consumer tenants meet first. Which
-   Cilium release honours `spec.addresses` is open question 4.
+   Cilium release honours `spec.addresses` is open question 3.
 3. The Cilium provisioner. A second provisioner tests the allocation seam; a second
    consumer has tested the association seam (*Implementation status*).
 4. A cloud provisioner (`source.providerRef`). Tests the source union.
@@ -795,17 +812,15 @@ Sequencing is open:
 1. **Provisioners: in-tree or out-of-tree?** In-tree suffices for three backends; CSI's
    history says it stops scaling. Where is the line, and is the CRD contract needed on day
    one?
-2. **PureLB.** Does it have any "request this exact IP" mechanism? If not, it cannot be a
-   backend.
-3. **Sharing one address across Services on disjoint ports.** GCP and Cilium permit it.
+2. **Sharing one address across Services on disjoint ports.** GCP and Cilium permit it.
    Today one consumer holds a claim at a time (§5). This is the mirror of the
    several-addresses-on-one-consumer case in *Non-goals*; both are the cardinality
    between a claim and its consumers.
-4. **Gateway.** `Gateway.spec.addresses` is the natural pin for a Gateway consumer, and
+3. **Gateway.** `Gateway.spec.addresses` is the natural pin for a Gateway consumer, and
    Cilium supports it with LB-IPAM. Whether the shipped Cilium release honours it, and
    whether the infrastructure-annotation path is needed as a fallback, is unverified.
    Which object a tenant annotates needs settling here.
-5. **The entitlement object's shape** (*Security*). One object per namespace or per class,
+4. **The entitlement object's shape** (*Security*). One object per namespace or per class,
    who may read it, and whether the reference admission policy consumes it as its
    `paramRef`.
 
