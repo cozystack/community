@@ -3,22 +3,19 @@
 - **Title:** `IP addresses as a first-class resource: IPAddress, IPAddressClaim, IPAddressClass, and a provisioner contract`
 - **Author(s):** `@lllamnyp`
 
-> **The shape is settled and implemented; the contract details are not.** The problem
-> statement, the primitives survey, and the object model are worked out, and phase 1 of
-> *Rollout* exists in code (see *Implementation status*, which also lists where the
-> document runs ahead of the code). Deliberately still open: the provisioner contract's
-> own API (capabilities are not modelled yet), the entitlement object of *Security*, the
-> sequencing beyond phase 1, and the open questions below.
+> The object model, the problem statement and the survey of existing primitives are
+> settled, and phase 1 of *Rollout* is implemented. *Implementation status* lists where
+> the text is ahead of the code. Open: the provisioner contract's own API (capabilities
+> are not modelled), the entitlement object of *Security*, sequencing after phase 1, and
+> *Open questions*.
 
 ## Overview
 
-A tenant cannot *own* an address. They can only cause one to appear as a side effect
-of creating a `Service type: LoadBalancer`, and it evaporates when that Service does.
-There is no object to hold, keep, quota, hand to another workload, or point DNS
-at with confidence.
+A tenant cannot own an address. An address appears when a tenant creates a `Service` of
+`type: LoadBalancer` and disappears when the Service is deleted. No object holds it,
+counts it, moves it to another workload, or is stable enough to put in DNS.
 
-This proposal makes the address a resource. Applying the `PersistentVolume` pattern
-to addresses:
+This proposal makes the address a resource, on the `PersistentVolume` pattern:
 
 | storage | addresses | role |
 |---|---|---|
@@ -27,180 +24,142 @@ to addresses:
 | `PersistentVolumeClaim` | **`IPAddressClaim`** (namespaced) | "give me one" — what a tenant creates |
 | CSI driver | **a provisioner contract** | how a class's backend allocates, adopts, and pins |
 
-The driving use case is the **public** address — the AWS Elastic IP experience:
-**allocate an address, keep it, attach it to something, detach it, attach it to
-something else, release it when done.** Not: "create a Service and hope you get the
-same IP back." But the resource is not public-specific. A class names a pool, and a
-platform can hand out more than one kind of pool — public ranges, a private internal
-LB range, a provider's static addresses. So the kinds are named for the general thing
-(`IPAddress`), and "public" is a property of the class's pool, not of the API.
+The driving use case is the public address, with the semantics of an AWS Elastic IP:
+allocate, keep, attach, detach, attach elsewhere, release. The resource is not
+public-specific. A class names a pool, and a platform can offer several pools: public
+ranges, a private LB range, a provider's static addresses. The kinds are therefore named
+`IPAddress`, and "public" is a property of a class's pool.
 
 ### Naming
 
-The kinds `IPAddress` and `IPAddressClaim` are deliberate echoes of an existing
-pattern, and the overlap is worth naming up front so reviewers are not surprised:
+`IPAddress` and `IPAddressClaim` share their short names with two existing kinds:
 
-- **Kubernetes core** ships an `IPAddress` kind in `networking.k8s.io` (KEP-1880). It
-  is *not* this: it is a low-level record where the object name **is** the IP, with a
-  generic `parentRef`, and its authors named "any generalization onto something like
-  an IPAM API" an explicit **non-goal** (see Context). Ours lives in a different API
-  group, carries a reclaim policy, a claim binding, and a class, and is the IPAM
-  object core declined to build.
-- **Cluster API** ships `IPAddressClaim`/`IPAddress` in `ipam.cluster.x-k8s.io` with a
-  documented third-party provider contract — the same claim-plus-concrete-address
-  shape, but only ever wired to **Machine** addressing, never Services, and with no
-  reclaim policy or association. We mint our own (*Alternatives considered*); the shared
-  names are an acknowledgement that the shape is not novel.
-- **`Service.spec.externalIPs`** is the older, unrelated mechanism — a Service claiming an
-  address by value with no allocator behind it, the field behind CVE-2020-8554 — and
-  `ExternalIP*` kinds, proposed in review, would invite confusion with it. One more reason
-  the kinds are not named that way.
+- **Kubernetes core** has `IPAddress` in `networking.k8s.io` (KEP-1880). It is a record
+  whose name is the IP, with a generic `parentRef`. KEP-1880 names "any generalization
+  onto something like an IPAM API" a non-goal. Our kind is in a different group and
+  carries a reclaim policy, a claim binding and a class.
+- **Cluster API** has `IPAddressClaim` and `IPAddress` in `ipam.cluster.x-k8s.io`, with a
+  provider contract. They serve Machine addressing only and have no reclaim policy and no
+  association. We define our own kinds (*Alternatives considered*).
 
-Kinds are qualified by API group, so the short-name overlap is not a collision. The
-kinds live in `local.sdn.cozystack.io` (see *Positioning*).
+`ExternalIP*`, proposed in review, was not chosen. `Service.spec.externalIPs` is an older,
+unrelated mechanism in which a Service claims an address by value with no allocator
+(CVE-2020-8554), and the kinds would be confused with it.
+
+Kinds are qualified by API group, so the shared short names do not collide. The group is
+`local.sdn.cozystack.io` (*Positioning*).
 
 ## Scope and related proposals
 
-- **Adjacent, not a dependency:** `design-proposals/structured-external-exposure`
-  (community #29) restructures how a managed application *requests* exposure. This
-  proposal is about what an address **is**. The two meet at one point — an exposure
-  entry should be able to name an `IPAddressClaim` instead of implicitly minting an
-  address — but neither needs the other to land first, and this proposal does not
-  assume #29's shape.
-- **Related:** `Service.spec.loadBalancerClass`, the upstream field selecting which LB
-  implementation serves a Service. An `IPAddressClass` names a provisioner and a pool,
-  which determines the implementation that will announce the address. An `IPAddressClass`
-  therefore **determines** the `loadBalancerClass` a consuming Service must carry (§5). (An
-  `ExposureClass` kind was proposed alongside community #29 and never shipped; there is no
-  `network.cozystack.io` group. That direction went to `loadBalancerClass` instead —
-  cozystack/cozystack#3164, cozystack/cozystack#3218.)
-- **Depended on by:** `design-proposals/endpoint-attachments` (community #45), which
-  attaches one endpoint of an application to an external address. It consumes an
-  `IPAddressClaim` and the association annotation of §5, and its `EndpointAttachment`
-  kind lives in **this same `local.sdn.cozystack.io` family** — the exposure half beside
-  the allocation half, another CRD-served resident relying on the `local.` prefix's
-  quota guarantee (*Positioning*). This proposal does not wait on it and lands
-  independently.
-- **Deferred to a sibling:** the *datapath* for whole-IP 1:1 NAT (all ports in, and
-  the workload egressing **as** that address) — today provided by
-  [cozy-proxy](https://github.com/cozystack/cozy-proxy)'s nftables rules. That is a
-  CNI concern, tracked separately. **This proposal is the allocation half; that is
-  the forwarding half.** They are independent: allocation is useful with a stock
-  LoadBalancer Service and no 1:1 NAT at all.
+- **Adjacent:** community #29 (`structured-external-exposure`) restructures how a managed
+  application requests exposure. This proposal defines what an address is. They meet at
+  one point: an exposure entry can name an `IPAddressClaim` instead of minting an address.
+  Neither depends on the other.
+- **Related:** `Service.spec.loadBalancerClass` selects the LB implementation for a
+  Service. An `IPAddressClass` names a provisioner and a pool, which determines the
+  implementation that announces the address, so the class determines the
+  `loadBalancerClass` a consuming Service must carry (§5). The `ExposureClass` kind
+  proposed with #29 never shipped, and `network.cozystack.io` does not exist;
+  cozystack/cozystack#3164 and cozystack/cozystack#3218 chose `loadBalancerClass`.
+- **Depended on by:** community #45 (`endpoint-attachments`), which attaches one endpoint
+  of an application to an address. It consumes an `IPAddressClaim` and the annotation of
+  §5, and its `EndpointAttachment` kind is in the same `local.sdn.cozystack.io` group
+  (*Positioning*). This proposal does not wait for it.
+- **Deferred to a sibling:** the datapath for whole-IP 1:1 NAT (all ports in, egress as
+  that address), provided today by [cozy-proxy](https://github.com/cozystack/cozy-proxy).
+  That is a CNI concern. This proposal is the allocation half; allocation works with a
+  stock LoadBalancer Service and no NAT.
 
 ## Decisions
 
-Implementation ran ahead of this document, and two of its findings changed the design
-rather than merely filling it in. Each is recorded where the reasoning can be found again:
+Two implementation findings changed the design:
 
-- [0002. The ledger does not adopt assignments; the core claims on behalf of Services that cannot](./decisions/0002-the-ledger-does-not-adopt-the-core-claims-on-behalf-of-services.md) — why §6's backwards inventory was dropped and the opt-in auto-claim took its place.
-- [0001. The backend allocates; the ledger records what it assigned](./decisions/0001-the-backend-allocates-and-the-ledger-records.md) — why the reference driver reserves through placeholder Services instead of carving addresses itself, and what that costs.
+- [0002. The ledger does not adopt assignments; the core claims on behalf of Services that cannot](./decisions/0002-the-ledger-does-not-adopt-the-core-claims-on-behalf-of-services.md) — the backwards inventory of §6 is dropped and auto-claim replaces it.
+- [0001. The backend allocates; the ledger records what it assigned](./decisions/0001-the-backend-allocates-and-the-ledger-records.md) — the reference driver reserves through placeholder Services instead of allocating itself.
 
 ## Positioning
 
-**This should stand on its own, and also ship as part of the Cozystack API surface —
-both, not either.** A controller that reserves an address, binds it to a workload
-through whatever pin mechanism the backend exposes, and gates that binding behind an
-admission policy is useful to any Kubernetes platform running MetalLB, Cilium LB-IPAM,
-or a cloud LB — not only Cozystack. So it is designed to be **valuable standalone**: the
-tenant contract is a plain namespaced CRD, the quota is a stock `ResourceQuota`, the
-enforcement is a `ValidatingAdmissionPolicy` — all vanilla Kubernetes, with no
-Cozystack-only machinery required to run it.
+The component is useful to any Kubernetes platform that runs MetalLB, Cilium LB-IPAM or a
+cloud LB, and it also ships as part of the Cozystack API. The tenant contract is a
+namespaced CRD, the quota is a `ResourceQuota`, the enforcement is a
+`ValidatingAdmissionPolicy`. Nothing requires Cozystack.
 
-Standalone value does **not** mean it lives outside the Cozystack API group. Cozystack
-already ships components that are fully standalone products yet live under
-`*.cozystack.io` — `etcd-operator.cozystack.io` is the precedent. This belongs there the
-same way, and the component is deliberately shaped so Cozystack integrates it cleanly (a
-default class, and an exposure path able to name a claim). Standalone-valuable and
-in-the-Cozystack-group are not in tension, and designing for easy Cozystack integration
-is a goal, not a compromise.
+Standalone does not mean outside the Cozystack API group. `etcd-operator.cozystack.io` is
+a standalone product under `*.cozystack.io`, and this follows it. The component is shaped
+for Cozystack integration: a default class, and an exposure path that can name a claim.
 
-It also belongs in the **networking** group rather than a new one of its own. Cozystack
-networking is `sdn.cozystack.io` today: `SecurityGroup` lives there, served by the
-Cozystack API as a tenant-facing interface over Cilium network policies. Cozyplane serves
-its own `SecurityGroup` in that same group, plus `local.sdn.cozystack.io` for the kinds it
-serves as CRDs. Addresses are the third networking feature to want a home, and the
-argument here is only that networking APIs should not accumulate several different group
-names: **one `sdn` family**, with the `local.` prefix marking CRD-served kinds and the
-bare group the aggregated ones. So the kinds live in **`local.sdn.cozystack.io`**.
-`ipam.cozystack.io` is not wrong on its own terms — it adds a fourth name to a subject
-area that should have one.
+The group is `local.sdn.cozystack.io`, in the networking family, because networking APIs
+should not accumulate group names. `SecurityGroup` is in `sdn.cozystack.io`, served by the
+aggregated Cozystack API. Cozyplane serves its own `SecurityGroup` in that group and its
+CRD-served kinds in `local.sdn.cozystack.io`. The `local.` prefix marks CRD-served kinds;
+the bare group marks aggregated ones. `ipam.cozystack.io` would be a fourth name for one
+subject.
 
-To be clear that this is a proposal and not an appeal to precedent:
-`local.sdn.cozystack.io` is new, nothing serves it today, and this would be among the
-first components to introduce it. Nor does the group
-string create a Cozystack dependency for a standalone user — the same three CRDs install
-under any name.
+The prefix also carries a guarantee. CRD-served kinds pass through the kube-apiserver's
+ResourceQuota admission, so `count/` quotas work on them. Kinds served by the aggregated
+API do not.
 
-The obvious objection is that `ipam.` describes the object better than `sdn.` does: an
-address ledger is not a datapath concern, and its consumers include Gateways and cloud
-providers that are not SDN either. That is a fair reading, and the reason it does not win
-here is that this is **not all of IPAM and cannot become it** — allocation stays with the
-allocator, since AWS and MetalLB both keep it — so an `ipam.cozystack.io` group would
-promise a generality the component deliberately does not have. If upstream moves and that
-generality becomes real, it is a v2 question. Until then the kinds sit with the rest of
-networking.
+`local.sdn.cozystack.io` is new; nothing serves it today. The group string creates no
+Cozystack dependency: the three CRDs install under any name.
 
-The kinds are minted rather than adopted from Cluster API's IPAM; *Alternatives
-considered* says why.
+The objection is that `ipam.` describes an address ledger better than `sdn.`: the ledger
+is not a datapath, and its consumers include Gateways and cloud providers. The answer is
+that this component is not all of IPAM and cannot become it. Allocation stays with the
+allocator (AWS, MetalLB), so an `ipam.` group would promise more generality than the
+component has. If that changes, the group is a v2 question.
+
+The kinds are defined here, not adopted from Cluster API's IPAM (*Alternatives
+considered*).
 
 ## Implementation status
 
-Phase 1 of *Rollout* exists, under the Cozystack organisation:
+Phase 1 of *Rollout* exists under the Cozystack organisation:
 
-- **[address-controller](https://github.com/cozystack/address-controller)** — the
-  class-agnostic core: the three kinds, claim–address binding, status, reclaim, and the
-  contract per-class drivers plug into. It touches a Service only on the opt-in
-  auto-claim path of §6 (cozystack/address-controller#7).
-- **[metallb-iad](https://github.com/cozystack/metallb-iad)** — the reference per-class
-  driver, for addresses announced by MetalLB. A reservation is held as a placeholder
-  Service in a driver-owned namespace, so MetalLB's own accounting refuses to
-  double-assign a held address. cozystack/metallb-iad#6 ships the admission policy of
-  *Security* as an opt-in chart template; cozystack/metallb-iad#5 opts the placeholders
-  out of auto-claim.
-- **cozystack/cozystack#3382** packages both as optional system packages, with tenant
-  RBAC on claims and a distribution-specific admission policy. Which policy a deployment
-  runs is its own business: the driver's generic one is the reference, and a distribution
-  that needs a different shape disables it and ships its own.
+- **[address-controller](https://github.com/cozystack/address-controller)**: the core.
+  The three kinds, claim–address binding, status, reclaim, and the driver contract. It
+  writes to a Service only on the auto-claim path of §6
+  (cozystack/address-controller#7).
+- **[metallb-iad](https://github.com/cozystack/metallb-iad)**: the reference driver for
+  MetalLB. It holds a reservation as a placeholder Service in its own namespace, so
+  MetalLB's accounting refuses to assign a held address elsewhere.
+  cozystack/metallb-iad#6 ships the admission policy of *Security* as an opt-in chart
+  template; cozystack/metallb-iad#5 opts the placeholders out of auto-claim.
+- **cozystack/cozystack#3382** packages both as optional system packages, with tenant RBAC
+  on claims and a distribution-specific admission policy. The driver's policy is the
+  reference; a distribution may disable it and ship its own.
 
-One backend proves little on its own, so the load-bearing evidence is a **second
-consumer**. [Cozyplane](https://github.com/lllamnyp/cozyplane) wears reserved addresses
-through this contract with **no module import, no CRD dependency, and no informer on the
-claim kinds**: it copies a claim name into the association annotation (§5) on a Service it
-already owns, and the driver does the rest. With the mechanism absent entirely it behaves
-identically, auto-assigning instead — reserved and dynamic are one code path. Validated
-end to end on a three-node cluster running address-controller + metallb-iad + MetalLB +
-cozyplane: an address survived delete-and-rebind and stayed externally reachable
-throughout.
+A second consumer tests the association contract.
+[Cozyplane](https://github.com/lllamnyp/cozyplane) copies a claim name into the §5
+annotation on a Service it owns, with no module import, no CRD dependency and no informer
+on the claim kinds. Without the mechanism it auto-assigns; reserved and dynamic are one
+code path. On a three-node cluster with address-controller, metallb-iad, MetalLB and
+cozyplane, an address survived delete-and-rebind and stayed reachable.
 
-Note precisely which seam that tests. *Rollout* names a second **provisioner** as the
-*allocation* seam, and it remains outstanding. What is demonstrated is the *association*
-seam: that a backend with an entirely different datapath can wear a reserved address while
-knowing nothing about the ledger beyond one annotation. The coupling turned out looser
-than this document assumed it would need to be.
+This tests the association seam only. The allocation seam, a second provisioner, is
+untested (*Rollout*).
 
-**Where the document runs ahead of the code.** This is a design proposal; the following
-are specified here and not yet implemented, so that nobody mistakes the text for a
-description of the binaries: the class-determined `loadBalancerClass` check of §5; a
-driver pinning only the address families its Service carries (§2); conditions on
-`IPAddress` (§2) and the `Associated` condition on a claim (§5); per-class scoping of
-conflict adjudication (§8); the held-before-minted rule of §6; the release delay and the
-class-deletion guard of *Failure and edge cases*; Gateway as an association target (§5);
-the entitlement object of *Security*. Where the code carries detail the text does not —
-`claimRef.uid`, a sticky `status.className` on the claim, claim conditions and a `Lost`
-claim phase, a `Pending` address phase, the provisioner stamp annotation, the finalizers —
-the implementation's own design document is the reference; none of it changes the model.
+**Specified here and not yet implemented:** the `loadBalancerClass` check of §5; pinning
+only the families a Service carries (§2); conditions on `IPAddress` (§2) and the
+`Associated` condition on a claim (§5); per-class conflict adjudication (§8); the
+held-before-minted rule of §6; the release delay and the class-deletion guard (*Failure
+and edge cases*); Gateway as an association target (§5); the entitlement object
+(*Security*).
+
+**In the code and not in this text:** `claimRef.uid`, `status.className` on the claim,
+claim conditions, a `Lost` claim phase, a `Pending` address phase, the provisioner stamp
+annotation, the finalizers. The implementation's design document is the reference for
+these. None changes the model.
 
 ## Context
 
 ### What exists today
 
-Cozystack installs MetalLB but renders no `IPAddressPool`/`L2Advertisement` itself;
-the admin configures an allocator to suit the environment (MetalLB L2/BGP, Cilium
-LB-IPAM, a cloud LB, or `Service.spec.externalIPs` pinning).
+Cozystack installs MetalLB and renders no `IPAddressPool` or `L2Advertisement`. The admin
+configures an allocator: MetalLB L2 or BGP, Cilium LB-IPAM, a cloud LB, or
+`Service.spec.externalIPs`.
 
-Across every one of those, the model is the same: **an address is allocated to a
-Service, at the moment the Service is created, and freed when it is deleted.**
+In every one of them an address is allocated to a Service when the Service is created and
+freed when it is deleted.
 
 ### The problem
 
@@ -212,89 +171,76 @@ Service, at the moment the Service is created, and freed when it is deleted.**
 > *"I want to reserve four addresses now, because the range is nearly full, and attach
 > them over the next month."*
 
-None of these are expressible. The address has no independent existence, so:
+None of these is expressible, because the address has no existence apart from the
+Service:
 
-- **It cannot be held.** Delete the Service, lose the address. Someone else may get it.
-- **It cannot be moved.** There is no detach/attach; there is only "hope the allocator
-  hands you the same one."
-- **It cannot be quota'd.** There is no object to count, so nothing bounds how many
-  addresses a tenant consumes. The only lever is pre-carving a pool per tenant.
-- **It cannot be gated.** Anyone who can create a `Service` in a namespace can cause an
-  address to be allocated. RBAC authorizes *verbs on resources*, not *fields*.
-- **It cannot be shown.** No inventory. "Which addresses do we own, and who has them?"
-  has no answer short of listing every Service in the cluster.
+- **It cannot be held.** Deleting the Service frees the address, and another tenant may
+  receive it.
+- **It cannot be moved.** There is no detach and attach.
+- **It cannot be counted.** There is no object to quota. The only lever is a pool per
+  tenant.
+- **It cannot be gated.** Anyone who can create a Service can allocate an address. RBAC
+  authorizes verbs on resources, not fields.
+- **It cannot be listed.** "Which addresses do we own, and who holds them?" requires
+  listing every Service in the cluster.
 
-This is a **new capability**, argued on its own merits: hold, move, quota, enumerate.
-Cozystack has no prior reserve-then-associate mechanism to preserve — the platform uses
-kube-ovn only for subnets and VPCs, not for its EIP objects — so there is nothing here
-being restored, only something being added.
+This is a new capability: hold, move, quota, enumerate. Cozystack has no
+reserve-then-associate mechanism to preserve; it uses kube-ovn for subnets and VPCs, not
+for its EIP objects.
 
 ## Goals
 
-- A tenant can request an address and receive one — or, in a brokered deployment, have
-  one requested on their behalf and attach it — without an admin pre-creating a pool
-  object for them.
-- An address **survives** the deletion of the workload it was attached to (reclaim
-  policy `Retain`), and can be attached to a different workload afterwards.
-- An operator can enumerate every address the cluster owns, and see who holds it.
-- The number of addresses a tenant may hold is bounded by a **plain `ResourceQuota`**
-  (`count/ipaddressclaims.<group>`), with no new quota machinery.
-- An admin configures the address source **once per class**, not once per tenant and
-  not once per address. No pool-per-tenant, no `/32` pools.
-- The tenant-facing API does not name the backend. A tenant asks for an address; it
-  does not learn whether MetalLB, Cilium, or a cloud API produced it.
-- The design admits at least: MetalLB, Cilium LB-IPAM, and a cloud provider whose
-  addresses are allocated outside the cluster.
-- A reserved address is never *silently* lost to a plain `Service type: LoadBalancer`:
-  reservations are reconciled against live Service assignments, so a collision is a
-  detected, surfaced state rather than a quiet theft (see *Design §8* and *Security*).
+- A tenant can request an address and receive one, or in a brokered deployment have one
+  requested on their behalf and attach it, without an admin pre-creating a pool.
+- An address survives the deletion of the workload it was attached to (reclaim policy
+  `Retain`) and can be attached to another workload.
+- An operator can list every address the cluster owns and who holds it.
+- A `ResourceQuota` on `count/ipaddressclaims.<group>` bounds how many addresses a tenant
+  holds. No new quota machinery.
+- An admin configures an address source once per class. No pool per tenant, no `/32`
+  pools.
+- The tenant API does not name the backend.
+- The design admits MetalLB, Cilium LB-IPAM, and a cloud provider that allocates outside
+  the cluster.
+- A reserved address is never silently lost to a plain LoadBalancer Service. A collision
+  is detected and reported (§8, *Security*).
 
 ### Non-goals
 
-- **Announcing addresses.** Attraction (ARP/NDP, BGP, a cloud VNIC assignment) stays
-  with the LB implementation. This proposal allocates and binds; it never puts a
-  packet on a wire.
+- **Announcing addresses.** ARP/NDP, BGP and cloud VNIC assignment stay with the LB
+  implementation.
 - **The 1:1 NAT datapath.** See *Scope*.
-- **Several owned addresses on one consumer.** One rule is settled and enforced: a claim
-  is consumed by **one consumer at a time**, so two consumers cannot quietly share a
-  reservation. The converse is *not* settled, and this proposal does not pretend it is —
-  how many claims one consumer may hold is open. No limit on a *workload* is claimed:
-  nothing stops an application owning several Services, each with its own claim, and a
-  managed service reachable on a public address and an internal routable one at once is
-  exactly that — two Services, two claims, no new concept. But a single consumer wearing
-  several addresses is a real case rather than a hypothetical one, and Gateway API states
-  it outright: `Gateway.spec.addresses` is a **list**, so one Gateway legitimately wears
-  several addresses, and nothing in the model below says how several claims attach to one
-  consumer or how a provisioner renders that. **Acknowledged and deferred to future
-  work.** Two neighbouring cases stay out with it: *N* owned addresses on a workload whose
-  extra addresses live on a **tunnel interface the platform neither owns nor sees** (a VM
-  acting as a router or VPN concentrator), which is orthogonal to reservation; and the
-  platform-owned variant of it, which would need an internal address and in-guest
-  configuration per address. Dual-stack (one v4 + one v6) is a separate, narrower
-  question, treated below rather than folded into this.
-- **Replacing the LB implementation.** MetalLB/Cilium/cloud stay exactly where they
-  are; this sits above them.
-- **IPv4-only thinking.** The model is family-agnostic; a claim may request v4, v6, or
-  both; a `Dual` claim binds one `IPAddress` per family (§2).
-- **Solving field-level authorization in general.** It is *used* here (see *Security*)
-  but the general problem is bigger than this proposal.
+- **Several addresses on one consumer.** One rule is settled and enforced: a claim is
+  consumed by one consumer at a time. The converse is open: how many claims one consumer
+  may hold. A workload may own several Services, each with its own claim; a managed
+  service with a public address and an internal one is two Services with two claims. A
+  single consumer with several addresses is a real case: `Gateway.spec.addresses` is a
+  list. How several claims attach to one consumer, and how a provisioner renders that, is
+  deferred. Two related cases are deferred with it: extra addresses on a tunnel interface
+  the platform does not see (a VM acting as a router), which is unrelated to reservation;
+  and the platform-owned variant, which needs an internal address and in-guest
+  configuration per address.
+- **Replacing the LB implementation.** MetalLB, Cilium and cloud LBs stay; this sits above
+  them.
+- **IPv4-only thinking.** A claim may request IPv4, IPv6 or both; a `Dual` claim binds one
+  `IPAddress` per family (§2).
+- **Field-level authorization in general.** It is used in *Security*; the general problem
+  is out of scope.
 
 ## Design
 
 ### 1. The primitives that already exist (survey)
 
-Load-bearing findings, because the design is shaped by them:
+Five findings shape the design:
 
-1. **Nothing has a standing reservation.** Not MetalLB, not Cilium LB-IPAM, not
-   kube-vip, not PureLB, not OpenELB — and not Kubernetes core. KEP-1880 shipped
-   cluster-scoped `ServiceCIDR`/`IPAddress` kinds (the name *is* the IP, with a
-   generic `spec.parentRef`), and then explicitly named *"any generalization onto
-   something like an IPAM API"* a **non-goal**. Nothing upstream is coming to provide
-   this. It is ours to build.
+1. **Nothing has a standing reservation.** Not MetalLB, Cilium LB-IPAM, kube-vip, PureLB,
+   OpenELB, or Kubernetes core. KEP-1880 shipped `ServiceCIDR` and `IPAddress` (the name
+   is the IP, with a generic `spec.parentRef`) and named "any generalization onto
+   something like an IPAM API" a non-goal. Nothing upstream will provide this.
 
-2. **Every backend has a "pin this exact address" hook, and it is always an
-   annotation** — because `Service.spec.loadBalancerIP` was deprecated in Kubernetes
-   1.24 with *no core replacement*, so every implementation invented its own:
+2. **Every backend pins a specific address through an annotation.**
+   `Service.spec.loadBalancerIP` was deprecated in Kubernetes 1.24 with no replacement, so
+   each implementation defined its own:
 
    | backend | pin mechanism |
    |---|---|
@@ -306,25 +252,21 @@ Load-bearing findings, because the design is shaped by them:
    | GCP / GKE | `networking.gke.io/load-balancer-ip-addresses` |
    | PureLB | **none found** — see *Open questions* |
 
-   Different spelling, identical semantics. **This is the seam the whole design rests
-   on:** if we can pin, we can bind a reserved address to a workload.
+   The semantics are identical. This is the seam the design rests on: a backend that can
+   pin can bind a reserved address to a workload.
 
-3. **A reserved-but-unattached address is inert, everywhere.** MetalLB never announces
-   an address that is not the live `status.loadBalancer.ingress` of a Service it
-   allocated. Cilium LB-IPAM only *assigns*; something else announces. A cloud EIP
-   routes nowhere until associated. This is not an obstacle — **it is correct
-   semantics**, and it is exactly why AWS bills for an idle EIP.
+3. **A reserved, unattached address is inert everywhere.** MetalLB announces only the live
+   `status.loadBalancer.ingress` of a Service it allocated. Cilium LB-IPAM assigns;
+   something else announces. A cloud EIP routes nowhere until associated. These are the
+   correct semantics; AWS bills for an idle EIP for this reason.
 
-4. **One pool can serve many tenants.** MetalLB's
-   `IPAddressPool.spec.serviceAllocation.{namespaces,namespaceSelectors,serviceSelectors}`
-   and Cilium's `CiliumLoadBalancerIPPool.spec.serviceSelector` both scope a *single*
-   pool by namespace or label. And `L2Advertisement`/`BGPAdvertisement` select
-   **pools**, not addresses — so one advertisement covers arbitrarily many addresses.
-   **The pool-per-tenant and `/32`-pool patterns were never necessary.**
+4. **One pool can serve many tenants.** MetalLB's `IPAddressPool.spec.serviceAllocation`
+   and Cilium's `CiliumLoadBalancerIPPool.spec.serviceSelector` scope a single pool by
+   namespace or label. `L2Advertisement` and `BGPAdvertisement` select pools, not
+   addresses. Pool-per-tenant and `/32` pools were never necessary.
 
-5. **`Service.spec.loadBalancerClass`** (GA in 1.24) is the standard way for multiple
-   LB implementations to coexist; MetalLB honours it via `--lb-class`. It is how a
-   cluster can run more than one backend without them fighting.
+5. **`Service.spec.loadBalancerClass`** (GA in 1.24) lets several LB implementations
+   coexist; MetalLB honours it via `--lb-class`.
 
 ### 2. The object model
 
@@ -387,71 +329,53 @@ status:
     name: web-lb
 ```
 
-**`spec.addressName` — asking for a *specific* address.** The
-`PersistentVolumeClaim.spec.volumeName` analogue: a claim may name one `IPAddress` rather
-than take whatever its class yields. It is meaningful only for a single-family claim, and
-the controller honours it only if every ordinary condition already holds — the address is
-`Available`, carries no `claimRef`, is not being deleted, and its class and family match
-the ones the claim resolved. A name that matches nothing eligible is not an error: the
-claim stays `Pending` and keeps waiting, exactly as it would with no `addressName` at all.
-The field therefore **narrows a candidate set and never widens one**. It cannot pull an
-address out of another class, take one away from another claim, or reclaim a `Released`
-address before an admin has cleared its `claimRef`.
+**`spec.addressName`** is the analogue of `PersistentVolumeClaim.spec.volumeName`: a
+claim names one `IPAddress` instead of taking any address of its class. It applies to
+single-family claims. The controller binds the named address only if it is `Available`,
+has no `claimRef`, is not being deleted, and matches the claim's class and family.
+Otherwise the claim stays `Pending`, as it would without the field. The field narrows the
+candidate set. It cannot take an address from another class, from another claim, or from
+`Released` state before an admin clears the `claimRef`.
 
-What it deliberately does *not* do is authorize. `IPAddress` is cluster-scoped, so a claim
-naming one names an object outside its own namespace. Neither this field nor
-`spec.className` — equally free-text, and equally unable to be gated by namespace RBAC —
-decides which classes a namespace may draw from. That gap is identical with or without
-`addressName`, and closing it belongs above this controller; see *Security*.
+The field does not authorize. `IPAddress` is cluster-scoped, so the claim names an object
+outside its namespace, and RBAC cannot gate the name. `spec.className` has the same
+property. Kubernetes treats `volumeName` the same way: any claim may name any `Available`
+volume of its class, and an admin who wants a volume to go to one tenant pre-binds it by
+setting its `claimRef`. Pre-provisioned addresses are pre-bound the same way. Gating the
+field is covered in *Security*.
 
-This is precisely how Kubernetes treats `volumeName`: any claim may name any `Available`
-volume of its class, nothing authorizes the name, and the admin's lever for a volume meant
-for one tenant is to **pre-bind** it by setting its `claimRef` first. Pre-provisioned
-addresses work the same way — an admin who wants an address to go to one namespace binds
-it before anyone can name it. Where a deployment wants the field gated rather than merely
-narrowed, *Security* says how.
+`IPAddressClaim.status.addresses` is a list because a `Dual` claim binds one `IPAddress`
+per family and reports both. A single-family claim has one entry. `Dual` is one claim
+binding two objects because a dual-stack Service names one claim in §5. The driver pins
+only the families the Service carries (*Failure and edge cases*).
 
-`IPAddressClaim.status.addresses` is a **list** deliberately: a `Dual` claim binds a
-v4 and a v6 `IPAddress` and must report both, and a scalar `address` field could not.
-For a single-family claim the list has one entry. `Dual` is one claim binding two objects
-— the implementation settled it that way, and the reason is the association contract: a
-dual-stack Service names *one* claim in §5, so one claim must be able to yield both
-families. The driver pins only the families the Service carries (*Failure and edge cases*).
+`IPAddress.status.conditions` record when, not only who. `Bound` and `Associated` are
+`metav1.Condition`s; their `lastTransitionTime` records which claim held the address and
+which consumer wore it. An operator answering "which tenant had this address at this hour"
+reads the ledger, not Service events, which expire. `Conflict` is reported as a condition
+beside the phase, so the offending consumer is recorded durably.
 
-`IPAddress.status.conditions` exist so the ledger answers *when* as well as *who*. `Bound`
-and `Associated` follow `metav1.Condition` semantics, and their `lastTransitionTime` is the
-record of which claim held an address, and which consumer wore it, over time. An operator
-reconstructing that after the fact — an abuse report naming an address and an hour — reads
-it from the ledger, not from Service events, which expire. `Conflict` is reported the same
-way, as a condition beside the phase, so that the offending consumer is named somewhere
-durable.
+### 3. The address-source union
 
-### 3. The address-source union — the reason this is not a MetalLB adapter
+Two kinds of backend exist, and the model admits both:
 
-There are two structurally different worlds, and the model must admit both:
+- **Self-allocating backends** (MetalLB, Cilium, kube-vip, OpenELB) hold no reservation.
+  The ledger is the record of reservation, and the address is carved from the class range
+  (`source.fromClass`). Which component picks the address is the driver's choice. The
+  reference driver asks MetalLB for an address through the holder of §6 and records what
+  MetalLB assigned, so the backend and the ledger cannot disagree (decision 0001).
+- **Provider-reservation backends** (AWS, GCP, Hetzner) already hold the reservation as an
+  object with a stable handle (`eipalloc-…`, a named static address), under the provider's
+  IAM. The provisioner adopts it (`source.providerRef`) and does not allocate.
 
-- **Self-allocating backends** (MetalLB, Cilium, kube-vip, OpenELB): *nothing anywhere*
-  holds a reservation. **The ledger is the record of reservation**, and the address is
-  carved from the class's range (`source.fromClass`). Which component picks the address
-  is the driver's business, and the reference driver deliberately lets the backend do it:
-  it asks MetalLB for an address through the holder of §6 and records what MetalLB
-  assigned, so the backend's allocator and the ledger can never disagree about who holds
-  what. A driver-side allocator was tried first and replaced for exactly that reason.
-- **Provider-reservation backends** (AWS, GCP, Hetzner): the reservation is already a
-  real object with a stable handle (`eipalloc-…`, a named static address), guarded by
-  the provider's own IAM. **Our provisioner must adopt, not allocate**
-  (`source.providerRef`).
+This is the `PersistentVolume` volume-source union (`spec.csi`, `spec.nfs`, …). It is the
+evidence that the shape is not specific to MetalLB: it survives a backend where allocation
+is not ours. The claim does not expose the difference.
 
-This is precisely the `PersistentVolume` volume-source union (`spec.csi` /
-`spec.nfs` / …), and it is the strongest evidence the shape is not bent around any one
-backend: it survives a backend where allocation is not ours at all. The tenant's
-`IPAddressClaim` never learns the difference.
+### 4. The provisioner contract
 
-### 4. The provisioner contract (the "CSI analogue")
-
-`IPAddressClass.spec.provisioner` names a controller, exactly as `StorageClass` names a
-CSI driver. Each provisioner declares **capabilities**, and the core controller refuses
-what a backend cannot do rather than half-supporting it:
+`IPAddressClass.spec.provisioner` names a controller, as `StorageClass` names a CSI driver.
+Each provisioner declares capabilities, and the core refuses what a backend cannot do:
 
 | capability | meaning | consequence if absent |
 |---|---|---|
@@ -459,22 +383,18 @@ what a backend cannot do rather than half-supporting it:
 | `Adopt` | can wrap a provider-side reservation | `providerRef` claims rejected |
 | **`Pin`** | **can bind a specific address to a Service** | **the class cannot serve claims at all** |
 
-`Pin` is not optional decoration — **it is the capability the entire model depends on.**
-A backend that cannot be told *which* address to use can never attach a reserved one,
-and a class over such a backend must reject `IPAddressClaim`s outright instead of
-allocating an address it can never bind. (PureLB may be exactly this case; see *Open
-questions*.)
+`Pin` is the capability the model depends on. A backend that cannot be told which address
+to use cannot attach a reserved one, so a class over such a backend rejects claims instead
+of allocating an address it cannot bind. PureLB may be this case (*Open questions*).
 
 Whether provisioners are in-tree (a switch in one controller) or out-of-tree (separate
-deployments, a real CRD contract, as CSI did) is an **open question**. In-tree is
-right for three backends; the CSI lesson is that it stops being right at about five.
+deployments with a CRD contract, as CSI did) is open. In-tree suffices for three
+backends; CSI's history says it stops at about five.
 
 ### 5. Association
 
-Association is a **separate, reversible act** — that is the entire point, and the thing
-the current model cannot express.
-
-A workload references the **claim**, never the raw address:
+Association is a separate, reversible act. A workload references the claim, never the
+address:
 
 ```yaml
 kind: Service
@@ -484,524 +404,406 @@ metadata:
 spec: {type: LoadBalancer, ...}
 ```
 
-The controller resolves the claim → address, verifies the claim is in the Service's own
-namespace, and writes the backend's pin annotation (§1.2). MetalLB/Cilium/the cloud then
-allocates and announces exactly that address.
+The driver resolves the claim to its address, checks that the claim is in the Service's
+namespace, and writes the backend's pin annotation (§1.2). The backend then allocates and
+announces that address.
 
-**The class determines the `loadBalancerClass`.** An `IPAddressClass` names the pool and
-the provisioner that carves it, which determines the LB implementation that will announce
-anything drawn from it, so a class unambiguously implies one `loadBalancerClass` value —
-empty meaning the cluster's default implementation (§1.5) — and a consuming Service must
-carry that value. This is not a preference: a Service whose `loadBalancerClass` selects one
-implementation while its claim's address is held by another is asking two backends for one
-address, and both will be wrong about who owns it. The provisioner's own holder Services
-(§6) carry the same value for the same reason. The simplest way to express the mapping is
-an explicit `spec.loadBalancerClass` on the class, as in §2; a driver that can derive it
-from its own parameters may do that instead. What is required is the check, and it is
-**specified here and not yet implemented** (*Implementation status*).
+**The class determines the `loadBalancerClass`.** A class names a pool and a provisioner,
+which determines the LB implementation that announces its addresses, so a class implies
+one `loadBalancerClass` value (empty means the cluster default, §1.5). A consuming Service
+must carry that value. A Service whose `loadBalancerClass` selects one implementation
+while its claim's address is held by another asks two backends for one address. The
+provisioner's holder Services (§6) carry the same value. The simplest expression is
+`spec.loadBalancerClass` on the class, as in §2; a driver may derive it from its
+parameters instead. The check is specified and not implemented (*Implementation status*).
 
-The check can only ever be a **refusal**, never a repair: `loadBalancerClass` is immutable
-on an existing Service, so a mismatch surfaces as a refused association naming both
-values, and whoever creates the Service — a chart, a controller minting one on a tenant's
-behalf, or a user — is responsible for setting it at creation. A controller that creates
-the Service *and* names the claim has no excuse for getting it wrong, since it can read
-the class first.
+The check refuses and never repairs: `loadBalancerClass` is immutable on an existing
+Service. A mismatch is a refused association naming both values. Whoever creates the
+Service sets the field at creation; a controller that creates the Service and names the
+claim reads the class first.
 
-Remove the annotation and the driver withdraws the pin it wrote, clears `associatedTo`,
-and holds the address again; the `IPAddress` stays `Bound` to its claim and becomes inert —
-**a reserved address, held, attached to nothing.** Which is what an unassociated EIP is.
-One honest caveat: the backend does not necessarily follow. MetalLB keeps an assignment
-until the Service changes or goes away, so a Service that drops the annotation but lives
-on keeps announcing the address, and the ledger reports it as a `Conflict` naming that
-Service until it is deleted or re-addressed. Detaching an address from a *live* Service
-therefore means recreating that Service, which is the natural shape of a cutover anyway;
-the common path — the workload is deleted, the address is kept — has no such wrinkle.
+**Detaching.** When the annotation is removed, the driver withdraws its pin, clears
+`associatedTo`, and holds the address again. The `IPAddress` stays `Bound` to its claim:
+reserved and attached to nothing, like an unassociated EIP. MetalLB keeps an assignment
+until the Service is deleted or re-addressed, so a running Service that drops the
+annotation keeps announcing the address, and the ledger marks the address `Conflict`
+naming that Service until it is gone (decision 0001). To detach an address from a running
+Service, delete or recreate the Service.
 
-**The annotated object is not always a Service.** Some consumers *own* the Service they
-are announced on rather than being one: under Gateway API the implementation renders the
-data-plane Service from the `Gateway`, so there is no user-authored Service to annotate,
-and the object the user does write has no way to name an address. The contract is therefore
-an **annotated object that resolves to an address consumer** — `Service` is the first
-member and `Gateway` the obvious second. Which object a given backend annotates, and where
-it lands the pin (`Gateway.spec.addresses`, infrastructure annotations propagated onto the
-generated Service, or the generated Service itself), is the provisioner's business (§4).
-The consequence that is *not* the provisioner's business is in *Security*:
-`Gateway.spec.addresses` names an address **by value**, so it is the same escalation
-surface as a backend pin annotation and the admission policy has to cover it.
+**The annotated object is not always a Service.** Under Gateway API the implementation
+renders the data-plane Service from the `Gateway`, so there is no user-authored Service to
+annotate. The contract is therefore an annotated object that resolves to an address
+consumer. `Service` is the first member; `Gateway` is the second. Which object a backend
+annotates, and where it lands the pin (`Gateway.spec.addresses`, infrastructure
+annotations propagated to the generated Service, or the generated Service), is the
+provisioner's choice (§4). `Gateway.spec.addresses` names an address by value, so the
+admission policy must cover it (*Security*).
 
-This is the claim-first path: the address exists before the Service names it. §6 covers
-the opposite order — when an eager allocator hands a Service an address before any claim
-exists.
+This is the claim-first path. §6 covers the allocator-first path.
 
 ### 6. When the allocator gets there first
 
-An eager allocator does not wait to be asked. MetalLB assigns an address the moment it
-sees a `Service type: LoadBalancer`, before any `IPAddressClaim` exists and whether or not
-one ever will. Two things follow.
+MetalLB assigns an address to a `Service` of `type: LoadBalancer` as soon as it sees it,
+before any claim exists.
 
-**A reservation is held in the allocator's own books, not merely recorded in ours.** For
-every address that is reserved but not currently attached, the provisioner keeps a
-**holder**: for MetalLB, a selectorless `type: LoadBalancer` Service in a provisioner-owned
-namespace, which MetalLB assigns the address to and, having no endpoints, never announces —
-held in the backend's accounting, silent on the wire. Neither MetalLB nor Cilium will give
-one address to a second Service without an explicit sharing key, so for as long as the
-holder exists the reservation is enforced by the allocator itself rather than by our
-detection. This is the primary guarantee, and it is what makes a reserved-but-unattached
-address safe to leave lying around.
+**A reservation is held in the allocator's own accounting.** For every reserved,
+unattached address the provisioner keeps a holder. For MetalLB the holder is a
+selectorless `type: LoadBalancer` Service in a provisioner-owned namespace. MetalLB assigns
+the address to it and, since it has no endpoints, never announces it. MetalLB and Cilium do
+not give one address to a second Service without a sharing key, so the allocator itself
+enforces the reservation while the holder exists. This is the primary guarantee (decision
+0001).
 
-**Nothing adopts what it did not reserve.** An earlier draft had the controller observe
-`status.loadBalancer` on every Service and reconcile foreign assignments into the ledger
-after the fact. That is dropped (*Alternatives considered*): with a class's pool at
-`autoAssign: false` (§7), a plain Service cannot draw a class address except by naming the
-pool or pinning the address, and that is a conflict to detect (§8), not an allocation to
-adopt. Addresses from pools no class manages are not in the ledger and are of no interest
-to it. The inventory therefore answers "what has been reserved, and who holds it", not
-"every address in the cluster" — which is the question an operator actually asks.
+**The ledger records only addresses reserved through it.** The controller does not create
+`IPAddress` objects for addresses it finds on Services. An address a plain Service holds
+from a class pool is a conflict (§8), not an inventory entry. Decision 0002 covers the
+earlier design.
 
-**Auto-claim: the ledger reaching a Service that has never heard of it.** The opposite
-need is real: a Service that *should* draw from a class but names no claim, because
-whoever rendered it knows nothing about claims. The concrete case is a
-cloud-controller-manager for tenant Kubernetes clusters, which creates a `type:
-LoadBalancer` Service on the host for every LoadBalancer Service in the guest, copying the
-guest's annotations once at creation and nothing afterwards. Under `autoAssign: false`
-such a Service sits `Pending` forever, and asking every guest to name a claim is not an
-answer. So the core offers an **opt-in** path, enabled per class by an annotation on the
-`IPAddressClass` and off everywhere otherwise: for a LoadBalancer Service with no claim
-annotation, no `loadBalancerClass`, no pin and no assigned address, the core mints an
-`IPAddressClaim` of the same name in the same namespace, **owned by the Service**, and
-writes the §5 annotation onto the Service; the driver then associates exactly as if a
-tenant had written it. A Service may name a class explicitly, or opt out, through
-annotations the core defines — which is what a guest cluster's annotations, copied by the
-deputy, reach for. A class marked for auto-claim is independent of the default class: the
-two decisions have different owners.
+**Auto-claim.** Some Services should draw from a class but cannot name a claim, because
+the component that renders them does not know about claims. The case that forced this is
+a cloud-controller-manager for tenant Kubernetes clusters: it creates a host-side
+`type: LoadBalancer` Service for each LoadBalancer Service in the guest and copies the
+guest's annotations once, at creation. Under `autoAssign: false` these Services stay
+`Pending`. The core therefore has an opt-in path, enabled per class by an annotation on
+the `IPAddressClass`: for a LoadBalancer Service with no claim annotation, no
+`loadBalancerClass`, no pin and no assigned address, the core creates an `IPAddressClaim`
+with the Service's name in the Service's namespace, owned by the Service, and writes the
+§5 annotation on the Service. The driver associates as usual. A Service can name a class
+or opt out through annotations the core defines; a deputy may copy these from a guest
+Service. The auto-claim class is independent of the default class.
 
-Two rules follow from "owned by the Service". **A claim with a controller owner follows
-its owner, not the class's reclaim policy**: when the Service goes, its claim goes, and
-the claim's addresses are deleted even under `Retain`, because nobody asked to keep them
-and a `Released` address per deleted Service is a leak, not a reservation. To keep such an
-address, remove the owner reference and the claim becomes an ordinary held one. The rule
-is stated for any controller owner, not only Services, so machinery that mints claims on a
-tenant's behalf (community #45) inherits it. And **held comes before minted**: when the
-namespace already holds an unattached claim of that class, auto-claim attaches the oldest
-one rather than minting, and mints only when none is free. In a brokered deployment where
-tenants cannot create claims (*User-facing changes*), that is what makes a plain
-LoadBalancer Service wear the address the tenant owns, and a second Service with no spare
-claim stay `Pending` rather than silently mint one. The first rule is implemented
-(cozystack/address-controller#7); the second is specified here.
+Two rules follow:
 
-Allocator-first and claim-first still race in the handoff below, and the inventory can
-transiently disagree with the live `status.loadBalancer` set. The design commits to
-**eventual consistency** there.
+- **A claim with a controller owner follows its owner, not the class reclaim policy.**
+  When the Service is deleted its claim is deleted, and the claim's addresses are deleted
+  even under `Retain`. A `Released` address per deleted Service would be a leak. To keep
+  the address, remove the owner reference; the claim is then an ordinary held claim. The
+  rule applies to any controller owner, so machinery that mints claims for a tenant
+  (community #45) inherits it. Implemented in cozystack/address-controller#7.
+- **Held before minted.** If the namespace holds an unattached claim of the class,
+  auto-claim attaches the oldest one and mints only when none is free. In a brokered
+  deployment (*User-facing changes*) a plain LoadBalancer Service wears the address the
+  tenant owns, and a second Service with no spare claim stays `Pending`. Specified, not
+  implemented.
 
-What remains once holders are in place is narrower than a general theft window, and worth
-naming precisely rather than waving at:
+Claim-first and allocator-first allocations race during the handoff, so the inventory can
+disagree with `status.loadBalancer` briefly. The design accepts eventual consistency there.
 
-- **The handoff.** Releasing the holder and pinning the workload's own Service is not
-  atomic. For that window the address is unheld and an eager allocator could hand it to
-  whichever Service happens to be asking. Narrow, but real — and one of the intervals where
-  layer 1 of *Security* earns its place.
-- **Annotation writers.** With a reserved pool set `autoAssign: false` a plain Service
-  cannot *automatically* draw a reserved address; it can only get one by naming the pool or
-  pinning the address explicitly. That is precisely the write layer 1 gates and layer 2
-  detects.
+Two gaps remain with holders in place:
 
-### 7. What an admin actually configures
+- **The handoff.** Releasing the holder and pinning the workload's Service is not atomic.
+  During that window the address is unheld. Layer 1 of *Security* covers it.
+- **Annotation writers.** With the pool at `autoAssign: false`, a plain Service receives a
+  reserved address only by naming the pool or pinning the address. Layer 1 gates that
+  write; layer 2 detects it.
 
-For MetalLB, forever, for the whole cluster:
+### 7. What an admin configures
 
-- **one** `IPAddressPool` covering the reserved range, **with `autoAssign: false`**, and
-- **one** `L2Advertisement` (or `BGPAdvertisement`) selecting it.
+For MetalLB, once per cluster:
 
-That is all. No pool per tenant, no `/32`s. The `IPAddressClass` carries the range; the
-provisioner renders the backend objects. `autoAssign: false` keeps MetalLB from handing a
-reserved address out *automatically* — but it does **not** make the pool unreachable,
-because a Service can still name the pool explicitly (`metallb.io/address-pool`) or pin an
-address (`metallb.io/loadBalancerIPs`). Closing that path is a security concern, not a
-pool-config one; see §8 and *Security*.
+- one `IPAddressPool` for the reserved range, with `autoAssign: false`;
+- one `L2Advertisement` or `BGPAdvertisement` selecting it.
 
-### 8. Worked examples: how this rides real allocators, and where it does not hold
+The `IPAddressClass` carries the range and the provisioner renders both objects.
+`autoAssign: false` stops MetalLB from assigning a reserved address automatically. It does
+not stop a Service from naming the pool (`metallb.io/address-pool`) or pinning an address
+(`metallb.io/loadBalancerIPs`); §8 and *Security* cover that.
 
-No static pool layout can *guarantee* a reservation. On MetalLB, `autoAssign: false`
-stops only automatic selection — a Service can still name the reserved pool
-(`metallb.io/address-pool`) or pin a specific address (`metallb.io/loadBalancerIPs`) and
-be handed a reserved address. And any principal who can impersonate the controller's
-ServiceAccount — a cluster-admin can — sails past an admission policy keyed on identity.
-So the design does **not** rest on an invariant it cannot enforce. It uses **two layers**,
-and is explicit about which one covers which threat:
+### 8. How this rides real allocators
 
-1. **Admission reduces the blast radius for the parties multi-tenancy is about** —
-   tenants and namespaced principals. A `ValidatingAdmissionPolicy` forbids them from
-   writing *any* backend annotation that selects a pool or pins an address (MetalLB's
-   `metallb.io/address-pool` **and** `metallb.io/loadBalancerIPs`, plus the §1.2
-   equivalents), leaving the claim reference as their only route to the reserved range.
-2. **Reconciliation makes a collision a detected, correctable state — however it arose.**
-   The `IPAddress` ledger is authoritative. The controller watches Services and their
-   assigned `status.loadBalancer.ingress`; if a Service holds an address belonging to an
-   `IPAddress` whose `claimRef`/`associatedTo` does not name that Service, it sets
-   `IPAddress.status.phase: Conflict`, raises a condition and a Service event, and does
-   not let the rightful claim silently lose its address. This is what "dealt with" means
-   for the cases admission cannot prevent (see the trust boundary in *Security*).
-   Adjudication is **per class**: the driver serving the address's class is the one that
-   marks it, so with two drivers neither judges the other's handoff window as theft.
+No pool layout guarantees a reservation. A Service can name the reserved pool or pin an
+address (§7), and a principal that can impersonate the driver's ServiceAccount passes an
+identity-keyed admission policy. The design therefore uses two layers:
 
-A Service arriving *without* a claim reference is **not** by itself the thing being
-defended against — an eager allocator handing a Service an address is the normal case §6
-reconciles after the fact. The conflict is narrower and specific: a Service ending up with
-an address already `Bound` to a *different* claim — by an explicit pin, a race, or an
-impersonated write. Layer 2 keys on exactly that — a `claimRef`/`associatedTo` mismatch —
-not on the mere absence of an annotation. What separates legitimate allocation from theft
-is whose reservation the address belongs to, not whether a claim annotation was present.
+1. **Admission, for tenants and namespaced principals.** A `ValidatingAdmissionPolicy`
+   forbids them from writing any backend input that selects a pool or pins an address
+   (*Security* lists them). The claim reference is their only route to the reserved range.
+2. **Reconciliation, for everything else.** The driver watches
+   `status.loadBalancer.ingress` on Services. If a Service holds an address whose
+   `IPAddress` has a `claimRef` or `associatedTo` that does not name that Service, the
+   driver sets `IPAddress.status.phase: Conflict`, adds a condition, and emits a Service
+   event. The rightful claim keeps its binding. Adjudication is per class: the driver
+   serving the address's class marks the conflict, so two drivers do not mark each other's
+   handoff windows.
 
-**MetalLB.** The class's `IPAddressPool` is `autoAssign: false`, so plain Services never
-draw from it *automatically*; they draw from the admin's other pools. Explicit selection
-(`address-pool`/`loadBalancerIPs`) is blocked for tenants by layer 1 and detected by layer
-2 for anyone else. Scoping the pool further with `IPAddressPool.spec.serviceAllocation`
-(limit to a controller-set label or namespace) is available defense-in-depth — not a
-guarantee.
+A Service without a claim annotation is not the threat. The conflict is a Service holding
+an address `Bound` to a different claim, through a pin, a race, or an impersonated write.
+Layer 2 keys on the `claimRef`/`associatedTo` mismatch, not on the absence of an
+annotation.
 
-> *"A cluster-admin runs `kubectl create -f bad-service.yaml --as
-> system:serviceaccount:metallb-iad-system:metallb-iad`, impersonating the driver, referencing the
-> reserved pool and maybe pinning a specific address."* — Admission cannot stop this: the
-> request carries the controller's identity, and a cluster-admin is the cluster's trust
-> root anyway (they can rewrite the policy or edit MetalLB objects directly). Layer 2 is
-> what applies. The Service is assigned a reserved address; the controller sees an
-> assignment no claim authorizes; the `IPAddress` goes `Conflict` with the offending
-> Service named. The reservation is not silently overwritten — the conflict is surfaced
-> for an operator (or an automated policy) to resolve. That is the honest boundary: the
-> model defends tenants against each other, and turns admin/impersonator collisions into
-> **visible faults** rather than pretending to prevent them.
+**MetalLB.** The class pool is `autoAssign: false`, so plain Services draw from other
+pools. Explicit selection is blocked for tenants by layer 1 and detected by layer 2 for
+everyone else. `IPAddressPool.spec.serviceAllocation` can restrict the pool to a
+controller-set label or namespace as defence in depth.
 
-**Cilium LB-IPAM.** Cilium has no `autoAssign` flag; the equivalent is `serviceSelector`.
-The reserved `CiliumLoadBalancerIPPool` carries a `serviceSelector` matching a label the
-controller stamps on associated Services only, so a plain Service lacks it and draws from
-an unselected default pool. The same two layers apply: admission stops a tenant from
-setting that label directly, and reconciliation catches an assignment no claim authorizes.
+A cluster-admin who runs `kubectl create --as
+system:serviceaccount:metallb-iad-system:metallb-iad` with a pinned Service passes
+admission, because the request carries the driver's identity. A cluster-admin is the trust
+root and can rewrite the policy or edit MetalLB objects directly, so admission does not
+apply to them. Layer 2 applies: the `IPAddress` goes `Conflict` naming the Service, and an
+operator resolves it. The model defends tenants against each other and reports admin
+collisions as faults.
 
-**Cloud (adopt).** The provider holds the reservation (`eipalloc-…`) under its own IAM. A
-plain LB Service with no annotation is handed an ephemeral address from the provider's
-general pool; the provider's API refuses to double-assign a reserved EIP. Here the
-separation is enforced by the provider, not by us — which is exactly why
-`source.providerRef` (adopt, don't allocate) is the right model for this world, and why
-this is the one backend where the reservation genuinely cannot be raided from inside the
-cluster.
+**Cilium LB-IPAM.** Cilium has no `autoAssign`; the equivalent is `serviceSelector`. The
+reserved `CiliumLoadBalancerIPPool` selects a label the driver sets on associated
+Services, so a plain Service draws from a default pool. Admission stops a tenant from
+setting the label; reconciliation detects an assignment no claim authorizes.
+
+**Cloud (adopt).** The provider holds the reservation under its IAM. A plain Service
+receives an ephemeral address from the provider's pool, and the provider refuses to
+double-assign a reserved EIP. The provider enforces the separation, which is why
+`source.providerRef` is the model for this backend.
 
 ## User-facing changes
 
-- **Tenants** gain one kind: `IPAddressClaim`. Create it, read `status.addresses[].address`,
-  put that in DNS, reference the claim by name from a Service. They never see `IPAddress`,
-  `IPAddressClass`, MetalLB, or a pin annotation.
-- **Two operating modes, decided by RBAC alone.** In **self-service** mode tenants create
-  and delete their own claims, bounded by quota. In **brokered** mode tenants hold *read*
-  access to claims, and platform machinery — a billing integration, a portal, a tenant
-  controller — creates them on the tenant's behalf: the tenant may attach and detach the
-  address, through the §5 annotation or the held-before-minted rule of §6, but cannot
-  release it, and an address moved between namespaces is moved by the machinery through
-  `spec.addressName`. Nothing in the model differs between the two. A hosting provider
-  that sells addresses on a minimum term runs the second; a platform team with internal
-  tenants runs the first.
-- **Admins** gain `IPAddressClass` (one per address source) and `IPAddress` (a read-mostly
-  inventory: `kubectl get ipaddresses` finally answers "what do we own and who has it").
-- **Quota** works with no new machinery: `count/ipaddressclaims.<group>` in a stock
-  `ResourceQuota`. (A distribution that renders quotas from its own tenant object has to
-  pass `count/` keys through; Cozystack's tenant chart does not yet.)
-- **Metering follows the claim.** A platform that meters `type: LoadBalancer` Services
-  today meters the wrong thing once addresses are claims: a held address is held whether
-  or not a Service wears it, and a placeholder in the driver's namespace is nobody's
-  workload. The `IPAddress` ledger is the unit of accounting — its `claimRef` says whose,
-  its conditions say since when — and a platform that bills addresses bills claims.
+- **Tenants** gain one kind, `IPAddressClaim`. They create it, read
+  `status.addresses[].address`, put it in DNS, and name the claim from a Service. They
+  never see `IPAddress`, `IPAddressClass`, MetalLB or a pin annotation.
+- **Two operating modes, set by RBAC.** In self-service mode tenants create and delete
+  claims, bounded by quota. In brokered mode tenants have read access to claims, and
+  platform machinery (a billing integration, a portal, a tenant controller) creates them.
+  The tenant attaches and detaches through the §5 annotation or the held-before-minted
+  rule of §6 and cannot release. The machinery moves an address between namespaces
+  through `spec.addressName`. The model is the same in both modes. A hosting provider that
+  sells addresses on a minimum term runs brokered; a platform team with internal tenants
+  runs self-service.
+- **Admins** gain `IPAddressClass`, one per address source, and `IPAddress`, the
+  inventory. `kubectl get ipaddresses` answers who holds what.
+- **Quota** is a `ResourceQuota` on `count/ipaddressclaims.<group>`. A distribution that
+  renders quotas from its own tenant object must pass `count/` keys through; Cozystack's
+  tenant chart does not yet.
+- **Metering follows the claim.** A held address is held whether or not a Service wears
+  it, and a placeholder in the driver's namespace belongs to no tenant workload. A platform
+  that meters LoadBalancer Services meters the wrong object once addresses are claims. The
+  `IPAddress` ledger is the unit of accounting: `claimRef` says whose, the conditions say
+  since when.
 
 ## Upgrade and rollback compatibility
 
-- **Additive.** Nothing about today's `Service type: LoadBalancer` path changes; a
-  Service with no claim annotation behaves exactly as now.
-- **Adoption path.** A cluster with existing LoadBalancer Services can import their
-  addresses as `IPAddress` objects with `source.providerRef`/`fromClass` and a `claimRef`
-  to a generated claim — an offline, reversible migration.
-- **Rollback.** Deleting the CRDs with `reclaimPolicy: Retain` leaves the backend objects
-  and the live Services untouched; addresses stay where they are. With `Delete`, it does
-  not — flagged as the irreversible case.
-- **Adopting Services that are already pinned.** A cluster that enables the fence with
-  hand-pinned Services in place does not break them: an unchanged pin always passes, since
-  the policy compares old against new. To bring such an address under the ledger, an admin
-  creates its `IPAddress` pre-bound to a claim (`claimRef` set, exactly as a pre-provisioned
-  PV), then adds the claim annotation to the Service; the driver's pin equals the existing
-  one and nothing moves. Removing a pin is a change and is gated, so unpinning a legacy
-  Service is an allowlisted operation.
-- **Turning the fence on.** The policy ships with `validationActions` configurable, so a
-  deployment runs `Warn` or `Audit` first, reads what would have been denied, extends the
-  allowlist, and only then switches to `Deny`.
+- **Additive.** A Service with no claim annotation behaves as today.
+- **Adoption.** Existing LoadBalancer Services can be imported: create an `IPAddress` with
+  `source.providerRef` or `fromClass` and a `claimRef` to a generated claim. The migration
+  is offline and reversible.
+- **Rollback.** Deleting the CRDs under `reclaimPolicy: Retain` leaves backend objects and
+  Services untouched. Under `Delete` it does not; this is the irreversible case.
+- **Already-pinned Services.** The policy compares old and new values, so an unchanged pin
+  passes. To bring a pinned address under the ledger, create its `IPAddress` pre-bound to
+  a claim (`claimRef` set, as for a pre-provisioned PV), then add the claim annotation to
+  the Service. The driver's pin equals the existing one. Removing a pin is a change and is
+  gated, so unpinning a legacy Service requires an allowlisted principal.
+- **Enabling the policy.** `validationActions` is configurable. Run `Warn` or `Audit`
+  first, read what would have been denied, extend the allowlist, then switch to `Deny`.
 
 ## Security
 
-**Selecting a pool or pinning an address is a privilege-escalation surface, and this is
-the sharp edge of the proposal.**
+**Selecting a pool or pinning an address is a privilege-escalation surface.**
 
-RBAC authorizes *verbs on resources*, not *fields* or *annotations*. Today, anyone who
-can create a `Service` in a namespace can write `metallb.io/loadBalancerIPs: <any
-address>` — or name the reserved pool with `metallb.io/address-pool` — and because a
-self-allocating backend has **no concept of a reservation**, it will happily hand over an
-address another tenant reserved but has not yet attached. That is a theft window, on
-MetalLB and Cilium alike. It is *not* a cloud problem: there, IAM already guards
-`eipalloc-…`.
+RBAC authorizes verbs on resources, not fields or annotations. Anyone who can create a
+Service in a namespace can write `metallb.io/loadBalancerIPs: <address>` or name the
+reserved pool with `metallb.io/address-pool`. A self-allocating backend has no concept of
+a reservation and assigns the address, including one another tenant reserved but has not
+attached. This applies to MetalLB and Cilium. It does not apply to cloud backends, where
+IAM guards the reservation.
 
-No single mechanism closes this, so the response has **two layers** (see *Design §8*),
-and the design is explicit about which threat each one covers.
+The response has two layers (§8).
 
-**Layer 1 — admission, against tenants.** Turn the ungatable annotation into a reference
-to an RBAC-gated object:
+**Layer 1: admission, against tenants.** The ungatable annotation becomes a reference to
+an RBAC-gated object:
 
-1. A tenant may only write `local.sdn.cozystack.io/ip-address-claim`, naming an object in
-   their **own namespace**, which RBAC *can* gate.
-2. The **driver** of the claim's class writes the backend's raw pool/pin annotations; the
-   core never does.
-3. A `ValidatingAdmissionPolicy` **rejects a non-allowlisted principal** writing *any*
-   backend annotation that selects a pool or pins an address — MetalLB's
-   `metallb.io/address-pool` and `metallb.io/loadBalancerIPs`, plus the §1.2 equivalents
-   for other backends — on a Service.
+1. A tenant writes only `local.sdn.cozystack.io/ip-address-claim`, naming an object in
+   their own namespace. RBAC gates that object.
+2. The driver of the claim's class writes the backend's pool and pin inputs. The core
+   never does.
+3. A `ValidatingAdmissionPolicy` rejects a non-allowlisted principal that writes any
+   backend input selecting a pool or pinning an address on a Service.
 
-*Identifying the driver, and not breaking the platform.* The policy must not rely on a
-hardcoded username. It matches the driver's **ServiceAccount** by name and namespace
-(`system:serviceaccount:<ns>:<sa>`), configured at install time, and it must carry an
-**allowlist**: real clusters have non-tenant principals that legitimately write these
-annotations — GitOps reconcilers applying content their operators authored, and system
-components whose own Services ship with pool annotations pre-set (an Istio installation,
-say). A naive "reject everyone but the driver" breaks reconciliation on day one, so the
-policy denies the write only for principals **outside** an explicit, admin-configurable
-allowlist of usernames and groups, and it ships with `Warn`/`Audit` modes for rollout
-(*Upgrade and rollback compatibility*).
+*Identifying the driver.* The policy matches the driver's ServiceAccount by name and
+namespace (`system:serviceaccount:<ns>:<sa>`), configured at install. It carries an
+allowlist of usernames and groups, because non-tenant principals legitimately write these
+inputs: GitOps reconcilers applying content their operators authored, and system
+components whose Services ship with pool annotations (an Istio installation, for example).
+Without the allowlist, reconciliation breaks on the first such write. The policy ships with
+`Warn` and `Audit` modes (*Upgrade and rollback compatibility*).
 
-*The fence covers every input the backend honours.* Not only the current annotation: a
-backend's deprecated spellings are still parsed, and so may be a core field. For MetalLB
-the gated set is `metallb.io/loadBalancerIPs`, `metallb.io/address-pool` and
-`metallb.io/allow-shared-ip`, the same three under the legacy `metallb.universe.tf/`
-prefix, **and `Service.spec.loadBalancerIP`**, which MetalLB still reads despite the
-field's deprecation in Kubernetes 1.24. Omit any one and the fence has a door. The
-comparison is old-versus-new, not presence: the driver pins the tenant's own Service, and
-the tenant must stay able to edit the rest of it.
+*The gated set is every input the backend honours.* Deprecated spellings are still parsed,
+and so may be a core field. For MetalLB the set is `metallb.io/loadBalancerIPs`,
+`metallb.io/address-pool`, `metallb.io/allow-shared-ip`, the same three under the legacy
+`metallb.universe.tf/` prefix, and `Service.spec.loadBalancerIP`, which MetalLB still
+reads. The comparison is old value against new value, not presence, because the driver
+pins the tenant's own Service and the tenant must be able to edit the rest of it.
 
-*The allowlist's hard case: trusted principals applying untrusted content.* An identity
-allowlist assumes a trusted principal writes content it authored, and that assumption fails
-wherever a privileged controller applies material some user supplied. Two shapes of this are
-ordinary rather than exotic: a GitOps reconciler that applies user-authored releases under
-its **own** identity instead of impersonating the user, and a cloud-controller-manager that
-copies Service annotations from a user-controlled cluster into an infrastructure Service
-verbatim. So **not every platform controller belongs on the allowlist**. A deputy that
-forwards user content is *denied*, like the users behind it, and the Services it creates
-get their addresses through the one path the fence leaves open: the claim annotation, or
-the auto-claim of §6, whose class-selection and opt-out annotations are exactly the ones a
-deputy may safely copy. Allowlist such a deputy instead and every user behind it inherits
-the ability to write a pin; deny it without that path and legitimate Services stay
-`Pending`. Where a deputy must forward gated keys for some other reason, **annotation
-filtering at the deputy is a precondition of layer 1, not a hardening extra**: a strip-list
-for the gated keys, and impersonation rather than ambient authority in any reconciler
-applying user-authored content. Until those hold for a given deputy, layer 1 is
-**partial** for the users behind it and layer 2 is what covers them. The design says so
-rather than assuming a trusted identity implies trusted content.
+*Deputies.* An identity allowlist assumes the principal authored what it writes. A
+privileged controller that applies user-supplied content breaks that assumption. Two
+common cases: a GitOps reconciler that applies user-authored releases under its own
+identity instead of impersonating the user, and a cloud-controller-manager that copies
+Service annotations from a user-controlled cluster into an infrastructure Service. Such a
+deputy is denied, like the users behind it, and is not allowlisted. Its Services obtain
+addresses through the inputs the policy leaves writable: the claim annotation and the
+auto-claim annotations of §6, which a deputy may copy from a guest Service. Where a deputy
+must forward gated inputs, filtering at the deputy is a precondition of layer 1: a
+strip-list for the gated keys, or impersonation instead of ambient authority in the
+reconciler. Until a deputy filters, layer 1 is partial for the users behind it and layer 2
+covers them.
 
-**Layer 2 — reconciliation, for everyone admission cannot bind.** Layer 1 is keyed on
-identity, so it is defeated by anyone who can impersonate an allowlisted ServiceAccount —
-which a cluster-admin can (`--as
-system:serviceaccount:metallb-iad-system:metallb-iad`), along with rewriting
-the policy or editing MetalLB objects directly. **This is a real trust
-boundary, not a bug to be closed:** a cluster-admin is the cluster's trust root, and
-handing out a reserved address is within their authority, not an escalation. What the
-design owes here is not prevention but **detection**. Because the `IPAddress` ledger is
-authoritative and continuously reconciled, any collision — impersonation, a direct
-backend edit, a misconfigured pool, MetalLB assigning a reserved address to a Service with
-no matching claim — surfaces as `IPAddress.status.phase: Conflict` with the offending
-Service named, and the rightful claim is never *silently* overwritten. Admission defends
-tenants against each other; reconciliation turns the cases admission cannot reach into
-visible faults instead of quiet theft.
+**Layer 2: reconciliation, for everyone admission cannot bind.** Layer 1 is keyed on
+identity. A cluster-admin can impersonate the driver's ServiceAccount, rewrite the policy,
+or edit MetalLB objects. This is a trust boundary: a cluster-admin is the trust root, and
+handing out a reserved address is within their authority. The design detects rather than
+prevents. The ledger is reconciled continuously, so an impersonated write, a direct
+backend edit, a misconfigured pool, or an assignment with no matching claim sets
+`IPAddress.status.phase: Conflict` naming the Service, and the rightful claim keeps its
+binding.
 
-Landing layer 1 is worth doing on its own, independent of the rest of the model: the
-theft window it closes is live in any cluster running a shared auto-assign pool today.
+Layer 1 is worth landing alone: the theft window exists in every cluster with a shared
+auto-assign pool.
 
-**Where this component stops, and the entitlement it leaves room for.** The two layers
-above cover the surface a reservation can be *stolen* through. They do not decide *which
-class* a namespace may draw from: a tenant who can create an `IPAddressClaim` can consume
-an address and may name any `spec.className`. `ResourceQuota` bounds how many addresses
-they hold, not from where. Kubernetes has the same gap for `StorageClass` — any namespace
-may name any class — and closes it, where it bothers to, with per-class quota scoping.
+**Where this component stops.** The two layers cover theft of a reservation. They do not
+decide which class a namespace may draw from: a tenant who can create an `IPAddressClaim`
+may name any `spec.className`. `ResourceQuota` bounds the count, not the source.
+Kubernetes has the same gap for `StorageClass` and closes it with per-class quota scoping.
 
-That is deliberate rather than unfinished. This component's job is the **capability** —
-reserve an address, hold it, attach it, detach it, release it — and encoding a tenancy
-model it cannot see belongs above it. Three things are stated here so that whoever closes
-the gap does not have to discover them:
+Encoding a tenancy model belongs above this component. Three constraints apply to whatever
+closes the gap:
 
-1. **The check keys on the namespace, never on the requesting principal.** Platform
-   machinery that mints claims on a tenant's behalf — community #45's attachment
-   controller, a billing integration — creates them under its *own* identity, so a policy
-   keyed on the requester never sees the tenant. A namespace-keyed check covers
-   tenant-authored and machinery-minted claims alike, and a `ValidatingAdmissionPolicy`
-   can express it synchronously, since `paramRef` resolves a parameter object in the
-   request's namespace.
-2. **The empty `className` is a decision, not a convenience.** "Empty means the default
-   class" is the documented path, so a rule of the form *empty or entitled* admits every
-   namespace to the default class. Whether the default class is entitled is a separate
-   boolean.
+1. **The check keys on the namespace, not on the requesting principal.** Machinery that
+   mints claims for a tenant (community #45's attachment controller, a billing
+   integration) creates them under its own identity, so a requester-keyed policy never
+   sees the tenant. A `ValidatingAdmissionPolicy` can key on the namespace, since
+   `paramRef` resolves a parameter object in the request's namespace.
+2. **The empty `className` is an explicit decision.** Empty means the default class, so a
+   rule of the form "empty or entitled" admits every namespace to the default class.
+   Whether the default class is entitled is a separate boolean.
 3. **`spec.addressName` cannot be checked in CEL**, because resolving an address to its
-   class needs a second object read. A deployment that gates it either refuses the field
-   to tenant principals outright — the reference policy's choice, and the right one where
-   platform machinery is what moves specific addresses — or checks it in a webhook.
+   class needs a second object read. A deployment either refuses the field to tenant
+   principals, which is the reference policy's choice, or checks it in a webhook.
 
-The natural home for the data is an **optional entitlement object in the core**: per
-namespace, per class, the number of claims that namespace may hold of that class, with
-zero meaning not entitled and absence meaning unrestricted — the per-class quota scoping
-Kubernetes applies to storage, which gives entitlement and a per-tenant ceiling in one
-object. When present, the core refuses a claim that exceeds it with a condition, and the
-reference admission policy enforces the same bound synchronously on the tenant-facing
-path. The object's shape is **deferred** (*Open questions*); what is fixed is that it is
-namespace-keyed and that the distribution, not the tenant, writes it. In Cozystack the
-`Tenant` object is the obvious source and the tenant chart the obvious renderer, which is
-also how a brokered deployment (*User-facing changes*) expresses "this tenant owns three
-addresses of the public class".
+The data belongs in an optional entitlement object in the core: per namespace, per class,
+the number of claims the namespace may hold. Zero means not entitled; absence means
+unrestricted. This is the per-class quota scoping Kubernetes applies to storage, and it
+gives entitlement and a per-tenant ceiling in one object. When present, the core refuses
+a claim over the limit with a condition, and the reference admission policy enforces the
+same bound synchronously. The object's shape is open (*Open questions*). The distribution
+writes it, not the tenant. In Cozystack the `Tenant` object is the source and the tenant
+chart the renderer; a brokered deployment (*User-facing changes*) uses it to express
+"this tenant owns three addresses of the public class".
 
 ## Failure and edge cases
 
 - **Class range exhausted** → claim stays `Pending` with a reason; no partial binding.
-- **Claim deleted, `reclaimPolicy: Retain`** → `IPAddress` goes `Released`, keeps the
-  address, is not reusable until an admin clears the `claimRef`. (PV semantics, deliberately.)
-- **Claim deleted, `Delete`** → address returned to the range; the backend object is torn down.
-- **Service references a claim in another namespace** → rejected. Cross-namespace address
-  sharing is not a thing.
-- **Two Services reference one claim** → resolved by reconciliation, not at admission. A
-  `ValidatingAdmissionPolicy` cannot see the claim — CEL is given the request object and the
-  policy's params, not arbitrary cluster state — so admission-time rejection would need a
-  webhook. The rule is **the live holder keeps it**: the Service already in `associatedTo`
-  stays associated for as long as it exists, a later Service naming the claim is refused
-  with an `AssociationRejected` event, and the claim reports the refusal in an `Associated`
-  condition naming both; only when the holder is gone does the next one take over. The
-  address is never silently moved. A 1:1 binding is 1:1; letting the second win quietly is
-  how an address goes dead.
-- **Plain Service pulls a reserved address** (explicit `address-pool`/pin, or a request
-  made under an impersonated controller identity) → not prevented in general; **detected**.
-  The `IPAddress` goes `Conflict`, the offending Service is named, and the reservation is
-  not silently overwritten. See §8 and *Security*.
+- **Claim deleted, `Retain`** → `IPAddress` goes `Released` and keeps the address. It is
+  not reusable until an admin clears `claimRef` (PV semantics).
+- **Claim deleted, `Delete`** → address returned to the range; the backend object is torn
+  down.
+- **Service names a claim in another namespace** → rejected.
+- **Two Services name one claim** → resolved by reconciliation. A
+  `ValidatingAdmissionPolicy` cannot read the claim (CEL sees the request object and the
+  policy's params), so admission-time rejection would need a webhook. The live holder
+  keeps the address: the Service in `associatedTo` stays associated while it exists, a
+  later Service is refused with an `AssociationRejected` event, and the claim reports the
+  refusal in an `Associated` condition naming both. When the holder is gone, the next
+  Service takes over.
+- **Plain Service receives a reserved address** (pool annotation, pin, or impersonated
+  write) → detected, not prevented. The `IPAddress` goes `Conflict` naming the Service;
+  the reservation is not overwritten (§8, *Security*).
 - **`spec.addressName` names an address that is absent, `Bound`, `Released`, or of another
-  class or family** → nothing binds; the claim stays `Pending` with the ordinary waiting
-  reason. Naming an address filters, it never seizes.
-- **A `Dual` claim associated with a single-stack Service** → the driver pins only the
-  family the Service carries; the other address stays `Bound` to the claim and inert. The claim is not
-  `Lost`, and the unattached family is never silently released.
-- **Backend lacks `Pin`** → claims against that class are refused loudly, rather than
-  allocating an address that can never be attached. With no capability registry there is
-  nothing for admission to consult, so this is the provisioner refusing and reporting it on
-  the claim, not an admission-time rejection.
-- **Address adopted from a provider, then released provider-side** → `IPAddress` goes
-  `Lost`. It must not silently re-allocate.
-- **Controllers down while a namespace holding claims is deleted** → the claim finalizer
-  holds the namespace until the core returns, exactly as PVC protection does; a controller
-  outage never leaks an address, at the cost of a deletion that waits.
-- **Class deleted while addresses of it are bound** → refused, not cascaded. The rendered
-  pool and advertisement are owned by the class, so letting the deletion through would
-  withdraw every address of the class at once; a finalizer holds the class until its
-  addresses are gone.
-- **`Released` addresses accumulate under `Retain`** → by default an admin clears
-  `claimRef`, PV semantics. A class may set an optional **`releaseDelay`**: once it
-  elapses the controller clears `claimRef` itself and the address returns to `Available`,
-  so a release followed by a cooling-off period before reuse needs no operator. An
-  address marked held — an annotation the controller honours — is exempt, which is how an
-  operator quarantines an address they do not want reissued.
+  class or family** → nothing binds; the claim stays `Pending` with the ordinary reason.
+- **`Dual` claim on a single-stack Service** → the driver pins only the family the Service
+  carries. The other address stays `Bound` and unattached. The claim is not `Lost`.
+- **Backend lacks `Pin`** → the provisioner refuses claims of that class and reports it on
+  the claim. There is no capability registry for admission to consult.
+- **Adopted address released provider-side** → `IPAddress` goes `Lost`. It is not
+  reallocated.
+- **Namespace with claims deleted while the core is down** → the claim finalizer holds the
+  namespace until the core returns, as PVC protection does. No address leaks; the deletion
+  waits.
+- **Class deleted with bound addresses** → refused. The class owns the rendered pool and
+  advertisement, so cascading the deletion would withdraw every address of the class. A
+  finalizer holds the class until its addresses are gone.
+- **`Released` addresses accumulate under `Retain`** → an admin clears `claimRef`. A class
+  may set `releaseDelay`: after it elapses the controller clears `claimRef` and the address
+  returns to `Available`. An address marked held by an annotation is exempt, which
+  quarantines an address an operator does not want reissued.
 
 ## Testing
 
-- **Unit:** the allocator (range carving, exhaustion, reclaim transitions, the source union).
-- **Integration:** claim → bind → associate → *delete the Service* → assert the address is
-  still held → associate it to a **different** workload → assert the same address comes back.
-  **That single test is the proposal.** It is precisely what cannot pass today.
-- **e2e (per backend):** MetalLB and Cilium, on a real cluster: an external client reaches
-  the workload on the reserved address, and still reaches it after the workload is
-  rebuilt behind the same claim.
-- **Admission:** a tenant writing a raw pool-select or pin annotation, a legacy-prefixed
-  one, or `spec.loadBalancerIP` is rejected; a tenant
-  reserving an address and a second tenant attempting to pin it directly is rejected; an
-  allowlisted GitOps/system principal writing a pool annotation is **admitted** (the
-  allowlist does not over-block).
+- **Unit:** the allocator: range carving, exhaustion, reclaim transitions, the source
+  union.
+- **Integration:** claim → bind → associate → delete the Service → assert the address is
+  still held → associate it to a different workload → assert the same address returns.
+  This test is the proposal; it cannot pass today.
+- **e2e, per backend:** MetalLB and Cilium on a real cluster. An external client reaches
+  the workload on the reserved address, and still reaches it after the workload is rebuilt
+  behind the same claim.
+- **Admission:** a tenant writing a pool-select or pin annotation, a legacy-prefixed one,
+  or `spec.loadBalancerIP` is rejected; a second tenant pinning a reserved address is
+  rejected; an allowlisted principal writing a pool annotation is admitted.
 - **Reconciliation:** a Service assigned a reserved address with no authorizing claim
-  (e.g. created under an impersonated controller identity) drives the `IPAddress` to
-  `Conflict` and emits an event; the rightful claim's binding is not lost.
+  drives the `IPAddress` to `Conflict` with an event; the rightful claim keeps its
+  binding.
 
 ## Rollout
 
-Sketch — sequencing is an open question:
+Sequencing is open:
 
-1. CRDs + core controller + the **MetalLB** provisioner + the admission policy. (The
-   admission policy is not phase 2. See *Security*.) All three exist, the policy as the
-   driver's opt-in template — see *Implementation status*. The §5 `loadBalancerClass`
-   check and the held-before-minted rule of §6 complete this phase.
-2. **Gateway as an association target** (§5), with `Gateway.spec.addresses` fenced. This
-   is the consumer tenants will meet first: the accepted external-database-exposure
-   proposal puts a tenant's database traffic on the single address of the tenant Gateway,
-   so the address a tenant most wants to keep is one a Service annotation cannot reach.
-   Which Cilium release honours `spec.addresses` is open question 4.
-3. The Cilium provisioner. Proves the abstraction is not a MetalLB adapter — **this is
-   the phase that either validates or falsifies the design**, and it should come early.
-   A second *consumer* has since exercised the association half (*Implementation
-   status*); a second *provisioner* is what remains.
-4. A cloud provisioner (adoption path, `source.providerRef`). Proves the source union.
+1. CRDs, core controller, the MetalLB provisioner, and the admission policy. All exist
+   (*Implementation status*); the policy is the driver's opt-in template. The §5
+   `loadBalancerClass` check and the held-before-minted rule of §6 complete this phase.
+2. Gateway as an association target (§5), with `Gateway.spec.addresses` fenced. The
+   accepted external-database-exposure proposal puts a tenant's database traffic on the
+   tenant Gateway's single address, so this is the consumer tenants meet first. Which
+   Cilium release honours `spec.addresses` is open question 4.
+3. The Cilium provisioner. A second provisioner tests the allocation seam; a second
+   consumer has tested the association seam (*Implementation status*).
+4. A cloud provisioner (`source.providerRef`). Tests the source union.
 
 ## Open questions
 
-1. **Provisioners: in-tree or out-of-tree?** In-tree for three backends; CSI's history
-   says that stops scaling. Where is the line, and do we want the CRD contract on day one?
-2. **PureLB.** Does it have *any* "request this exact IP" mechanism? If not, it cannot be a
-   backend, and that should be stated rather than discovered.
-3. **Sharing one address across Services** (different ports — GCP and Cilium both permit
-   it). Today one consumer at a time holds a claim and a second reference is refused (§5).
-   Should that relax to several consumers on disjoint ports? It is the mirror of the
-   deferred several-addresses-on-one-consumer case in *Non-goals*, and the two probably
-   want answering together, since both are really "what is the cardinality between a claim
-   and the things that wear it".
-4. **Gateway.** `Gateway.spec.addresses` is the natural pin for a Gateway consumer (§5),
-   and Cilium supports it with LB-IPAM; whether the Cilium release a platform ships honours
-   it, and whether the infrastructure-annotation path is needed as a fallback, is
-   unverified. The provisioner decides where the pin lands; which object a tenant
-   annotates is the part that needs settling here.
-5. **The entitlement object's shape** (*Security*). Namespace-keyed, per-class, a count;
-   whether it is one object per namespace or one per class, who may read it, and whether
-   the reference admission policy consumes it directly as its `paramRef` are open.
+1. **Provisioners: in-tree or out-of-tree?** In-tree suffices for three backends; CSI's
+   history says it stops scaling. Where is the line, and is the CRD contract needed on day
+   one?
+2. **PureLB.** Does it have any "request this exact IP" mechanism? If not, it cannot be a
+   backend.
+3. **Sharing one address across Services on disjoint ports.** GCP and Cilium permit it.
+   Today one consumer holds a claim at a time (§5). This is the mirror of the
+   several-addresses-on-one-consumer case in *Non-goals*; both are the cardinality
+   between a claim and its consumers.
+4. **Gateway.** `Gateway.spec.addresses` is the natural pin for a Gateway consumer, and
+   Cilium supports it with LB-IPAM. Whether the shipped Cilium release honours it, and
+   whether the infrastructure-annotation path is needed as a fallback, is unverified.
+   Which object a tenant annotates needs settling here.
+5. **The entitlement object's shape** (*Security*). One object per namespace or per class,
+   who may read it, and whether the reference admission policy consumes it as its
+   `paramRef`.
 
 ## Alternatives considered
 
-**Bind the address to a Service** — the shape community #29 proposed as
-`ServiceExposure`. A namespaced object naming a `serviceRef`, which allocates an address
-and reports it in status. **Rejected as the
-model for *this* problem:** it fuses *allocation* with *association*, so the address's
-lifetime is the Service's lifetime — which is the exact thing being fixed. It cannot
-express "keep this address, the workload is gone", which is the entire user request.
-The **class** half of that idea is right and is kept here; the exposure half is not a
-reservation and cannot be made into one.
+**Bind the address to a Service** (community #29's `ServiceExposure`): a namespaced object
+naming a `serviceRef`, which allocates an address and reports it. Rejected: it fuses
+allocation with association, so the address's lifetime is the Service's lifetime, which is
+the problem being fixed. The class half of the idea is kept.
 
-**Per-tenant pools.** Give each tenant an `IPAddressPool` (or a `/32` per address) and let
-MetalLB do the rest. **Rejected:** it is the status quo's failure mode, it makes the admin
-the allocator, it scales as O(tenants) or O(addresses) in operator-managed objects, and it
-*still* provides no reservation — the address is released the moment the Service goes away.
+**Per-tenant pools**: an `IPAddressPool` per tenant, or a `/32` per address. Rejected: the
+admin becomes the allocator, the object count scales with tenants or addresses, and there
+is still no reservation.
 
-**Let the tenant write the backend's pin annotation directly.** **Rejected:** unauthorizable
-(RBAC does not gate fields), and it hands every tenant the ability to steal any reserved
-address that is not currently attached. See *Security*.
+**Let the tenant write the pin annotation.** Rejected: RBAC does not gate fields, so every
+tenant could take any reserved, unattached address (*Security*).
 
-**Reuse Cluster API's IPAM kinds.** `ipam.cluster.x-k8s.io` `IPAddressClaim`/`IPAddress` is
-*literally* this pattern — namespaced claim, concrete address object, a documented
-third-party provider contract — and shares even the kind names chosen here. **Rejected:**
-it has only ever been wired to **Machine** addressing, never Services, and has no reclaim
-policy and no association, which are the two things this proposal exists to add. The
-contract is copied; the group is not.
+**Reuse Cluster API's IPAM kinds.** `ipam.cluster.x-k8s.io` has `IPAddressClaim` and
+`IPAddress` with a provider contract and the same kind names. Rejected: they serve Machine
+addressing only and have no reclaim policy and no association, which are the two things
+this proposal adds. The contract is copied; the group is not.
 
-**Adopt every live LoadBalancer assignment into the ledger.** An earlier draft reconciled
-`status.loadBalancer` on every Service into `IPAddress` objects, so the inventory would
-converge on everything in use. **Rejected:** catch-all adoption of objects nobody asked for
-is uncharacteristic of Kubernetes, and there is nothing to adopt — a class's pool is
-`autoAssign: false`, so a Service holding a class address without a claim got it through a
-pin, which is a conflict to surface, not a reservation to record; and addresses outside
-every class are not the ledger's concern. The real need underneath — Services that should
-draw from a class but cannot name a claim — is met by the opt-in auto-claim of §6.
+**Adopt every live LoadBalancer assignment into the ledger.** An earlier draft had the
+controller create an `IPAddress` for every assigned address found on a Service. Rejected:
+a class pool is `autoAssign: false`, so a Service holding a class address without a claim
+got it through a pin, which is a conflict (§8), and addresses outside every class are out
+of scope. Adoption of objects nobody asked for is also uncharacteristic of Kubernetes; the
+PersistentVolume controller does not adopt volumes it did not provision. The need
+underneath, Services that cannot name a claim, is met by auto-claim (§6, decision 0002).
 
-**Wait for upstream.** **Rejected:** KEP-1880 lists generalizing to an IPAM API as an
-explicit non-goal, and `loadBalancerIP` was deprecated with no replacement. There is
-nothing to wait for.
+**Wait for upstream.** Rejected: KEP-1880 names an IPAM API a non-goal, and
+`loadBalancerIP` was deprecated with no replacement.
 
-**Do nothing.** **Rejected:** the capability simply does not exist today — an address
-cannot be held, moved, quota'd, or enumerated — and the pin-annotation theft window in
-*Security* is live in any cluster running a shared auto-assign pool. Doing nothing leaves
-both the missing capability and the open security hole in place.
+**Do nothing.** Rejected: an address cannot be held, moved, counted or listed, and the
+theft window in *Security* exists in every cluster with a shared auto-assign pool.
