@@ -164,6 +164,7 @@ A newer client connected to an older cluster exposes only discovered operations 
 1. Should `tenant use` store an XDG preference or select a kubeconfig context whose namespace represents the tenant?
 2. Which related-resource selectors are reliable enough to support in the first release?
 3. Which service-specific action is valuable enough to justify the first explicit capability proposal?
+4. How should a user get the name of the workload object behind an application, such as the `VirtualMachine` behind a `VMInstance`, to pass to a type-specific tool like `virtctl`? `ApplicationDefinition` declares selectors only for Secrets, Services, and Ingresses, so `app resources` cannot report it today. The workload could be declared through a new selector field, or through a naming contract between the release prefix and the chart; for `vm-instance` the VM name currently equals `<prefix><app name>`, but only as a chart convention.
 
 ## Alternatives considered
 
@@ -174,6 +175,8 @@ A newer client connected to an older cluster exposes only discovered operations 
 **Generate typed commands for every application.** This requires a client release for every catalog change and cannot cover application packages from external sources. Dynamic discovery matches the existing aggregated API architecture.
 
 **Generate application types as root commands.** This makes command help, completion, and scripts depend on the connected cluster. Stable `catalog` and `app <type>` commands avoid that instability.
+
+**Wrap or reimplement `virtctl` for VM actions.** An earlier prototype added `console`, `vnc`, `port-forward`, and `migrate`, which mapped the application name to the KubeVirt VM name and executed `virtctl`. A single entry point is convenient, but `cozyctl` would then have to follow `virtctl` flags and KubeVirt API versions, and the command tree would be tied to KubeVirt: if another virtualization backend appears, those commands have to be redone. Executing an external binary also conflicts with the security boundary above, and a native implementation would duplicate KubeVirt's streaming clients. VM-specific actions stay with `virtctl`, in the same way `kubectl` remains the raw-resource escape hatch.
 
 ---
 
