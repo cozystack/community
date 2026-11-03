@@ -56,10 +56,11 @@ the placeholder, pin the workload's Service.
 
 - A reserved, unattached address cannot be taken by another Service. Admission and
   conflict detection become defence in depth. Proposal §6 is written around this.
-- One placeholder Service, with a ClusterIP, per held address.
-- The handoff is not atomic. Between deleting the placeholder and pinning the workload's
-  Service the address is unheld for one reconcile interval. The admission policy covers
-  that window.
+- One placeholder Service per held address, each with a ClusterIP. The number of
+  reserved addresses is therefore bounded by the Service CIDR, not by the external pool.
+- The handoff is not atomic. Between deleting the placeholder and the first successful
+  pin the address is unheld, and because `associatedTo` is already set, a failed pin or a
+  driver restart does not re-arm the hold. The admission policy covers that window.
 - MetalLB keeps an assignment until the Service is deleted or re-addressed;
   `autoAssign: false` gates only new allocation (observed on a live cluster,
   [design §5](https://github.com/cozystack/metallb-iad/blob/main/docs/design.md#5-association-the-gap-handoff)).
