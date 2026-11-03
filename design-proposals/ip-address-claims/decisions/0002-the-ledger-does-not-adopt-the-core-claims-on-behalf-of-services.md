@@ -10,86 +10,76 @@
 
 ## Context
 
-The proposal's §6 originally had two halves. Holders (record 0001) were one. The other said
-*"the inventory still works backwards"*: because an eager allocator assigns before any claim
-exists, the controller would also observe `status.loadBalancer` on every Service and
-reconcile what it found into `IPAddress` objects after the fact, so that the ledger would
-converge on everything in use. It was introduced in the first revision in answer to a
-production report that a shared auto-assign pool was the normal deployment
-([comment, 2026-07-15](https://github.com/cozystack/community/pull/35#issuecomment-4977850733)
-and the [reply](https://github.com/cozystack/community/pull/35#issuecomment-4984507704)).
+The first revision of §6 had the controller create an `IPAddress` for every assigned
+address it found on a LoadBalancer Service, to inventory addresses MetalLB assigned before
+a claim existed. It was added in response to a production report that a shared
+auto-assign pool was the normal deployment
+([comment, 2026-07-15](https://github.com/cozystack/community/pull/35#issuecomment-4977850733),
+[reply](https://github.com/cozystack/community/pull/35#issuecomment-4984507704)).
+Placeholder holding, the other half of §6, is record 0001.
 
-Neither controller ever implemented it, and when the reason for it was examined it was not
-there. With a class's pool at `autoAssign: false`, a plain Service cannot draw a class
-address *except* by naming the pool or pinning the address — which is a conflict to
-surface, not an allocation to record — and addresses from pools no class manages were never
-the ledger's concern. Catch-all adoption of objects nobody asked for is also uncharacteristic
-of Kubernetes: the PersistentVolume controller does not adopt volumes it did not provision.
+Neither controller implemented it, and nothing needs it. A class pool is
+`autoAssign: false`, so a plain Service gets a class address only by naming the pool or
+pinning the address, which §8 already reports as a conflict. Other pools are outside the
+ledger's scope. Adoption of objects nobody asked for is also uncharacteristic of
+Kubernetes; the PersistentVolume controller does not adopt volumes it did not provision.
 
-What the implementation *did* find was the opposite problem. The packaging work for tenant
-Kubernetes clusters showed that cloud-provider-kubevirt creates a host-side
-`type: LoadBalancer` Service for every LoadBalancer Service in a guest, copying the guest's
-annotations once at creation and nothing afterwards
+The implementation found the opposite problem. cloud-provider-kubevirt creates a host-side
+`type: LoadBalancer` Service for every LoadBalancer Service in a tenant Kubernetes cluster
+and copies the guest's annotations once, at creation
 ([cozystack/cozystack#3382 review](https://github.com/cozystack/cozystack/pull/3382#pullrequestreview-5503155946),
 [address-controller#7](https://github.com/cozystack/address-controller/pull/7)). Under
-`autoAssign: false` such Services sat `Pending` with *no available IPs*. These are Services
-that *should* draw from a class but cannot name a claim, because nothing in their render
-path has heard of claims.
+`autoAssign: false` these Services stayed `Pending` with "no available IPs". They should
+draw from a class and cannot name a claim, because nothing in their render path knows
+about claims.
 
 ## Decision
 
-The ledger records only what was reserved through it; it adopts nothing. In its place the
-core offers an **opt-in auto-claim** path, enabled per class by an annotation on the
-`IPAddressClass` and inert everywhere otherwise: for a live LoadBalancer Service with no
-claim annotation, no `loadBalancerClass`, no pin and no assigned address, the core mints an
-`IPAddressClaim` of the same name in the same namespace, **owned by the Service**, and
-writes the association annotation onto the Service; the driver then associates as if a
-tenant had written it. A Service may name a class, or opt out, through annotations the core
-defines — the ones a deputy such as a cloud-controller-manager may safely copy. A claim with
-a controller owner follows its owner rather than the class reclaim policy: when the Service
-goes, its claim goes and its addresses are deleted even under `Retain`. Removing the owner
-reference turns it into an ordinary held claim.
+The ledger records only addresses reserved through it. The core has an opt-in auto-claim
+path, enabled per class by an annotation on the `IPAddressClass`: for a live LoadBalancer
+Service with no claim annotation, no `loadBalancerClass`, no pin and no assigned address,
+the core creates an `IPAddressClaim` with the Service's name in the Service's namespace,
+owned by the Service, and writes the association annotation on the Service. The driver
+then associates as usual. A Service can name a class or opt out through annotations the
+core defines, which a deputy such as a cloud-controller-manager may copy. A claim with a
+controller owner follows its owner, not the class reclaim policy: when the Service is
+deleted, its claim and addresses are deleted even under `Retain`. Removing the owner
+reference makes it an ordinary held claim.
 
 ## Why not the alternatives
 
-- **Reconcile every live assignment into the ledger** (the proposal's own §6 text until
-  this revision). Lost because there is nothing to adopt once class pools are
-  `autoAssign: false`, and because an inventory that adopts foreign assignments would
-  record addresses nobody reserved, with no claim to attribute them to. Recorded in the
-  proposal's *Alternatives considered*.
-- **Require every guest cluster to name a claim.** Lost on the deputy's behaviour: the
-  cloud-controller-manager copies annotations at creation only, so a guest would have to
-  know about claims before creating its Service, and every Kubernetes-app tenant would
-  need to be taught the contract. Auto-claim keeps the guest ignorant and still gives the
-  Service a ledgered address.
-- **Let auto-claimed addresses follow the class reclaim policy.** Lost because nobody asked
-  to keep them: under `Retain` every deleted Service would leave a `Released` address
-  behind, which is a leak, not a reservation. The same concern was raised independently
-  against machinery-minted claims on community #45
+- **Create an `IPAddress` for every live assignment** (the proposal's own §6 until this
+  revision). There is nothing to adopt under `autoAssign: false`, and an adopted address
+  has no claim to attribute it to. Recorded in *Alternatives considered*.
+- **Require every guest cluster to name a claim.** The cloud-controller-manager copies
+  annotations at creation only, so every guest would need to know the contract before
+  creating a Service. Auto-claim gives the Service a ledgered address without that.
+- **Let auto-claimed addresses follow the class reclaim policy.** Under `Retain` every
+  deleted Service would leave a `Released` address. The same objection was raised against
+  machinery-minted claims on community #45
   ([review, 2026-10-12](https://github.com/cozystack/community/pull/45#pullrequestreview-5491027438)),
-  which is why the rule is stated for any controller owner, not only Services.
+  so the rule applies to any controller owner.
 
 ## Consequences
 
-- The core now touches Services on this one path; the proposal's claim that it never does
+- The core writes to Services on this path. The proposal's statement that it never does
   is withdrawn.
-- Auto-claim is independent of the default class. The two decisions have different
-  owners, and a class marked for auto-claim must be deployed after drivers have opted
-  their own placeholder Services out
-  ([cozystack/metallb-iad#5](https://github.com/cozystack/metallb-iad/pull/5)), or the core
-  will claim the driver's holders.
-- A deputy that forwards user content no longer needs to be allowlisted by the admission
-  fence: its Services reach the ledger through the claim-reference and class-selection
-  annotations, which the fence leaves writable.
-- The brokered operating mode gains a natural attach surface: with the held-before-minted
-  rule (specified, not yet implemented), a plain LoadBalancer Service in a namespace that
-  already holds an unattached claim wears that address rather than minting a new one, and
-  a second Service with no spare claim stays `Pending`.
-- Deputies copy annotations at creation only, so class selection and opt-out must be set on
-  the guest Service before it exists; adding them later has no effect.
+- The auto-claim class is independent of the default class. Mark a class only after
+  drivers have opted their placeholder Services out
+  ([cozystack/metallb-iad#5](https://github.com/cozystack/metallb-iad/pull/5)); otherwise
+  the core claims the driver's holders.
+- A deputy that forwards user content does not need to be allowlisted by the admission
+  policy. Its Services reach the ledger through the claim-reference and class-selection
+  annotations, which the policy leaves writable.
+- With the held-before-minted rule (specified, not implemented), a plain LoadBalancer
+  Service in a namespace that holds an unattached claim wears that address, and a second
+  Service with no spare claim stays `Pending`. This is the attach surface of the brokered
+  mode.
+- Deputies copy annotations at creation only, so class selection and opt-out must be on
+  the guest Service before it is created.
 
 ## Revisit if
 
-cloud-provider-kubevirt gains an annotation filter or a configurable claim contract, which
-would let guest clusters name claims directly; or a second deputy appears whose behaviour
-the annotation-copy assumption does not fit.
+cloud-provider-kubevirt gains an annotation filter or a configurable claim contract, so
+guest clusters can name claims directly; or a second deputy appears whose behaviour the
+annotation-copy assumption does not fit.
