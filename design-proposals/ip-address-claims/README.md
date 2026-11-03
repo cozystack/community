@@ -497,11 +497,15 @@ placeholders carry the pool annotation, so this rule excludes them without the o
 annotation and without knowledge of the driver's namespace. The auto-claim class is
 independent of the default class.
 
-An auto-claimed Service has no `loadBalancerClass`, and the core does not set one: the
-field is immutable and the Service already exists. The Service is therefore served by the
-implementation that handles unclassed Services, the cluster default (§1.5), and an
-auto-claim class must have an empty `loadBalancerClass`. The core ignores the auto-claim
-annotation on a class with a non-empty value and reports it with an event.
+An auto-claimed Service has no `loadBalancerClass`, so the cluster's default
+implementation serves it (§1.5). An auto-claim class is therefore a class of the default
+implementation, with an empty `loadBalancerClass`. This is the semantics of the field,
+not a rule of this design: the field is immutable once the Service is
+`type: LoadBalancer`, and MetalLB reads no annotation in its place, so no component can
+route an unclassed Service to another implementation after creation. The core reports an
+event on a class marked for auto-claim whose `loadBalancerClass` is non-empty, since no
+Service it mints for can be served. Auto-claim into such a class needs the field set at
+creation, which a mutating admission webhook could do from the class; that is deferred.
 
 Two rules follow:
 
