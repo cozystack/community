@@ -23,10 +23,11 @@ This had two defects. MetalLB did not know about the reservation: a held, unatta
 address was free in its accounting, and only the admission policy, which impersonation
 defeats, stopped a pin from taking it. And the driver allocated independently of MetalLB,
 so it could pick an address a plain Service already held from an overlapping pool and
-detect the collision only at pin time. @lexfrei's review of the proposal
+detect the collision only at pin time. Three days after the change, @lexfrei's review of
+the proposal
 ([2026-07-23](https://github.com/cozystack/community/pull/35#pullrequestreview-4763639339))
-asked for the same change from the other side: enforce the reservation in the allocator's
-own accounting, with detection as the backstop.
+made the same argument independently: enforce the reservation in the allocator's own
+accounting, with detection as the backstop.
 
 ## Decision
 
