@@ -121,9 +121,10 @@ Phase 1 of *Rollout* exists under the Cozystack organisation:
   (cozystack/address-controller#7).
 - **[metallb-iad](https://github.com/cozystack/metallb-iad)**: the reference driver for
   MetalLB. It holds a reservation as a placeholder Service in its own namespace, so
-  MetalLB's accounting refuses to assign a held address elsewhere.
-  cozystack/metallb-iad#6 ships the admission policy of *Security* as an opt-in chart
-  template; cozystack/metallb-iad#5 opts the placeholders out of auto-claim.
+  MetalLB's accounting refuses to assign a held address elsewhere. On `main` the chart
+  has no admission policy, so layer 1 of *Security* is absent as shipped.
+  cozystack/metallb-iad#6, open, adds the policy as an opt-in chart template;
+  cozystack/metallb-iad#5, open, opts the placeholders out of auto-claim.
 - **cozystack/cozystack#3382** packages both as optional system packages, with tenant RBAC
   on claims and a distribution-specific admission policy. The driver's policy is the
   reference; a distribution may disable it and ship its own.
@@ -138,7 +139,8 @@ cozyplane, an address survived delete-and-rebind and stayed reachable.
 This tests the association seam only. The allocation seam, a second provisioner, is
 untested (*Rollout*).
 
-**Specified here and not yet implemented:** the `loadBalancerClass` check of §5; pinning
+**Specified here and not yet implemented:** the `loadBalancerClass` check and the
+serviceability check of §5; the pool-or-pin exclusion of §6; pinning
 only the families a Service carries (§2); conditions on `IPAddress` (§2) and the
 `Associated` condition on a claim (§5); per-class conflict adjudication (§8); the
 held-before-minted rule of §6; the release delay and the class-deletion guard (*Failure
@@ -422,6 +424,14 @@ Service. A mismatch is a refused association naming both values. Whoever creates
 Service sets the field at creation; a controller that creates the Service and names the
 claim reads the class first.
 
+**Serviceability before handoff.** The driver checks that it can serve the consumer
+before it releases the hold: the Service is `type: LoadBalancer`, its `loadBalancerClass`
+matches the class, and the backend will act on the pin. A consumer that fails the check
+is refused with an event, `associatedTo` stays unset, and the holder keeps the address.
+The order matters. Setting `associatedTo` disarms the hold (§6), so a consumer recorded
+before it is checked leaves the address unheld, announced nowhere, and reported as
+attached. Specified, not implemented.
+
 **Detaching.** When the annotation is removed, the driver withdraws its pin, clears
 `associatedTo`, and holds the address again. The `IPAddress` stays `Bound` to its claim:
 reserved and attached to nothing, like an unassociated EIP. MetalLB keeps an assignment
@@ -470,7 +480,11 @@ the `IPAddressClass`: for a LoadBalancer Service with no claim annotation, no
 with the Service's name in the Service's namespace, owned by the Service, and writes the
 §5 annotation on the Service. The driver associates as usual. A Service can name a class
 or opt out through annotations the core defines; cloud-provider-kubevirt copies these
-from the guest Service. The auto-claim class is independent of the default class.
+from the guest Service. The core also skips any Service that carries a backend pool or pin
+input (*Security* lists them): such a Service has chosen its address source. The driver's
+placeholders carry the pool annotation, so this rule excludes them without the opt-out
+annotation and without knowledge of the driver's namespace. The auto-claim class is
+independent of the default class.
 
 Two rules follow:
 
@@ -492,7 +506,9 @@ disagree with `status.loadBalancer` briefly. The design accepts eventual consist
 Two gaps remain with holders in place:
 
 - **The handoff.** Releasing the holder and pinning the workload's Service is not atomic.
-  During that window the address is unheld. Layer 1 of *Security* covers it.
+  The address is unheld until the first successful pin; `associatedTo` is already set, so
+  a failed pin or a driver restart does not re-arm the hold. Layer 1 of *Security* covers
+  the window.
 - **Annotation writers.** With the pool at `autoAssign: false`, a plain Service receives a
   reserved address only by naming the pool or pinning the address. Layer 1 gates that
   write; layer 2 detects it.
@@ -511,6 +527,10 @@ range moved into a class must leave its old pool first.
 `autoAssign: false` stops MetalLB from assigning a reserved address automatically. It does
 not stop a Service from naming the pool (`metallb.io/address-pool`) or pinning an address
 (`metallb.io/loadBalancerIPs`); §8 and *Security* cover that.
+
+Under BGP, MetalLB announces each assigned address as a host route whether or not it is
+reserved, so scattered reservations within a range do not change route-table growth.
+`BGPAdvertisement.aggregationLength` summarises as it does without this proposal.
 
 ### 8. How this rides real allocators
 
@@ -682,8 +702,9 @@ closes the gap:
 
 The data belongs in an optional entitlement object in the core: per namespace, per class,
 the number of claims the namespace may hold. Zero means not entitled; absence means
-unrestricted. This is the per-class quota scoping Kubernetes applies to storage, and it
-gives entitlement and a per-tenant ceiling in one object. When present, the core refuses
+unrestricted. This is the per-class quota scoping Kubernetes applies to storage, and the
+shape community #99 uses for GPU budgets; it gives entitlement and a per-tenant ceiling
+in one object. When present, the core refuses
 a claim over the limit with a condition, and the reference admission policy enforces the
 same bound synchronously. The object's shape is open (*Open questions*). The distribution
 writes it, not the tenant. In Cozystack the `Tenant` object is the source and the tenant
@@ -715,7 +736,16 @@ chart the renderer; a brokered deployment (*User-facing changes*) uses it to exp
 - **Backend lacks `Pin`** → the provisioner refuses claims of that class and reports it on
   the claim. There is no capability registry for admission to consult.
 - **Adopted address released provider-side** → `IPAddress` goes `Lost`. It is not
-  reallocated.
+  reallocated. The claim reports `Lost`, and the address keeps its `claimRef` and its
+  entry in `status.addresses` until an admin deletes the `IPAddress` or restores the
+  provider-side reservation; the claim then rebinds.
+- **Service names a claim but the driver cannot serve it** (not `type: LoadBalancer`, or a
+  `loadBalancerClass` the backend ignores) → refused with an event before the hold is
+  released (§5). The address stays held.
+- **Two default classes, or two auto-claim classes** → claims with an empty `className`
+  stay `Pending` with `MultipleDefaultClasses`; auto-claim does nothing and emits a
+  Warning event on the Service. A CRD schema cannot validate uniqueness across objects;
+  Kubernetes treats duplicate default `StorageClass`es the same way.
 - **Namespace with claims deleted while the core is down** → the claim finalizer holds the
   namespace until the core returns, as PVC protection does. No address leaks; the deletion
   waits.
@@ -748,9 +778,10 @@ chart the renderer; a brokered deployment (*User-facing changes*) uses it to exp
 
 Sequencing is open:
 
-1. CRDs, core controller, the MetalLB provisioner, and the admission policy. All exist
-   (*Implementation status*); the policy is the driver's opt-in template. The §5
-   `loadBalancerClass` check and the held-before-minted rule of §6 complete this phase.
+1. CRDs, core controller, the MetalLB provisioner, and the admission policy. The
+   controllers exist; the policy is in an open PR (*Implementation status*). The §5
+   `loadBalancerClass` and serviceability checks and the held-before-minted rule of §6
+   complete this phase.
 2. Gateway as an association target (§5), with `Gateway.spec.addresses` fenced. The
    accepted external-database-exposure proposal puts a tenant's database traffic on the
    tenant Gateway's single address, so this is the consumer tenants meet first. Which
