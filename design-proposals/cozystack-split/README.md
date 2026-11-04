@@ -347,7 +347,8 @@ What a catalog declares so the console shows its applications without a console 
 Enforced from step 0:
 
 - The project maintains the platform, virtualization and services. A new application either joins one of our catalogs or stays in author's own catalog.
-- Application joins our catalog when all of these hold: a maintainer or reviewer takes it in CODEOWNERS, licenses of the application and its operator are acceptable for a CNCF project, it has e2e test, its upstream operator is maintained, and more than one user needs it.
+- A new application starts as a design proposal, and the proposal decides whether it joins our catalogs and which one.
+- Application joins our catalog when all of these hold: a maintainer or reviewer takes it in CODEOWNERS, licenses of the application and its operator are acceptable for a CNCF project, it has tests for what the chart adds on top of the upstream operator, its upstream operator is maintained, and users need it, as the proposal shows.
 - Until step 3 our catalogs live in `cozystack/cozystack`, so accepted application goes into its catalog directory there, under the coupling rule below, and moves together with the catalog later. We don't create interim repository for it.
 - Any other application is published by its author as a catalog from author's own repository and installed through the marketplace. The project does not host such catalogs and has no separate organization for them.
 - Recommended layout for such repository is `PackageSource` with `cozypkg`, the same format our own catalogs use after step 2. The older layout from `cozystack/external-apps-example`, a Git repository with a bootstrap `HelmRelease`, keeps working but is not recommended for new catalogs.
