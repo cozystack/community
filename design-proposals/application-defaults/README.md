@@ -112,7 +112,7 @@ For each field missing from the user spec, copy the installation value. If both 
 | `{a: 2}` (dictionary) | `{a: 1, b: 3}` | `{a: 2}` |
 | permitted `null` | any value | `null` |
 
-Arrays are replaced as whole values, and so are objects without declared properties: typed dictionaries (`additionalProperties`) and free-form objects (`x-kubernetes-preserve-unknown-fields`). Installation defaults do not merge into their elements or entries. For a map of registry mirrors, a pool that declares its own entries receives none of the platform entries. Existing normalization of required, non-nullable null fields remains in place; its ordering is an open question below.
+Arrays are replaced as whole values, and so are objects without declared properties: typed dictionaries (`additionalProperties`) and free-form objects (`x-kubernetes-preserve-unknown-fields`). An object that its schema marks `x-kubernetes-map-type: atomic` is replaced whole as well, which fits fields whose children exclude each other, such as `osImage.builtin` and `osImage.factory` of a worker pool. Installation defaults do not merge into the elements, entries or fields of any of these. For a map of registry mirrors, a pool that declares its own entries receives none of the platform entries. Existing normalization of required, non-nullable null fields remains in place; its ordering is an open question below.
 
 Top-level fields beginning with `_` remain reserved by the existing application API. Nested application data is not subject to that reservation.
 
