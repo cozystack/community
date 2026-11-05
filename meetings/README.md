@@ -87,3 +87,5 @@ For how the meeting is run and how to join the next one, see [community_meeting.
 
 Meetings listed: 72. Recordings available: 62. Where the recording column shows an em dash, the meeting took place but no recording was published — the notes in the shared document remain the record for that date.
 
+Rows for meetings with a recording are added automatically once it appears in the playlist. A meeting that was cancelled, or held without a recording, produces nothing to detect, so its row is added by hand — usually by whoever ran or cancelled the meeting.
+
