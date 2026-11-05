@@ -57,10 +57,8 @@ Kinds are qualified by API group, so the shared short names do not collide. The 
   one point: an exposure entry can name an `IPAddressClaim` instead of minting an address.
   Neither depends on the other.
 - **Related:** `Service.spec.loadBalancerClass` selects the LB implementation for a
-  Service. An `IPAddressClass` names a provisioner, and the provisioner fronts one LB
-  implementation, so the class determines the `loadBalancerClass` a consuming Service
-  must carry (§5). It does so through its provisioner, not through a field of its own
-  (decision 0003). The `ExposureClass` kind proposed with #29 never shipped, and
+  Service. An `IPAddressClass` determines, through its provisioner, the
+  `loadBalancerClass` a consuming Service must carry (§5). The `ExposureClass` kind proposed with #29 never shipped, and
   `network.cozystack.io` does not exist; cozystack/cozystack#3164 and
   cozystack/cozystack#3218 chose `loadBalancerClass`.
 - **Depended on by:** community #45 (`endpoint-attachments`), which attaches one endpoint
@@ -339,11 +337,9 @@ status:
     name: web-lb
 ```
 
-**The class references backend configuration; it does not restate it.** `parameters`
-names objects the backend already has, such as a MetalLB pool, rather than repeating their
-contents. The `loadBalancerClass` is not a class field: the provisioner determines it and
-reports it in `status` (§5). A second copy of either would be one that no component can
-check against the backend (decision 0003).
+**The class references backend configuration.** `parameters` names objects the backend
+already has, such as a MetalLB pool (§7). The provisioner, not the class, determines the
+`loadBalancerClass` and reports it in `status` (§5). Decision 0003 records why.
 
 **`spec.addressName`** is the analogue of `PersistentVolumeClaim.spec.volumeName`: a
 claim names one `IPAddress` instead of taking any address of its class. It applies to
@@ -433,17 +429,13 @@ The driver reads the annotation, looks up a claim of that name in the Service's 
 namespace, resolves it to its address, and writes the backend's pin annotation (§1.2). The
 backend then allocates and announces that address.
 
-**The provisioner determines the `loadBalancerClass`.** A class names a provisioner, and
-the provisioner fronts one LB implementation, so a class implies one `loadBalancerClass`
-value (empty means the cluster default, §1.5). A consuming Service must carry that value.
-A Service whose `loadBalancerClass` selects one implementation while its claim's address
-is held by another asks two backends for one address. The provisioner's holder Services
-(§6) carry the same value. The value is not a field of the class. MetalLB takes it from
-its controller's `--lb-class` flag and records it on no object, so a class field would be
-a copy that nothing can check. A driver deployment fronts one implementation instance, is
-configured with that instance's value, and reports it as `status.loadBalancerClass` on
-every class it serves (decision 0003). The check is specified and not implemented
-(*Implementation status*).
+**The provisioner determines the `loadBalancerClass`.** Each driver deployment fronts one
+LB implementation instance and is configured with that instance's value (empty means the
+cluster default, §1.5). It reports the value as `status.loadBalancerClass` on every class
+it serves (decision 0003). A consuming Service must carry that value. A Service whose
+`loadBalancerClass` selects one implementation while its claim's address is held by
+another asks two backends for one address. The provisioner's holder Services (§6) carry
+the same value. The check is specified and not implemented (*Implementation status*).
 
 The check refuses and never repairs: `loadBalancerClass` is immutable on an existing
 Service. A mismatch is a refused association naming both values. Whoever creates the
@@ -563,8 +555,7 @@ The admin writes both in MetalLB's own terms, and the `IPAddressClass` names the
 is missing, has `autoAssign: true`, or is named by another class, and reports why on the
 class's claims and in an event on the class. Range syntax, `avoidBuggyIPs`,
 `serviceAllocation` and the choice of L2 or BGP are pool and advertisement settings, not
-class parameters. Because the range is described only once, MetalLB's own validation
-catches an overlap with another pool (decision 0003).
+class parameters (decision 0003).
 `autoAssign: false` stops MetalLB from assigning a reserved address automatically. It does
 not stop a Service from naming the pool (`metallb.io/address-pool`) or pinning an address
 (`metallb.io/loadBalancerIPs`); §8 and *Security* cover that.
@@ -796,8 +787,7 @@ chart the renderer; a brokered deployment (*User-facing changes*) uses it to exp
   not deleted with the class.
 - **The class's pool deleted, shrunk, or switched to `autoAssign: true`** → MetalLB
   withdraws assignments outside the remaining range, and the affected addresses go `Lost`.
-  A pool that auto-assigns is refused for new claims and reported on the class (§7). The
-  driver does not repair the admin's pool.
+  A pool that auto-assigns is refused (§7).
 - **`Released` addresses accumulate under `Retain`** → an admin clears `claimRef`. A class
   may set `releaseDelay`: after it elapses the controller clears `claimRef` and the address
   returns to `Available`. An address marked held by an annotation is exempt, which
@@ -880,10 +870,8 @@ of scope. Adoption of objects nobody asked for is also uncharacteristic of Kuber
 PersistentVolume controller does not adopt volumes it did not provision. The need
 underneath, Services that cannot name a claim, is met by auto-claim (§6, decision 0002).
 
-**The class restates the backend's configuration.** As first written, a MetalLB class
-listed its CIDRs for the driver to render into a pool, and carried a `loadBalancerClass`.
-Rejected: two objects then describe one range, and the field duplicates a MetalLB flag no
-object records. Neither copy can be checked against the backend (decision 0003).
+**The class restates the backend's configuration**: CIDRs for the driver to render into
+a MetalLB pool, and a `loadBalancerClass` field. Rejected in decision 0003.
 
 **Wait for upstream.** Rejected: KEP-1880 names an IPAM API a non-goal, and
 `loadBalancerIP` was deprecated with no replacement.
