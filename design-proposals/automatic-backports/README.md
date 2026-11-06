@@ -81,7 +81,7 @@ Batcher has two parts.
 4. open or update one PR per line: originals, conflicts, skipped items with reasons, release notes of originals;
 5. `backport-batch check <line>` fails while some qualifying fix is neither on line nor in open batch PR, it replaces `backport-audit` as patch-cut gate.
 
-Each original lands in batch the way it sits on `main`, as merge commit with PR's own commits inside. For original merged to `main` as M, batcher picks every commit of the PR in order (`git rev-list --reverse --no-merges M^1..M^2`) on top of batch head with `cherry-pick -x`, then adds merge commit: first parent is batch head before the picks, second parent is last pick. Merge commit carries message of M and a trailer naming M. Commits that merged `main` into PR branch are skipped, they bring changes of other PRs. Original merged as single-parent commit (squash) is one plain pick. Batch PR is merged into line with merge commit as today, so on line each PR looks the same as on `main`.
+Each original lands in batch the way it sits on `main`, as merge commit with PR's own commits inside. For original merged to `main` as M, batcher picks every commit of the PR in order (`git rev-list --reverse --topo-order --no-merges M^1..M^2`) on top of batch head with `cherry-pick -x`, then adds merge commit: first parent is batch head before the picks, second parent is last pick. Merge commit carries message of M and a trailer naming M. Commits that merged `main` into PR branch are skipped, they bring changes of other PRs. Original merged as single-parent commit (squash) is one plain pick. Batch PR is merged into line with merge commit as today, so on line each PR looks the same as on `main`.
 
 Picks keep author and `Signed-off-by` of every commit. Reverting one original after batch merged is one command, `git revert -m 1` of its merge commit on line.
 
@@ -154,7 +154,7 @@ Batcher works only with commits already merged to `main`, the same code we revie
 
 ## Testing
 
-- Rules: table tests per rule, plus replay on real merges from v1.6.1 to v1.6.5 window as fixtures: every `feat`, breaking and api/CRD change there must be skipped, fixes picked, overrides respected.
+- Rules: table tests per rule, and where a rule reads history, on real git repos the tests build on disk with synthetic content: every `feat`, breaking and api/CRD change must be skipped, fixes picked, overrides respected. Real history is not a fixture, it was checked by dry run of batcher against live release lines, without pushing.
 - Policy and code stay in sync: rules on policy page are machine-readable block, test fails if code and page differ.
 - Batcher on synthetic git repos: assembly (PR with several commits, PR that merged `main` in, squashed original), presence, `--onto` continuation, `check` exit codes. `fold` and batch PR check have to refuse commit from outside the PR, pick without `-x` and change outside PR's files.
 - Check on original PR: evaluation set of past PRs with known correct type (including mislabeled ones), check has to agree with it before it starts reporting status.
