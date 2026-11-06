@@ -23,6 +23,7 @@ Batch carries each original as merge commit with all PR's commits inside, same a
 ## Why not the alternatives
 
 - One squashed commit per original (`cherry-pick -x -m 1`), the design merged in [cozystack/community#114](https://github.com/cozystack/community/pull/114). It loses authors and sign-offs as above, and line history stops matching `main`. It gives fewer conflicts, see Consequences.
+- Fall back to one squashed pick (`cherry-pick -x -m 1`) only when intermediate commit conflicts, with `Signed-off-by` and `Co-authored-by` of PR's commits collected into its message, raised in review of this record. Author is again whoever merged on `main` and PR's commits lose their own messages: sign-offs and co-authors can be collected, authorship and per-commit history can't. `fold` and batch PR check (`backport-batch verify`) would also have to accept second shape for the same original.
 
 ## Consequences
 
@@ -34,4 +35,4 @@ Batch carries each original as merge commit with all PR's commits inside, same a
 
 ## Revisit if
 
-Conflicts in intermediate commits start deferring originals often enough to delay fixes, while final diff of those PRs would pick cleanly.
+Conflicts in intermediate commits start deferring originals often enough to delay fixes, while final diff of those PRs would pick cleanly. Squashed fallback above is then the alternative to weigh again.
