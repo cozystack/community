@@ -40,7 +40,7 @@ Cilium allow rules are additive. As long as the first two policies select every 
 
 ### The problem
 
-A tenant who attaches a group with `ingress: [{fromApp: web, toPorts: 8080}]` to a database expects that only `web` reaches it, and only on that port. Measured in a real tenant namespace: any other pod of the namespace still reaches the member on every port, and a group with egress rules leaves DNS and the Internet open. The members are correctly labelled; the baseline simply allows everything. The API accepts the group, reports nothing, and protects nothing.
+A tenant who attaches a group with `ingress: [{fromApp: web, toPorts: 8080}]` to a database cannot make only `web` reach it, on that port only. Measured in a real tenant namespace: any other pod of the namespace still reaches the member on every port, and a group with egress rules leaves DNS and the Internet open. The members are correctly labelled; the baseline simply allows everything. This is the documented contract: the field documentation of `ingress` and `egress` in `pkg/apis/sdn/v1alpha1/securitygroup_types.go` states that each rule only adds allowed traffic and that an empty list does not isolate the member pods. A SecurityGroup can widen access today, but it cannot restrict it, and restricting is what tenants need from a firewall object.
 
 The same groups in a namespace without the baseline do restrict, for pods and for KubeVirt VMs alike: the allowed peer passes on its port, other ports and other peers are denied, with a `Policy denied` verdict in the Cilium monitor. The mechanism works; the baseline makes it inert.
 
@@ -176,14 +176,14 @@ Recovery after adding the platform policy took about five minutes and filtering 
 
 ## User-facing changes
 
-- Attaching a SecurityGroup now closes the attached applications to everything their groups do not allow, except platform traffic and the application's own traffic. This is the behaviour the SecurityGroup API documents but does not deliver today.
+- This is a proposed behaviour change. Today the field documentation states that rules only add allowed traffic and do not isolate members, and the implementation does exactly that. With this proposal, attaching a SecurityGroup closes the attached applications to everything their groups do not allow, except platform traffic and the application's own traffic. The field documentation of `ingress` and `egress` in `pkg/apis/sdn/v1alpha1/securitygroup_types.go`, and the generated OpenAPI descriptions, change accordingly.
 - A managed application's egress to the outside cannot be restricted by a group.
 - The SecurityGroup documentation states the limits: egress inside the tenant stays open, `toFQDNs` is not usable on kube-ovn-chained clusters, buckets are not covered, and a Kubernetes cluster's `LoadBalancer` Services are seen on their NodePort.
 - No new API, field or CRD.
 
 ## Upgrade and rollback compatibility
 
-Existing groups start restricting when the tenant chart change reaches a tenant. On clusters where tenants already created groups expecting them to be inert, this is a behaviour change for those tenants: the release notes must say so, and administrators can list existing groups (`kubectl get securitygroups -A`) before upgrading.
+Existing groups start restricting when the tenant chart change reaches a tenant. Groups created under the current, documented additive semantics change meaning: the release notes must say so, and administrators can list existing groups (`kubectl get securitygroups -A`) before upgrading.
 
 No migration is needed: the controller backfills `member` on its first resync, the platform policies are rendered at the next reconciliation of each application, and the tenant chart is reconciled last (Rollout).
 
