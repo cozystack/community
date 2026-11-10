@@ -47,7 +47,7 @@ that run tenant clusters (iaas), which are the ones with MetalLB and kube-ovn.
   `LoadBalancer` Services that remain. The Gateway does not change Part B: the
   Services it serves are created by tenants inside their own clusters.
 - **Out of scope:** VMs (fixed, below), IPv6, UDP, `externalTrafficPolicy:
-  Cluster` in Part B, MetalLB in BGP mode.
+  Cluster` in Part B, announcers other than MetalLB.
 
 All repository paths below refer to `cozystack/cozystack` unless stated
 otherwise.
@@ -297,16 +297,22 @@ table `ip cozy_proxy_l4`, rebuilt atomically on every change:
 - `guard`, on every node: drops new packets to an L4 IP on an undeclared port.
   Without it, such a packet is routed to the gateway and back, since the IP is
   no longer local once Cilium releases it.
-- `translate`, on the node MetalLB elected to announce the IP only: stateful
-  DNAT, with port translation and round-robin, to the **local** ready backends
-  from the EndpointSlices. eTP `Local` is what makes MetalLB pick a node that
-  has one.
-- `masq`, on the same node: masquerades sources that are node IPs only, so that
-  replies to in-cluster clients come back through the announcer's conntrack.
-  Internet and VM clients keep their source.
+- `translate`, on every node that can receive the IP's traffic: stateful DNAT,
+  with port translation and round-robin, to the **local** ready backends from
+  the EndpointSlices. A node translates a port when it is MetalLB's L2
+  announcer for the IP, or when it hosts a ready backend for that port. The
+  second condition is what BGP mode needs: with eTP `Local`, MetalLB advertises
+  the IP from every node with a ready backend, and the routers spread flows
+  across them with ECMP. A node that advertises nothing receives no traffic
+  for the IP, so translating there changes nothing. In L2 mode, eTP `Local` is
+  what makes MetalLB pick an announcer that has a backend; an announcer
+  without one drops the port.
+- `masq`, on the same nodes: masquerades sources that are node IPs only, so
+  that replies to in-cluster clients come back through the translating node's
+  conntrack. Internet and VM clients keep their source.
 
 Inputs: `Service`, `EndpointSlice`, `Node`, and MetalLB's `ServiceL2Status` for
-the announcer. Conntrack entries are purged as kube-proxy does: UDP on endpoint
+the L2 announcer. Conntrack entries are purged as kube-proxy does: UDP on endpoint
 removal, TCP only when the frontend goes away on this node. A DaemonSet restart
 leaves the table in place until the new instance replaces it.
 
@@ -327,7 +333,7 @@ cozy-proxy design document, section 7.1.
 
 - Tenants: the public IP of an opted-in Service becomes reachable from every
   tenant. Under Part A the backend sees the client pod; under Part B it sees
-  the announcer's join-network address (`100.64.x` on kube-ovn).
+  the translating node's join-network address (`100.64.x` on kube-ovn).
 - Admins: a platform switch per Service type for Part A, and
   `l4LoadBalancer.enabled` on cozy-proxy plus the CCM switch for Part B. No new
   CRD or API.
@@ -366,7 +372,7 @@ Part B:
 |---|---|---|
 | Internet | its own IP | `world` |
 | VM with a public IP (VM mode) | the VM's public IP | `world` |
-| pod or node process, any node | the announcer's join IP (`100.64.x`) | `world` |
+| pod or node process, any node | the translating node's join IP (`100.64.x`) | `world` |
 
 - No tenant gains access to another tenant's pods: the client's egress policy is
   unchanged and still sees `world`; only declared ports are translated, every
@@ -390,7 +396,13 @@ Part B:
 - Part B, announcer moved by MetalLB → the new announcer programs the DNAT after
   its `ServiceL2Status` appears; in-flight connections are lost, as with any L2
   failover. Lab: one failed probe out of about 110 at a 0.5 s interval.
-- Part B, no ready local backend on the announcer → the port is dropped, not
+- Part B, BGP mode, a node advertises the IP without translating it → the
+  flows hashed to that node leave untranslated for the default gateway. This
+  happened on a production cluster running MetalLB in L2 and BGP at once,
+  while only the L2 announcer translated: the gateway dropped those flows, and
+  the clients whose flows hashed there could not connect. Translating on every
+  node with a ready backend is the fix (Datapath).
+- Part B, no ready local backend on the L2 announcer → the port is dropped, not
   forwarded.
 - Part B, undeclared port or ICMP to an L4 IP → dropped on every node; no
   routing loop.
@@ -421,6 +433,13 @@ Part B:
   keep-alive.
 - Part B, e2e to add: a cross-tenant connection to a `LoadBalancer` Service
   created inside a tenant cluster.
+- Part B, lab cases to add: MetalLB in BGP mode with backends on two nodes,
+  checking that flows hashed to either node connect; and a VM client of an L4
+  IP hosted on a node that translates it. The lab only covered VM clients on
+  other nodes. On the client's node the VM mode rewrites the VM's source at
+  `raw`, before conntrack, and the L4 mode does not masquerade it, since it is
+  not a node IP; the reply should then match conntrack before the VM mode's
+  `ingress_dnat` at `mangle`. That is the reasoning, not a measurement.
 
 ## Rollout
 
@@ -434,9 +453,9 @@ Each step can be rolled back on its own.
 
 ## Open questions
 
-1. **Part B announcer source.** Phase 1 reads MetalLB L2's `ServiceL2Status`.
-   Should it be behind an interface, and is BGP mode, where every node
-   advertises, required before acceptance?
+1. **Part B announcer source.** The L4 mode reads MetalLB L2's
+   `ServiceL2Status` and, for BGP, the local ready backends (Datapath). Should
+   the announcer source be behind an interface for other implementations?
 2. **Residual SYN-ACK loss under churn** for node-masqueraded clients: accept
    it, or fix it on the OVN side (conntrack timeouts or ACLs) first?
 3. **Admission guard.** Should Cozystack ship a guard on CCM Services, and in
@@ -479,9 +498,13 @@ Each step can be rolled back on its own.
   masqueraded to its node IP by kube-ovn; the backend answers that node
   directly through OVN, outside the announcer's conntrack, and the client gets
   a RST. Observed on the lab.
-- **DNAT on every node plus masquerade.** Breaks VM clients: the VM mode
-  rewrites a VM's source statelessly before conntrack, so the reply is never
-  translated back. Observed on the lab.
+- **DNAT on every node plus masquerade of every source from the pod
+  interface.** Breaks VM clients: the VM mode rewrites a VM's source
+  statelessly before conntrack, and with a masquerade on the VM's own node the
+  reply is de-masqueraded only after the VM mode has already rewritten its
+  destination, so it is never turned back into the VM's pod IP. Observed on
+  the lab. The retained datapath also translates on every node with a ready
+  backend, but masquerades node IPs only, so a VM's source is left alone.
 - **`service.kubernetes.io/service-proxy-name`**, as the VM mode does, instead
   of `service.cilium.io/type: ClusterIP`. Cilium then drops the ClusterIP and
   the NodePort as well, changing in-cluster behavior beyond the public IP.
