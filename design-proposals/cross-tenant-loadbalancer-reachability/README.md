@@ -2,8 +2,6 @@
 
 - **Title:** `Cross-tenant reachability of LoadBalancer public IPs`
 - **Author(s):** `@mattia-eleuteri`
-- **Date:** `2026-10-06`; revised `2026-10-07`
-- **Status:** Draft
 
 ## Overview
 
@@ -21,8 +19,9 @@ The proposal splits the fix by the kind of Service:
   every variant, isp-slim included. Every such application has a route for the
   label except RabbitMQ, which stays as today until one is verified.
 - **Part B, Services of tenant Kubernetes clusters** (kubevirt CCM,
-  selectorless): no policy rule can admit them without opening the NodePort
-  range of every tenant cluster to every tenant. For these only, an opt-in L4
+  selectorless): the shipped Cilium cannot match their backends in a policy,
+  and a single shared rule with static ports would open the NodePort range of
+  every tenant cluster to every tenant. For these only, an opt-in L4
   mode in cozy-proxy takes the public IP over from Cilium, as the VM mode
   already does for VMs. Prototype: cozystack/cozy-proxy#25.
 
@@ -143,15 +142,24 @@ project, as it is from the Internet and as it already is for a VM.
   (all of them but RabbitMQ's, see Part A); Part B opts in the CCM Services of
   case 3 with `externalTrafficPolicy: Local`. What remains broken is listed,
   not implied.
-- No tenant gains access to another tenant's ClusterIPs, to pods that are not
-  backends of an opted-in Service, or to undeclared ports of a tenant cluster.
+- No tenant gains access to another tenant's pods beyond what each part grants:
+  - Part A: the backends of an opted-in Service, on its backend ports, by
+    whatever address reaches them on those ports (public IP, ClusterIP or pod
+    IP). A `toServices` grant cannot tell these apart (Security).
+  - Part B: the public IP of an opted-in Service, on its declared ports only.
+    Its ClusterIP, its backends and the other ports of the tenant cluster stay
+    unreachable.
 - Opt-in is set by the platform only, per Service, with a per-Service rollback.
 - A Service whose owner restricted its sources is not opened by this change.
 - The VM mode is unchanged.
 
 ### Non-goals
 
-- Cross-tenant access through ClusterIPs or service names.
+- Limiting Part A's grant to the public IP. Reaching an opted-in backend by
+  ClusterIP or pod IP on its backend ports is accepted, as it already is for
+  the ancestor ingress rule.
+- Cross-tenant access through ClusterIPs or service names to anything that
+  is not an opted-in backend.
 - Distinguishing tenants among in-cluster clients at the backend.
 - Replacing MetalLB or Cilium for Services that do not opt in.
 - Fixing the ancestor derivation of the existing rule (Context).
@@ -244,10 +252,15 @@ EndpointSlice IPs, which matches pods only with `policy-cidr-match-mode=pods`.
 That value is accepted from Cilium 1.20 (cilium/cilium#45194); Cozystack ships
 1.19.5, whose agent accepts only `nodes`, and Cilium's documentation advises
 against it by default (an identity per pod matched by a CIDR selector). Even
-then the rule is L3 plus static ports, and the backends are the virt-launcher
-pods of whole clusters: one cluster-wide rule would open the NodePort range of
-every tenant cluster to every tenant, including NodePorts no tenant declared as
-LoadBalancer ports. `toEndpoints` on virt-launcher pods has the same exposure.
+then, the backends are the virt-launcher pods of whole clusters and their
+target ports are NodePorts allocated per Service. A single shared rule with
+static ports would have to list the NodePort range, and would open it on every
+tenant cluster to every tenant, including NodePorts no tenant declared as
+LoadBalancer ports. A rule written for one Service keeps that Service's own
+`toPorts` and does not have this exposure; what rules it out today is the
+agent's lack of pod-CIDR matching above. `toEndpoints` on virt-launcher pods
+has no Service to take its ports from, so it has the exposure of the shared
+rule.
 
 #### Opt-in
 
@@ -447,9 +460,12 @@ Each step can be rolled back on its own.
 
 ### For CCM Services
 
-- **`toServices` with `policy-cidr-match-mode=pods`**, or **`toEndpoints` on
-  virt-launcher pods.** Opens the NodePort range of every tenant cluster to
-  every tenant (Part B, Why not a policy rule).
+- **`toServices` with `policy-cidr-match-mode=pods`.** Not accepted by the
+  shipped agent (Cilium 1.19.5). A single shared rule with static ports would
+  open the NodePort range of every tenant cluster to every tenant; a rule per
+  Service keeps its own ports (Part B, Why not a policy rule).
+- **`toEndpoints` on virt-launcher pods.** Has no Service to take its ports
+  from, so it opens the NodePort range like the shared rule.
 - **`exposeMethod: Proxied` everywhere.** Requires every domain to be declared
   on the Kubernetes application beforehand, carries only HTTP and HTTPS, and
   does not cover the `LoadBalancer` Services tenants create themselves.
