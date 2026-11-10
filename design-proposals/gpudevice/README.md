@@ -22,6 +22,8 @@ NVIDIA's vGPU stack changes quickly. Within the last few releases the driver bra
 
 ## Decisions
 
+- [0020. A `GPUClass` toleration has no `tolerationSeconds`](./decisions/0020-a-gpuclass-toleration-has-no-tolerationseconds.md), proposed
+- [0019. GPU usage carries the class a VM was admitted with, so classes may share a resource name](./decisions/0019-gpu-usage-names-the-admitted-class.md), proposed
 - [0018. A vGPU license reaches each VM as a Secret volume, copied only into entitled namespaces](./decisions/0018-a-vgpu-license-reaches-each-vm-as-a-secret-volume.md)
 - [0017. The vGPU entitlement is a Tenant flag stamped on the namespace, not a budget key](./decisions/0017-the-vgpu-entitlement-is-a-tenant-flag.md)
 - [0016. Holding a GPU for a stopped VM is step 2, and stays GPU-specific until DRA can carry it](./decisions/0016-holding-is-step-2-and-stays-gpu-specific.md)
