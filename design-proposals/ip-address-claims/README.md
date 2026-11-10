@@ -629,9 +629,10 @@ double-assign a reserved EIP. The provider enforces the separation, which is why
   tenant chart does not yet.
 - **Metering follows the claim.** A held address is held whether or not a Service wears
   it, and a placeholder in the driver's namespace belongs to no tenant workload. A platform
-  that meters LoadBalancer Services meters the wrong object once addresses are claims. The
-  `IPAddress` ledger is the unit of accounting: `claimRef` says whose, the conditions say
-  since when.
+  that meters LoadBalancer Services meters the wrong object once addresses are claims. A
+  platform that bills addresses bills claims, as storage bills `PersistentVolumeClaim`s.
+  The `IPAddress` ledger is the record behind the bill: `claimRef` says whose, the
+  conditions say since when.
 
 ## Upgrade and rollback compatibility
 
