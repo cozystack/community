@@ -82,8 +82,6 @@ nodeRemediation:
   bmc:
     agent: fence_redfish      # fence_redfish | fence_ipmilan
     credentialsSecretName: bmc-credentials  # required, in cozy-node-remediation-bmc
-    parameters:                # connection options for all nodes, allow-listed
-      --ssl-insecure: ""
     nodes:
       node1:
         address: 192.0.2.11
@@ -93,6 +91,8 @@ nodeRemediation:
         parameters:            # per-node fence agent parameters
           --systems-uri: /redfish/v1/Systems/1
 ```
+
+The example leaves TLS verification on: without it, anything that answers on the BMC address can reply to the fence call.
 
 The rules below exist because FAR passes Secret keys and parameters to the fence agent almost unchecked, and one wrong key can release a running node:
 
