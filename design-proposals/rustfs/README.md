@@ -118,7 +118,7 @@ Purely additive and opt-in. Removing the module deletes its `HelmRelease` and, p
 
 ## Open questions
 
-1. **`Bucket` integration.** `Bucket` is built on COSI. We found no RustFS COSI driver. Options: (a) write a COSI driver (RustFS exposes an S3-compatible API and IAM-style admin API; its fitness for a driver needs to be checked); (b) a small Cozystack-side controller that creates the bucket and a scoped key directly; (c) leave RustFS as a raw S3 endpoint only. Which would maintainers accept?
+1. **`Bucket` integration.** `Bucket` is built on COSI. We found no RustFS COSI driver. Options: (a) write a COSI driver (RustFS documents IAM and bucket policies, but we have not verified that it offers an API to create scoped access keys per bucket, which a driver needs; this must be checked first); (b) a small Cozystack-side controller that creates the bucket and a scoped key directly; (c) leave RustFS as a raw S3 endpoint only. Which would maintainers accept?
 2. **Default or optional?** Should this stay opt-in indefinitely, or become a default package once mature?
 3. **Maturity gate.** What is the bar for shipping a third-party store the project must patch and support: a release age, a security audit, a CNCF-sandbox-or-similar status?
 4. **Image policy.** Mirror upstream's image, or build from source like SeaweedFS?
@@ -129,6 +129,6 @@ Purely additive and opt-in. Removing the module deletes its `HelmRelease` and, p
 
 - **Do nothing, use SeaweedFS only.** Simplest for the project, but ignores the request and keeps the multi-component footprint for small installs.
 - **Run RustFS outside Cozystack and consume it as an external S3.** Works today, but is not managed, monitored or tenant-isolated by the platform.
-- **MinIO.** Same architectural shape, but the community edition has moved to maintenance/source-only distribution, so it is a poor dependency for a platform. (Maintainers should correct this if they have better information.)
+- **MinIO.** Same architectural shape, but the `minio/minio` repository is archived and its README states it is no longer maintained, pointing to the commercial AIStor editions; the last release is from October 2025. The community code is AGPL-3.0 and unmaintained, so it is a poor new dependency for a platform.
 - **Rook-Ceph RGW.** Mature S3, but requires a Ceph cluster, far heavier than the use case here.
 - **Replace SeaweedFS with RustFS.** Out of scope: different workload profile, no COSI driver, and a breaking change for every existing `Bucket`.
