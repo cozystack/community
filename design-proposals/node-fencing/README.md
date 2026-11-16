@@ -2,8 +2,6 @@
 
 - **Title:** `Node fencing and remediation for the Cozystack management cluster`
 - **Author(s):** `@lexfrei`
-- **Date:** `2026-10-14`
-- **Status:** Review
 
 ## Overview
 
@@ -15,9 +13,7 @@ The proof needs a BMC that answers. That covers a hung OS, a kernel panic, a fai
 
 ## Scope and related proposals
 
-- [GPUDevice](../gpudevice/README.md) moves a dead node's attached devices to `Lost` after its grace period and rebinds them once KubeVirt fails the VMIs. When the VMIs fail before that, it can move the devices as the next VMIs are created. Fencing is what makes KubeVirt fail them without manual action.
-- [GPU virtual machines](../vgpu-vms/README.md) states that a GPU VM on a failed node often does not come back by itself and points to this proposal for fencing.
-- The GPUDevice and GPU virtual machines proposals are proposed in parallel. This proposal lands together with them or after them; until then the two links above do not resolve.
+- In its step 2, which adds GPU claims and their placement, [`gpudevice`](../gpudevice/README.md) moves a dead node's attached claims to `Lost` after its grace period; it rebinds the ordered ones once KubeVirt fails the VMIs, while a template claim goes with its VMI. When the VMIs fail before that, it can move the ordered claims as the next VMIs are created. Fencing is what makes KubeVirt fail them without manual action.
 - In scope: nodes of the Cozystack cluster itself, both Talos and generic Linux (k3s, kubeadm).
 - Out of scope: worker nodes of tenant Kubernetes clusters, which have their own Cluster API MachineHealthCheck (section 5), and workers on other substrates, such as Proxmox nodes.
 
@@ -42,7 +38,7 @@ The proof needs a BMC that answers. That covers a hung OS, a kernel panic, a fai
 
 ## Goals
 
-- A VM with `runStrategy: Always` or `RerunOnFailure` on a node that died starts again on a healthy node without manual action, once the hoster has enabled the package, as long as the node's BMC still answers and, for a VM with GPUDevice references, GPUDevice can place its devices on a `Ready` node with room when the VM restarts. A `Stay` device on a cordoned node is an exception (section 3).
+- A VM with `runStrategy: Always` or `RerunOnFailure` on a node that died starts again on a healthy node without manual action, once the hoster has enabled the package, as long as the node's BMC still answers and, for a VM with class or claim entries, `gpudevice` can place its claims on a `Ready` node with room when the VM restarts. A claim of a `Stay` class on a cordoned node is an exception (section 3).
 - This package releases nothing from a node before the BMC confirms a power action on it. Without confirmation, the alert stays and the manual procedure applies. The HA Controller keeps its existing per-volume behaviour (section 4).
 - A network partition, or a failure of several nodes at once, does not trigger a fencing storm beyond the `minHealthy` bounds of section 2.
 - A fenced node stays powered off until a person powers it on; once it is `Ready` again, it rejoins without manual untainting.
@@ -120,10 +116,10 @@ A pause, set with `paused: true`, adds a pause request to both NHCs and stops ne
 3. After `unhealthyAfter`, NHC checks `minHealthy` and creates a remediation CR for the node.
 4. FAR powers the node off through its BMC.
 5. FAR sets `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute`; Kubernetes force-deletes the node's remaining pods and detaches their volumes.
-6. KubeVirt fails each VMI as soon as its pod is gone, and `runStrategy` decides what comes next. The next VMI of a VM with GPUDevice references also needs its devices, and GPUDevice's rules for a dead node decide where and when it gets them; section 5 covers pool workers. When the fence comes before GPUDevice's grace period for a `NotReady` node, GPUDevice gathers the devices the VM names in `device` entries onto another node with room, as GPUDevice's gather rule allows, and the VM starts there. A device of a `Stay` class on a cordoned dead node can keep the new VMI on that node until the grace period ends, after which a `RerunOnFailure` VM can stay stopped; GPUDevice's section 3 has the exact conditions. Template devices, devices already `Lost` and the case of no node with room follow GPUDevice's rules.
+6. KubeVirt fails each VMI as soon as its pod is gone, and `runStrategy` decides what comes next. The next VMI of a VM with class or claim entries also needs its claims, and `gpudevice`'s rules for a dead node decide where and when it gets them; section 5 covers pool workers. When the fence comes before `gpudevice`'s grace period for a `NotReady` node, `gpudevice` gathers the claims the VM names in `claim` entries onto another node with room, as `gpudevice`'s gather rule allows, and the VM starts there. A claim of a `Stay` class on a cordoned dead node can keep the new VMI on that node until the grace period ends, after which a `RerunOnFailure` VM can stay stopped; `gpudevice`'s section 9 and its "Failure and edge cases" have the exact conditions. Template claims, claims already `Lost` and the case of no node with room follow `gpudevice`'s rules.
 7. When a person powers the node on and it is `Ready` again, NHC deletes the remediation CR and FAR removes its taints.
 
-With defaults, a VM runs elsewhere roughly six to eight minutes after the failure when the BMC answers on the first try. A VM with GPUDevice references can take longer in the cases step 6 leaves to GPUDevice.
+With defaults, a VM runs elsewhere roughly six to eight minutes after the failure when the BMC answers on the first try. A VM with class or claim entries can take longer in the cases step 6 leaves to `gpudevice`.
 
 ### 4. Proof that a node is dead
 
@@ -148,7 +144,7 @@ Kubernetes `NotReady` alone is not proof: a node that lost its network to the co
 
 ### 5. Interaction with tenant clusters
 
-A tenant worker from a `KubernetesNodes` pool on the KubeVirt provider is a VM on the management cluster. When its host dies, fencing restarts the VM elsewhere, and its system disk survives when it is on `replicated`. Independently, the tenant's MachineHealthCheck replaces a worker whose node stays `Ready=Unknown` for `readyUnknownTimeout`, with a fresh disk. With default settings MHC fires first in a pool of more than one worker, which discards worker-local state such as local-path volumes; a tenant who keeps such state raises `readyUnknownTimeout` above `unhealthyAfter` plus the fence and boot time. For a Kairos GPU worker from a `deviceSelector` pool, both the VM that fencing restarts and an early MHC replacement get a GPU only from a spare device of the pool on a healthy node: the dead worker's device serves no new worker before GPUDevice's own grace period for a `NotReady` node has passed and the old VMI has failed or been removed. A worker from a `deviceTemplate` pool gets a new device instead, as GPUDevice describes. Medik8s is not installed inside tenant clusters.
+A tenant worker from a `KubernetesNodes` pool on the KubeVirt provider is a VM on the management cluster. When its host dies, fencing restarts the VM elsewhere, and its system disk survives when it is on `replicated`. Independently, the tenant's MachineHealthCheck replaces a worker whose node stays `Ready=Unknown` for `readyUnknownTimeout`, with a fresh disk. With default settings MHC fires first in a pool of more than one worker, which discards worker-local state such as local-path volumes; a tenant who keeps such state raises `readyUnknownTimeout` above `unhealthyAfter` plus the fence and boot time. For a Kairos GPU worker from a `claimSelector` pool, both the VM that fencing restarts and an early MHC replacement get a GPU only from a spare claim of the pool on a healthy node: the dead worker's claim serves no new worker before `gpudevice`'s own grace period for a `NotReady` node has passed and the old VMI has failed or been removed. A worker from a pool on class entries gets a new template claim instead, as `gpudevice` describes. Medik8s is not installed inside tenant clusters.
 
 ### 6. Manual procedure
 
