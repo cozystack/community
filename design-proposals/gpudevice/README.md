@@ -13,10 +13,10 @@ NVIDIA's vGPU stack changes quickly. Within the last few releases the driver bra
 
 ## Scope and related proposals
 
-- [vGPU licensing for virtual machines](../vgpu-vms/README.md) (`vgpu-vms`) builds on the license delivery of section 6: who the licensee is, how a guest image applies the license, how a guest reaches the license server, how license use maps to tenants, and rotation and revocation. The link resolves once it merges.
+- [vGPU licensing for virtual machines](../vgpu-vms/README.md) (`vgpu-vms`) builds on the license delivery of section 6: who the licensee is, how a guest image applies the license, how a guest reaches the license server, how license use maps to tenants, and rotation and revocation.
 - [Kairos tenant worker pools](https://github.com/cozystack/community/pull/115) (cozystack/community#115) is where worker pools on Kairos are proposed. A Kairos GPU pool takes GPUs through class entries, and through `claimSelector` once step 2 ships, under the rules of section 4 for pools on another worker OS, and its worker image follows the `GPULICENSE` contract of section 6.
 - [Tenant quotas as reservation limits](https://github.com/cozystack/community/pull/48) makes declared sizes the quota authority and refuses an application that does not fit its pool when it is written. GPU budgets are ordinary keys of that gate (section 5). Until it ships, an interim check does the same for GPU keys only.
-- [Node fencing](../node-fencing/README.md), proposed alongside this one, adds an optional package that fences a dead node through its BMC and taints it `out-of-service`, so KubeVirt fails its VMIs and step 2 rebinds their `Lost` claims. The link resolves once it merges.
+- [Node fencing](../node-fencing/README.md), proposed alongside this one, adds an optional package that fences a dead node through its BMC and taints it `out-of-service`, so KubeVirt fails its VMIs and step 2 rebinds their `Lost` claims.
 - [IP addresses as a first-class resource](https://github.com/cozystack/community/pull/35) solves a similar problem for addresses with a class, a tenant claim and a backend contract.
 - Host-side discovery of vGPU VFs grouped by profile is [NVIDIA/kubevirt-gpu-device-plugin#192](https://github.com/NVIDIA/kubevirt-gpu-device-plugin/pull/192), still open. Section 2 ships it downstream in the host layer, behind a boundary the rest of the design does not cross.
 
