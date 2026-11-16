@@ -22,15 +22,11 @@ An application kind counts as converted once its ApplicationDefinition declares 
 
 ## Decisions
 
-<!-- Leave this empty in the initial PR; fill it in as implementation
-proceeds. Records live in this proposal's own directory, numbered from
-0001. Link each one here, newest first:
+- [0001. The finish step is a migration-created, least-privilege Job, not a chart-rendered cluster-admin one](./decisions/0001-the-finish-job-is-migration-created-under-least-privilege.md) — the Postgres conversion's finish Job is created by the migration under a scoped role, not rendered by the platform chart under cluster-admin.
 
-- [0001. Short statement of what was decided](./decisions/0001-short-slug.md) — one clause on what it settled.
-
-Where implementation changed the design, the record is what explains why
-— this section is how a reader of the proposal finds that out.
-See ../README.md#decision-records. -->
+<!-- Records live in this proposal's own directory, numbered from 0001.
+Link each one above, newest first. Where implementation changed the design,
+the record is what explains why. See ../README.md#decision-records. -->
 
 ## Context
 
