@@ -82,7 +82,7 @@ initialize "admin" {
 }
 ```
 
-OpenBAO runs this once, on the first start, with a temporary root token that it revokes afterwards. The `<release>-admin` Secret is shown in the app's secrets tab, like the credentials of other apps.
+OpenBAO runs this once, on the first start, with a temporary root token that it revokes afterwards. The `<release>-admin` Secret is shown in the app's secrets tab, like the credentials of other apps. If it is missing from an existing bootstrap release, rendering fails instead of generating another password: `initialize` does not update credentials in initialized storage.
 
 ## User-facing changes
 
@@ -97,17 +97,17 @@ The default is off, existing releases render the same. OpenBAO runs `initialize`
 - The seal key and the admin password live in Secrets of the tenant namespace. Whoever can read them can unseal the data and log in, including cluster admins. This is the trust model of the static seal today, now explicit.
 - The root token exists only inside the server during initialization.
 - The chart enables no audit device with `log_raw` and does not set `TRACE`, at `TRACE` OpenBAO logs request bodies, the password included.
-- Until TLS lands, the form warns that `external: true` sends the login in plain text.
+- Until TLS lands, bootstrap rejects `external: true`; a warning does not protect credentials sent over HTTP. Internal HTTP access still requires a trusted tenant network.
 
 ## Failure and edge cases
 
-- Initialization stops halfway. OpenBAO stops at the failed request and logs it. If that happens before the admin user exists, nobody can log in, there is no root token and there are no recovery keys. There is no data yet either, so the documented fix is to delete the instance PVC and let it start again. The e2e test covers this order.
+- Initialization stops halfway. Preserve the PVC and both Secrets and report the failed step; do not automatically delete storage or repeat init. Recovery from failure before the admin user exists is an implementation gate, because there may be no usable login or recovery keys.
 - The key Secret is deleted. The instance stays sealed after the next restart and the chart refuses to make a new key.
-- A backup is restored into a new instance. It needs the original key Secret.
+- A backup is restored into a new instance. Before starting it, restore the original seal Secret and the admin Secret matching the credentials in that backup. Initialized storage keeps the source password hash and skips `initialize`; a newly generated admin password cannot log in. If the password was rotated after the backup, use the matching saved credential or a separately verified authentication-recovery path. Preserve both Secrets with the backup recovery material under restricted access.
 
 ## Testing
 
-`hack/e2e-apps/openbao.bats` gets a bootstrap case. The app becomes Ready without a manual init, the password from `<release>-admin` logs in, a KV secret is written and read, the pod is restarted, it unseals by itself and the login still works. Negative cases cover bootstrap without a static seal, bootstrap with `replicas` above 1, and an existing Shamir instance rendering unchanged.
+`hack/e2e-apps/openbao.bats` gets a bootstrap case. The app becomes Ready without a manual init, the password from `<release>-admin` logs in, a KV secret is written and read, the pod is restarted, it unseals by itself and the login still works. Negative cases cover bootstrap without a static seal, bootstrap with `replicas` above 1, external access without TLS, a missing admin Secret on an existing release, and an existing Shamir instance rendering unchanged. A restore test writes a KV secret, backs up the data, restores it with the matching seal and admin Secrets into a fresh instance, then verifies login and the original value. A mismatched admin password must fail authentication; it must not trigger reinitialization or storage deletion.
 
 ## Open questions
 
