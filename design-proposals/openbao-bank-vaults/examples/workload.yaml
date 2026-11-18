@@ -47,6 +47,8 @@ spec:
         # Explicit entrypoint avoids relying on registry image metadata inspection.
         command: [/app/server]
         env:
+        # To pin an already tracked reference, stop Reloader, change it, then restart
+        # with an empty cache; manual rollout after baseline handles missed changes.
         - name: API_KEY
           value: vault:secret/data/demo/api#API_KEY
         ports:

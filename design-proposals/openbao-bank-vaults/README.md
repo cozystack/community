@@ -151,9 +151,13 @@ Independent external key store (optional):
 
 The webhook and Reloader run against the workload cluster API. Install one scoped
 webhook per cluster, not a cluster-wide webhook for every OpenBao application.
-The server can stay in the management cluster or be external. Reloader 0.5.1 has one
-configured server/namespace per process; separate trust domains require separately
-scoped instances or a later multi-instance design, not one root-wide reader.
+The server can stay in the management cluster or be external. The initial reload
+profile permits one Reloader instance and one OpenBao server/namespace per workload
+cluster. All opted-in workloads must use that pair: v0.5.1 groups references by path
+and does not filter by server or OpenBao namespace. Multiple independent readers in
+one cluster are outside this profile, even with namespace-scoped update permissions.
+Use separate workload clusters or manual rollouts for other trust domains; a broader
+profile needs enforceable per-instance selection and collision tests before support.
 
 Prefer independent opt-ins:
 
@@ -176,8 +180,14 @@ Start with a one-replica supported profile; gate HA behind tests.
 For existing-data mode, the proposed existingClaimRef binds a platform-approved restore
 to a PVC name and UID in the application namespace. Before creating the Vault CR,
 verify the claim matches the rendered StatefulSet claim name, is Bound, has the expected
-UID and contains the approved restored data. Reject absent/mismatched claims; do not
-fall back to dynamic provisioning. The stock operator does not implement this guard.
+UID and contains the approved restored data. Reject absent/mismatched claims; a newly
+provisioned same-named PVC is not an approved restore. This precheck alone is insufficient. The proposed
+platform integration must also use fail-closed Pod CREATE admission to read the current
+claim UID and reject absent, deleting or mismatched claims with ClaimIdentityMismatch.
+Protect the approved claim from deletion while the instance is active; otherwise a
+check followed by deletion is still a race. Only platform automation may approve a new
+restore identity or deactivate that protection. The stock operator supplies neither
+control; existing-data support remains gated on their implementation and race tests.
 Also disable runtime init: the reference appends --init=false to the unsealer args.
 This protects against reinitialization if a claim is later replaced, but cannot identify
 the correct restored dataset. Restore provenance and matching keys remain separate checks.
@@ -223,12 +233,16 @@ Provision an OpenBao namespace team-a, a KV v2 engine secret/, and a workload-cl
 auth mount. Bind demo-api-read to only ServiceAccount demo-api in namespace demo-app.
 For Kubernetes auth, configure the correct remote API/CA and TokenReview identity
 with reviewed permissions. Do not grant TokenReview to every application by default.
-The example application config is a fragment: auth connection setup and configurer
-credentials must already exist. Stock Bank-Vaults 1.33.2 configure retrieves a stored
-root token or generates one from shares; it cannot use only a namespace-scoped token.
-Treat it as privileged platform automation. A scoped API applier requires a separate
-implementation and permission review (see the examples guide); it is not supplied here.
-Never use an unsealer role as an application role.
+The application fragment is input data for the explicit API provisioning sequence in
+the examples guide, not a complete stock configure invocation. Preserve the existing
+auth connection by writing only named roles; stock configure with missing auth.config
+would derive and write the configurer cluster's Kubernetes endpoint. Verify secret/ is
+unused or KV v2 before provisioning; converting a populated KV v1 mount is a migration.
+Stock configure needs privileged credentials. Its shares-only branch cannot generate
+a root token in team-a; acquire credentials in root separately from namespaced writes.
+The reference CR has no externalConfig/configurer, and a separate configurer would
+need its own authentication, CA and namespace wiring. Never reuse the unsealer role
+for application provisioning. A packaged scoped API applier is not implemented here.
 
 Application env contains vault:secret/data/demo/api#API_KEY. A fresh Pod resolves it
 at startup; the secret value is not placed in the Deployment or an application Secret
@@ -240,7 +254,8 @@ For Reloader 0.5.1, verified in source:
 - Explicit spec.template.metadata.annotations opt-in is required.
 - Deployment, StatefulSet and DaemonSet are supported; arbitrary resources/Jobs are not.
 - Unversioned references in container/init-container env and supported from-path
-  annotations are collected; a pinned #version intentionally opts out of latest-version reload.
+  annotations are collected. A pinned #version on a fresh workload is not tracked;
+  changing an already tracked reference to pinned needs the cache reset below.
 - It polls KV data and reads metadata.version from that response. It receives the
   secret values too: a metadata-only ACL is insufficient for this implementation.
 - It uses Kubernetes Get/Update to change secret-reload-count in the Pod template.
@@ -250,10 +265,13 @@ For Reloader 0.5.1, verified in source:
 - Discovery uses cluster-wide get/list/watch on Deployments, StatefulSets and DaemonSets.
   Namespace-only RoleBindings cannot support its informers. Grant update only in approved
   namespaces and CA Secret get separately; if cluster-wide reads are unacceptable, disable reload.
-- After downtime, the first observed KV version becomes the baseline without a rollout.
-  Manually roll consumers if their secrets changed while Reloader was stopped.
-- Removing opt-in does not clear existing cached associations in v0.5.1. Stop all relevant
-  Reloader instances, remove opt-in, and restart with empty caches to disable tracking.
+- On initial startup and after downtime, the first observed KV version becomes the
+  baseline without a rollout. If a Pod started with v1 and the secret reached v2 before
+  that poll, the Pod can keep v1. Establish the baseline, then manually roll affected
+  consumers and verify they received the intended version; coordinate secret changes.
+- Removing opt-in, or pinning/removing the last unversioned reference, can leave cached
+  associations in v0.5.1. Stop Reloader, change the workload, and restart with an empty
+  cache. Recover changes missed during that stop using the baseline/manual-rollout step.
 - Flux/Helm drift handling must preserve or ignore only the controller-owned reload-count
   annotation, not all workload drift. Include this in integration tests.
 
@@ -307,6 +325,12 @@ ownership, preserve storage before Helm deletion, then transfer workload ownersh
 Names, service selectors, TLS SANs, auth addresses and backup jobs must all be reconciled.
 For file → Raft, require an independently tested storage migration, not volume reuse.
 Rollback after writes to the target needs a data plan, not just a Git revert.
+For audit configuration, inspect the restored audit inventory before adding a declared
+device. The example uses cozystack-stdout/ rather than the common API-created file/.
+Restore in isolation with the source-compatible audit configuration first; keep existing
+sinks working. Choose a different declared path if cozystack-stdout/ is already occupied.
+After applying it, verify readiness and a synthetic request record on stdout before
+retiring an old sink. Never blindly delete an audit device to resolve a name collision.
 
 Raft snapshots are created by OpenBao, scheduled/uploaded by a separate integration.
 Use Cozystack bucket/credential abstractions, restricted policies, read-back integrity
@@ -383,16 +407,25 @@ Required acceptance tests:
 2. Fresh install and interrupted bootstrap recover without losing keys or reinitializing data.
 3. Restart/unseal and wrong CA/audience/subject/role/path; unavailable external key store.
    Existing-data mode: restored data unseals; missing/mismatched PVC fails the restore guard;
-   empty replacement storage with absent shares stays uninitialized. Inspect effective argv.
+   PVC deletion while active is denied. If a same-named replacement appears after
+   precheck, Pod admission rejects its different UID with ClaimIdentityMismatch.
+   Empty replacement storage with absent shares stays uninitialized. Inspect effective argv.
    A sealed process stays alive but unready while the key store is unavailable.
 4. TLS leaf/CA renewal, actual served certificate and auth after controlled restart/reload.
 5. Git change to auth/policy reaches OpenBao; reconcile failures are visible and retryable.
+   Role-only provisioning preserves the remote auth connection; KV v1 preflight rejects
+   implicit conversion. Namespace configuration does not invoke namespaced generate-root.
 6. Injection works without storing application values in Kubernetes; denied paths fail closed.
-7. A synthetic KV update rolls only opted-in consumers; pinned versions remain unchanged.
+7. A synthetic KV update rolls only opted-in consumers; consumers with only pinned
+   references do not reload after the required cache reset.
    Test denied update, temporary API failure and Flux reconciliation. Verify manual rollout
-   after a KV change during Reloader downtime, and opt-out with cache reset.
+   after a KV change during downtime and before the first startup poll. For already
+   tracked workloads, pin/remove the last unversioned reference or opt out, reset cache,
+   update KV, and verify reload-count is unchanged. Reject mixed-server/namespace opt-in.
 8. One-replica limits and rollout downtime documented; HA quorum tests before advertising HA.
 9. Snapshot read-back and isolated restore with the original keys, including namespaces/auth.
+   Include an existing API-created file/ audit device; retain it, select an unused declared
+   path, and verify readiness plus stdout audit output on the target OpenBao version.
 10. Delete/upgrade/migration explicitly verify storage and key retention; no accidental prune.
 
 ## Rollout

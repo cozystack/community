@@ -45,16 +45,17 @@ spec:
           audience: external-openbao-unseal
           expirationSeconds: 600
           path: token
-  # combine-ca snapshots projected trust into emptyDir. For CA rotation, stage old
-  # and new CAs, replace the Pod, verify external login/unseal, then retire old trust.
-  # Restarting the sidecar alone does not rebuild this bundle.
+  # combine-ca snapshots projected trust into emptyDir. CA rotation needs two Pod
+  # replacements: load overlapping trust, then remove old trust after verifying the
+  # external server's NEW chain. See README.md; a sidecar restart is insufficient.
   vaultInitContainers:
   - name: combine-ca
     image: quay.io/openbao/openbao:2.7.2@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f
     command:
     - /bin/sh
     - -ec
-    - cat /trusted-ca/local.crt /trusted-ca/external.crt > /ca-bundle/ca.crt
+    - |-
+      { cat /trusted-ca/local.crt; printf '\n'; cat /trusted-ca/external.crt; } > /ca-bundle/ca.crt
     volumeMounts:
     - name: trusted-ca
       mountPath: /trusted-ca
@@ -99,7 +100,8 @@ spec:
     - bao
     args:
     - -config=/vault/config/vault.json
-    # Alive while sealed/uninitialized; leave readiness strict so no traffic is served.
+    # Alive while sealed/uninitialized; readiness excludes it from the main Service.
+    # Per-Pod Service may publish not-ready addresses; readiness is not network ACL.
     livenessProbe:
       httpGet:
         scheme: HTTPS
@@ -133,9 +135,11 @@ spec:
     api_addr: https://openbao-main.tenant-openbao.svc.cluster.local:8200
     cluster_addr: https://${.Env.POD_NAME}:8201
     ui: true
+    # Reserve an unused audit path in restored data; see the staged restore procedure.
+    # Never collide with or blindly remove an existing API-managed audit device.
     audit:
     - file:
-        file:
+        cozystack-stdout:
           description: OpenBao request audit
           options:
             file_path: stdout

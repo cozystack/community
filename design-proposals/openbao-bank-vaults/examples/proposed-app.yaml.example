@@ -24,7 +24,8 @@ spec:
   bootstrap:                         # PROPOSED here, not community#134's API
     mode: existing
     # PROPOSED: platform-approved restored claim in this application namespace.
-    # Resolve to the rendered StatefulSet claim identity and validate UID before start.
+    # Proposed fail-closed Pod admission rechecks UID; guarded PVC deletion is denied
+    # while active. These controls are implementation gates, not stock operator features.
     existingClaimRef:
       name: raft-REPLACE_WITH_RENDERED_STATEFULSET_NAME-0
       uid: REPLACE_WITH_RESTORED_PVC_UID

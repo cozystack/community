@@ -1,12 +1,13 @@
-# Bank-Vaults external configuration FRAGMENT, applied to OpenBao namespace team-a.
-# The namespace and kubernetes-workloads auth connection must already be configured.
-# Supply actual cluster CA/API, reviewed TokenReview identity and audience separately.
-# This file is configuration data, not a Kubernetes resource.
-# Stock Bank-Vaults 1.33.2 configure requires stored root credentials or shares to
-# generate a root token; a namespace-scoped token alone is NOT supported.
-# Only platform automation may run it. No credentials are included here.
-# A least-privilege API applier is a separate implementation gate; see README.md.
+# Bank-Vaults-format configuration DATA for OpenBao namespace team-a; not an installer.
+# Use the explicit API provisioning sequence in README.md for this reference.
+# Do not pass this incomplete fragment to stock configure or attach as externalConfig:
+# missing auth.config would overwrite the intended Kubernetes auth connection.
+# Stock configure cannot use only a namespace-scoped token. Its shares-only branch
+# also cannot generate a root token with VAULT_NAMESPACE=team-a; acquire credentials
+# in root separately from namespace-targeted configuration. No credentials included.
 secrets:
+# Require an unused path or an existing KV v2 mount. Never implicitly upgrade KV v1;
+# use a different mount and update references, or plan an explicit client migration.
 - path: secret
   type: kv
   options:
@@ -19,6 +20,8 @@ policies:
   rules: |
     path "secret/data/demo/api" { capabilities = ["read"] }
 auth:
+# Apply roles only via auth/kubernetes-workloads/role/<name>; do not write /config.
+# For stock configure, first supply ALL intended auth.config connection settings.
 - type: kubernetes
   path: kubernetes-workloads
   roles:

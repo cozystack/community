@@ -14,6 +14,8 @@ collectorSyncPeriod: 30s
 reloaderRunPeriod: 1m
 env:
   VAULT_ADDR: https://secrets.example.org:8200
+  # Single server/namespace for ALL opted-in workloads in this Kubernetes cluster.
+  # v0.5.1 groups by path alone; mixed servers/namespaces are outside this profile.
   VAULT_NAMESPACE: team-a
   VAULT_AUTH_METHOD: kubernetes
   VAULT_PATH: kubernetes-workloads
