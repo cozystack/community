@@ -105,7 +105,6 @@ Cozystack's existing deployment paths.
 The [examples guide](./examples/README.md) maps each configuration to its owner and
 prerequisites. Real existing APIs and proposed Cozystack fields are kept separate.
 
-
 ### Components
 
 | Component | Capability | Proposed scope |
@@ -134,6 +133,7 @@ Sources: [Bank-Vaults configuration](https://bank-vaults.dev/docs/concepts/exter
 
 ### Placement
 
+```text
 Management Kubernetes cluster:
   Cozystack OpenBAO app → optional Bank-Vaults backend → Vault CR
   platform Vault Operator → OpenBao + unsealer + optional configurer
@@ -147,6 +147,7 @@ Workload Kubernetes cluster (same cluster OR a separate tenant cluster):
 Independent external key store (optional):
   primary unsealer ServiceAccount JWT → external OpenBao root JWT auth
   → selected child-namespace KV shares → primary local /sys/unseal
+```
 
 The webhook and Reloader run against the workload cluster API. Install one scoped
 webhook per cluster, not a cluster-wide webhook for every OpenBao application.
@@ -155,6 +156,7 @@ configured server/namespace per process; separate trust domains require separate
 scoped instances or a later multi-instance design, not one root-wide reader.
 
 Prefer independent opt-ins:
+
 1. Client integration with the existing managed/external OpenBao.
 2. Experimental reload for explicitly opted-in workloads.
 3. Server backend only where operator lifecycle/configuration offers enough benefit.
@@ -244,7 +246,7 @@ Sources: [Reloader v0.5.1 README](https://github.com/bank-vaults/vault-secrets-r
 [collector](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/collector.go),
 [Vault reader](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/vault.go).
 
-#### Upstream OpenBao fix contributed by this reference deployment
+#### Upstream OpenBao compatibility fix
 
 We contributed [vault-secrets-reloader#702](https://github.com/bank-vaults/vault-secrets-reloader/pull/702),
 merged on 2026-11-02 and included in [v0.5.1](https://github.com/bank-vaults/vault-secrets-reloader/releases/tag/v0.5.1),
@@ -258,8 +260,7 @@ Our deployed reference has since moved to OpenBao 2.7.2 with Reloader 0.5.1.
 Thus the namespace/authentication/health blockers are fixed in a published release;
 a private image or local patch is not required for those fixes. This does not remove
 the upstream early-alpha status or replace the KV-change-to-workload-rollout acceptance
-test for the proposed Cozystack package. Other v0.5.1 fixes, such as read-error state
-preservation and rollout retry, are separate contributions, not claimed as ours.
+test for the proposed Cozystack package.
 
 ## User-facing changes
 
@@ -348,7 +349,6 @@ webhook 1.23.1, vault-env 1.23.0 and Reloader 0.5.1.
 Prior operational checks include upgrade/restart/unseal, scoped JWT access, namespace
 migration, application authentication/read, off-site snapshots and isolated restore.
 These do not certify upstream OpenBao compatibility, HA or shared-tenant isolation.
-The newest post-cleanup snapshots were not separately restore-tested.
 The proposed API and newly sanitized examples have not been deployed as a new stack.
 
 Required acceptance tests:
