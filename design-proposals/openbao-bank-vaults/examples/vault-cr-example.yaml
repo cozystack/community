@@ -45,6 +45,9 @@ spec:
           audience: external-openbao-unseal
           expirationSeconds: 600
           path: token
+  # combine-ca snapshots projected trust into emptyDir. For CA rotation, stage old
+  # and new CAs, replace the Pod, verify external login/unseal, then retire old trust.
+  # Restarting the sidecar alone does not rebuild this bundle.
   vaultInitContainers:
   - name: combine-ca
     image: quay.io/openbao/openbao:2.7.2@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f
@@ -82,12 +85,28 @@ spec:
   statsdDisabled: true
   skipVaultContainerCapabilities: true
   serviceRegistrationEnabled: false
+  # Operator 1.24.1 appends these args to its generated bank-vaults container.
+  # The later --init=false overrides --init in the generated command. Existing-data
+  # mode must never initialize a replacement PVC; verify argv on operator upgrades.
+  vaultPodSpec:
+    containers:
+    - name: bank-vaults
+      args:
+      - --init=false
   vaultContainerSpec:
     name: vault
     command:
     - bao
     args:
     - -config=/vault/config/vault.json
+    # Alive while sealed/uninitialized; leave readiness strict so no traffic is served.
+    livenessProbe:
+      httpGet:
+        scheme: HTTPS
+        port: api-port
+        path: /v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200
+      periodSeconds: 10
+      failureThreshold: 3
   volumeClaimTemplates:
   - metadata:
       name: raft

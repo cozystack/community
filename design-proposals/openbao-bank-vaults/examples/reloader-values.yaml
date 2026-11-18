@@ -1,7 +1,9 @@
 # Existing Helm values: vault-secrets-reloader chart 0.5.1.
 # EXPERIMENTAL: upstream README discourages production use.
 # Install in namespace bank-vaults of the workload cluster.
-# Requires namespace-scoped workload patch rights and get on openbao-client-ca.
+# Requires cluster-wide get/list/watch on Deployments, StatefulSets and DaemonSets.
+# Grant workload update only in approved namespaces; grant CA Secret get separately.
+# Namespace-only discovery is unsupported in v0.5.1; otherwise keep reload disabled.
 # Default chart RBAC is NOT a reviewed multi-tenant configuration: constrain separately.
 image:
   tag: v0.5.1

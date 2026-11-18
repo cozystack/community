@@ -23,6 +23,11 @@ spec:
   backend: bankVaults                 # PROPOSED; default remains helm
   bootstrap:                         # PROPOSED here, not community#134's API
     mode: existing
+    # PROPOSED: platform-approved restored claim in this application namespace.
+    # Resolve to the rendered StatefulSet claim identity and validate UID before start.
+    existingClaimRef:
+      name: raft-REPLACE_WITH_RENDERED_STATEFULSET_NAME-0
+      uid: REPLACE_WITH_RESTORED_PVC_UID
   tls:                               # PROPOSED; align with platform-wide TLS design
     existingSecretName: openbao-main-tls
   unseal:                            # PROPOSED; automated Shamir, not a seal type

@@ -35,7 +35,9 @@ spec:
         vault.security.banzaicloud.io/vault-role: demo-api-read
         vault.security.banzaicloud.io/vault-tls-secret: openbao-client-ca
         vault.security.banzaicloud.io/vault-skip-verify: 'false'
-        # Optional, experimental Reloader 0.5.1. Remove to use manual rollouts.
+        # Optional, experimental Reloader 0.5.1. Omit on a fresh install for manual rollouts.
+        # To disable existing tracking, stop Reloader, remove this annotation, then
+        # restart Reloader with an empty cache (see examples/README.md).
         secrets-reloader.security.bank-vaults.io/reload-on-secret-change: 'true'
     spec:
       serviceAccountName: demo-api

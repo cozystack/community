@@ -1,5 +1,6 @@
 # Existing Helm values: vault-secrets-webhook chart 1.23.1.
-# Install in workload cluster, NOT only in management cluster.
+# Install in namespace bank-vaults of the workload cluster, outside demo-app.
+# ignoreReleaseNamespace defaults to true; installing in demo-app skips its Pods.
 # Requires cert-manager, namespace demo-app, CA/auth and separately reviewed RBAC.
 # Values are illustrative; this is not a complete Cozystack package installation.
 replicaCount: 2

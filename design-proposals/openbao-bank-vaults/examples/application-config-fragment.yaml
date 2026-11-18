@@ -2,7 +2,10 @@
 # The namespace and kubernetes-workloads auth connection must already be configured.
 # Supply actual cluster CA/API, reviewed TokenReview identity and audience separately.
 # This file is configuration data, not a Kubernetes resource.
-# Configure with a namespace-scoped configurer identity; no root token is included.
+# Stock Bank-Vaults 1.33.2 configure requires stored root credentials or shares to
+# generate a root token; a namespace-scoped token alone is NOT supported.
+# Only platform automation may run it. No credentials are included here.
+# A least-privilege API applier is a separate implementation gate; see README.md.
 secrets:
 - path: secret
   type: kv
@@ -23,7 +26,7 @@ auth:
     bound_service_account_names: [demo-api]
     bound_service_account_namespaces: [demo-app]
     policies: [demo-api-read]
-    # Replace with the actual audience accepted by this cluster's TokenReview API.
+    # Match aud in this application's actual login JWT, also accepted by TokenReview.
     audience: https://kubernetes.default.svc.cluster.local
     token_no_default_policy: true
     ttl: 10m
@@ -32,6 +35,7 @@ auth:
     bound_service_account_names: [demo-reloader]
     bound_service_account_namespaces: [bank-vaults]
     policies: [demo-reloader-read]
+    # Match aud in the Reloader's actual JWT; do not assume it matches the app JWT.
     audience: https://kubernetes.default.svc.cluster.local
     token_no_default_policy: true
     ttl: 10m

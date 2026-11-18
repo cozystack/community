@@ -90,7 +90,7 @@ Cozystack's existing deployment paths.
 - Provide direct injection using a scoped application identity and verified TLS.
 - Allow an existing managed/external server without requiring Vault Operator.
 - Offer an optional operator backend with explicit ownership and recovery rules.
-- Support separately enabled KV v2 reload with scoped read/patch permissions.
+- Support separately enabled KV v2 reload with scoped read/update permissions.
 - Pin and test the complete component combination, including failure and restore cases.
 
 ### Non-goals
@@ -142,7 +142,7 @@ Management Kubernetes cluster:
 Workload Kubernetes cluster (same cluster OR a separate tenant cluster):
   selected Pod admission → Bank-Vaults webhook → runtime secret resolver
   application ServiceAccount → OpenBao auth → allowed KV path → process environment
-  optional Reloader → version check → patch Pod template → new Pod → fresh injection
+  optional Reloader → version check → update Pod template → new Pod → fresh injection
 
 Independent external key store (optional):
   primary unsealer ServiceAccount JWT → external OpenBao root JWT auth
@@ -168,8 +168,19 @@ Prefer independent opt-ins:
 declarative audit and external unseal. It is a reference with prerequisites,
 not a renderer for the proposed API.
 Keep the OpenBAO resource kind; default backend remains helm.
-Initially make backend immutable after creation. New bankVaults instances use Raft
-at one replica too. Start with a one-replica supported profile; gate HA behind tests.
+Initially make the effective backend immutable after creation: an absent field means
+helm, including on legacy objects. Reject helm → bankVaults updates; allow updates
+that continue to omit the field. New bankVaults instances use Raft at one replica too.
+Start with a one-replica supported profile; gate HA behind tests.
+
+For existing-data mode, the proposed existingClaimRef binds a platform-approved restore
+to a PVC name and UID in the application namespace. Before creating the Vault CR,
+verify the claim matches the rendered StatefulSet claim name, is Bound, has the expected
+UID and contains the approved restored data. Reject absent/mismatched claims; do not
+fall back to dynamic provisioning. The stock operator does not implement this guard.
+Also disable runtime init: the reference appends --init=false to the unsealer args.
+This protects against reinitialization if a claim is later replaced, but cannot identify
+the correct restored dataset. Restore provenance and matching keys remain separate checks.
 
 Implement proposed packages for operator and workload integration using the existing
 PackageSource/component mechanism. Exact package names remain a maintainer decision.
@@ -213,7 +224,11 @@ auth mount. Bind demo-api-read to only ServiceAccount demo-api in namespace demo
 For Kubernetes auth, configure the correct remote API/CA and TokenReview identity
 with reviewed permissions. Do not grant TokenReview to every application by default.
 The example application config is a fragment: auth connection setup and configurer
-credentials must already exist. Never use an unsealer role as an application role.
+credentials must already exist. Stock Bank-Vaults 1.33.2 configure retrieves a stored
+root token or generates one from shares; it cannot use only a namespace-scoped token.
+Treat it as privileged platform automation. A scoped API applier requires a separate
+implementation and permission review (see the examples guide); it is not supplied here.
+Never use an unsealer role as an application role.
 
 Application env contains vault:secret/data/demo/api#API_KEY. A fresh Pod resolves it
 at startup; the secret value is not placed in the Deployment or an application Secret
@@ -228,12 +243,17 @@ For Reloader 0.5.1, verified in source:
   annotations are collected; a pinned #version intentionally opts out of latest-version reload.
 - It polls KV data and reads metadata.version from that response. It receives the
   secret values too: a metadata-only ACL is insufficient for this implementation.
-- It patches secret-reload-count in the Pod template. It does not rewrite live env,
-  rotate the source credential, or guarantee zero downtime.
+- It uses Kubernetes Get/Update to change secret-reload-count in the Pod template.
+  It does not rewrite live env, rotate the source credential, or guarantee zero downtime.
 - A StatefulSet/DaemonSet with OnDelete does not automatically replace existing Pods
   merely because its template changed. Validate update strategy and application readiness.
-- Kubernetes list/watch scope, namespace-scoped patch permissions, CA Secret read and
-  exact OpenBao read paths must be reviewed independently.
+- Discovery uses cluster-wide get/list/watch on Deployments, StatefulSets and DaemonSets.
+  Namespace-only RoleBindings cannot support its informers. Grant update only in approved
+  namespaces and CA Secret get separately; if cluster-wide reads are unacceptable, disable reload.
+- After downtime, the first observed KV version becomes the baseline without a rollout.
+  Manually roll consumers if their secrets changed while Reloader was stopped.
+- Removing opt-in does not clear existing cached associations in v0.5.1. Stop all relevant
+  Reloader instances, remove opt-in, and restart with empty caches to disable tracking.
 - Flux/Helm drift handling must preserve or ignore only the controller-owned reload-count
   annotation, not all workload drift. Include this in integration tests.
 
@@ -244,7 +264,9 @@ for production. This must be visible to users, not hidden by a successful smoke 
 
 Sources: [Reloader v0.5.1 README](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/README.md),
 [collector](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/collector.go),
-[Vault reader](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/vault.go).
+[Vault reader](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/vault.go),
+[workload updates](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/reloader.go),
+[discovery and cache](https://github.com/bank-vaults/vault-secrets-reloader/blob/v0.5.1/pkg/reloader/controller.go).
 
 #### Upstream OpenBao compatibility fix
 
@@ -299,7 +321,10 @@ root auth on the external server, namespace-qualified KV paths and a read-only r
 policy. This is automated Shamir, not OpenBao Transit seal. The primary application
 namespace and the external key-store namespace are independent despite similar names.
 
-A read-only runtime role cannot initialize an empty server and write its new shares.
+A read-only runtime role cannot safely initialize an empty server and persist its shares.
+It is not an init guard: with --init and disabled preflight checks, initialization can
+succeed before key storage fails. The existing-data reference explicitly disables init.
+On upgrades, verify the rendered argv still ends with the effective --init=false.
 Use a recoverable, explicit bootstrap workflow; define how interruption between init
 and durable key storage is recovered. Preprovisioned shares must match restored data.
 The backend must never reinitialize an existing PVC or generate replacement seal keys
@@ -337,7 +362,7 @@ Sources: [unseal backends](https://bank-vaults.dev/docs/concepts/unseal-keys/),
 - Selected application admission without a healthy webhook: fail closed; unselected
   workloads remain outside the webhook's selection scope.
 - Missing application secret: block startup; do not log values or silently use an empty value.
-- Reloader read/patch failure: preserve the last known state and retry; verify this
+- Reloader read/update failure: preserve the last known state and retry; verify this
   with a synthetic integration test rather than inferring success from Pod readiness.
 - Interrupted initialization: preserve evidence, storage and key material; require a
   tested recovery procedure before calling fresh bootstrap supported.
@@ -354,13 +379,18 @@ The proposed API and newly sanitized examples have not been deployed as a new st
 Required acceptance tests:
 
 1. Existing default app renders unchanged; new fields cannot bypass tenant boundaries.
+   Test a legacy object without backend: ordinary updates succeed; switching to bankVaults fails.
 2. Fresh install and interrupted bootstrap recover without losing keys or reinitializing data.
 3. Restart/unseal and wrong CA/audience/subject/role/path; unavailable external key store.
+   Existing-data mode: restored data unseals; missing/mismatched PVC fails the restore guard;
+   empty replacement storage with absent shares stays uninitialized. Inspect effective argv.
+   A sealed process stays alive but unready while the key store is unavailable.
 4. TLS leaf/CA renewal, actual served certificate and auth after controlled restart/reload.
 5. Git change to auth/policy reaches OpenBao; reconcile failures are visible and retryable.
 6. Injection works without storing application values in Kubernetes; denied paths fail closed.
 7. A synthetic KV update rolls only opted-in consumers; pinned versions remain unchanged.
-   Test denied patch, temporary API failure, restart of Reloader and Flux reconciliation.
+   Test denied update, temporary API failure and Flux reconciliation. Verify manual rollout
+   after a KV change during Reloader downtime, and opt-out with cache reset.
 8. One-replica limits and rollout downtime documented; HA quorum tests before advertising HA.
 9. Snapshot read-back and isolated restore with the original keys, including namespaces/auth.
 10. Delete/upgrade/migration explicitly verify storage and key retention; no accidental prune.
