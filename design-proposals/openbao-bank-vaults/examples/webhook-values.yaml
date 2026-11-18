@@ -1,0 +1,31 @@
+# Existing Helm values: vault-secrets-webhook chart 1.23.1.
+# Install in workload cluster, NOT only in management cluster.
+# Requires cert-manager, namespace demo-app, CA/auth and separately reviewed RBAC.
+# Values are illustrative; this is not a complete Cozystack package installation.
+replicaCount: 2
+certificate:
+  useCertManager: true
+  generate: false
+secretsMutation: false
+configMapMutation: false
+podsFailurePolicy: Fail
+timeoutSeconds: 10
+namespaceSelector:
+  matchExpressions:
+  - key: kubernetes.io/metadata.name
+    operator: In
+    values: [demo-app]
+objectSelector:
+  matchLabels:
+    vault-injection: enabled
+vaultEnv:
+  repository: ghcr.io/bank-vaults/vault-env
+  tag: v1.23.0
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+# Opt-in labels are not an authorization boundary. OpenBao roles/ACLs enforce access.
+# Review default chart ClusterRoleBindings before offering this to multiple tenants.

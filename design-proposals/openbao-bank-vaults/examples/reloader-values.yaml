@@ -1,0 +1,30 @@
+# Existing Helm values: vault-secrets-reloader chart 0.5.1.
+# EXPERIMENTAL: upstream README discourages production use.
+# Install in namespace bank-vaults of the workload cluster.
+# Requires namespace-scoped workload patch rights and get on openbao-client-ca.
+# Default chart RBAC is NOT a reviewed multi-tenant configuration: constrain separately.
+image:
+  tag: v0.5.1
+serviceAccount:
+  create: true
+  name: demo-reloader
+collectorSyncPeriod: 30s
+reloaderRunPeriod: 1m
+env:
+  VAULT_ADDR: https://secrets.example.org:8200
+  VAULT_NAMESPACE: team-a
+  VAULT_AUTH_METHOD: kubernetes
+  VAULT_PATH: kubernetes-workloads
+  VAULT_ROLE: demo-reloader
+  VAULT_TLS_SECRET: openbao-client-ca
+  VAULT_TLS_SECRET_NS: bank-vaults
+  VAULT_SKIP_VERIFY: 'false'
+  VAULT_CLIENT_TIMEOUT: 10s
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+# This CA Secret is a separate copy in bank-vaults, not the application's Secret.
+# A single configured OpenBao server/namespace is used by this controller instance.

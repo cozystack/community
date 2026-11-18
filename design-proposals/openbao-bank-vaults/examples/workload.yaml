@@ -1,0 +1,64 @@
+# Actual Kubernetes and vault-secrets-webhook 1.23.1 annotations.
+# Requires webhook, demo-app namespace, OpenBao auth/policy, KV secret and CA Secret.
+# Replace the application image; it is intentionally not a runnable sample image.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-api
+  namespace: demo-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: demo-api
+        vault-injection: enabled
+      annotations:
+        vault.security.banzaicloud.io/vault-addr: https://secrets.example.org:8200
+        vault.security.banzaicloud.io/vault-namespace: team-a
+        vault.security.banzaicloud.io/vault-auth-method: kubernetes
+        vault.security.banzaicloud.io/vault-path: kubernetes-workloads
+        vault.security.banzaicloud.io/vault-role: demo-api-read
+        vault.security.banzaicloud.io/vault-tls-secret: openbao-client-ca
+        vault.security.banzaicloud.io/vault-skip-verify: 'false'
+        # Optional, experimental Reloader 0.5.1. Remove to use manual rollouts.
+        secrets-reloader.security.bank-vaults.io/reload-on-secret-change: 'true'
+    spec:
+      serviceAccountName: demo-api
+      containers:
+      - name: api
+        image: registry.example.org/demo/api:REPLACE_WITH_RELEASE
+        # Explicit entrypoint avoids relying on registry image metadata inspection.
+        command: [/app/server]
+        env:
+        - name: API_KEY
+          value: vault:secret/data/demo/api#API_KEY
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+# No secret value is stored here. The app must implement /ready and tolerate overlap
+# during rollout; replicas: 2 alone does not guarantee availability or safe key rotation.

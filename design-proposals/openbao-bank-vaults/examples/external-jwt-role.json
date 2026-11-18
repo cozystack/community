@@ -1,0 +1,14 @@
+{
+  "role_type": "jwt",
+  "user_claim": "sub",
+  "bound_subject": "system:serviceaccount:tenant-openbao:openbao-main-unsealer",
+  "bound_audiences": [
+    "external-openbao-unseal"
+  ],
+  "token_policies": [
+    "main-unseal-reader"
+  ],
+  "token_no_default_policy": true,
+  "token_ttl": 600,
+  "token_max_ttl": 1200
+}

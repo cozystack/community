@@ -1,0 +1,129 @@
+# ACTUAL Vault CR API, single-replica reference, not a Cozystack public resource.
+# Requires operator 1.24.1, TLS/CA/SA resources and initialized Raft data with matching shares.
+# Read-only external-unseal role cannot bootstrap an empty PVC. Do not apply to production.
+# Independent example names do not claim to be the output of proposed-app.yaml.example.
+apiVersion: vault.banzaicloud.com/v1alpha1
+kind: Vault
+metadata:
+  name: openbao-main
+  namespace: tenant-openbao
+spec:
+  image: quay.io/openbao/openbao:2.7.2@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f
+  bankVaultsImage: ghcr.io/bank-vaults/bank-vaults:v1.33.2
+  serviceAccount: openbao-main-unsealer
+  unsealConfig:
+    options:
+      preFlightChecks: false
+      storeRootToken: false
+      secretShares: 5
+      secretThreshold: 3
+    vault:
+      address: https://unseal.example.org:8200
+      unsealKeysPath: team-a/secret/data/unseal/main
+      role: main-unsealer
+      authPath: main-kubernetes
+  volumes:
+  - name: trusted-ca
+    projected:
+      sources:
+      - configMap:
+          name: external-openbao-ca
+          items:
+          - key: ca.crt
+            path: external.crt
+      - secret:
+          name: openbao-main-tls
+          items:
+          - key: ca.crt
+            path: local.crt
+  - name: ca-bundle
+    emptyDir: {}
+  - name: external-auth
+    projected:
+      sources:
+      - serviceAccountToken:
+          audience: external-openbao-unseal
+          expirationSeconds: 600
+          path: token
+  vaultInitContainers:
+  - name: combine-ca
+    image: quay.io/openbao/openbao:2.7.2@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f
+    command:
+    - /bin/sh
+    - -ec
+    - cat /trusted-ca/local.crt /trusted-ca/external.crt > /ca-bundle/ca.crt
+    volumeMounts:
+    - name: trusted-ca
+      mountPath: /trusted-ca
+      readOnly: true
+    - name: ca-bundle
+      mountPath: /ca-bundle
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 32Mi
+  bankVaultsVolumeMounts:
+  - name: ca-bundle
+    mountPath: /ca-bundle
+    readOnly: true
+  - name: external-auth
+    mountPath: /var/run/external-auth
+    readOnly: true
+  sidecarEnvsConfig:
+  - name: VAULT_CACERT
+    value: /ca-bundle/ca.crt
+  - name: VAULT_JWT_FILE
+    value: /var/run/external-auth/token
+  existingTlsSecretName: openbao-main-tls
+  size: 1
+  serviceType: ClusterIP
+  statsdDisabled: true
+  skipVaultContainerCapabilities: true
+  serviceRegistrationEnabled: false
+  vaultContainerSpec:
+    name: vault
+    command:
+    - bao
+    args:
+    - -config=/vault/config/vault.json
+  volumeClaimTemplates:
+  - metadata:
+      name: raft
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: replicated
+      resources:
+        requests:
+          storage: 10Gi
+  volumeMounts:
+  - name: raft
+    mountPath: /vault/file
+  config:
+    disable_mlock: true
+    storage:
+      raft:
+        path: /vault/file
+    listener:
+      tcp:
+        address: 0.0.0.0:8200
+        tls_cert_file: /vault/tls/server.crt
+        tls_key_file: /vault/tls/server.key
+    api_addr: https://openbao-main.tenant-openbao.svc.cluster.local:8200
+    cluster_addr: https://${.Env.POD_NAME}:8201
+    ui: true
+    audit:
+    - file:
+        file:
+          description: OpenBao request audit
+          options:
+            file_path: stdout
+  resources:
+    vault:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
