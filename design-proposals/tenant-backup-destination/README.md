@@ -2,8 +2,6 @@
 
 - **Title:** `Tenant-supplied backup destination and driver options`
 - **Author(s):** `@androndo`
-- **Date:** `2026-09-22`
-- **Status:** Draft
 
 ## Overview
 
