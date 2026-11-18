@@ -2,8 +2,6 @@
 
 - **Title:** `Configurable backup retention and cleanup`
 - **Author(s):** `@androndo`
-- **Date:** `2026-09-15`
-- **Status:** Draft
 
 ## Overview
 
