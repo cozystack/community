@@ -22,6 +22,8 @@ An application kind counts as converted once its ApplicationDefinition declares 
 
 ## Decisions
 
+- [0002. The chart renders a CredentialTemplate per account, and an API request writes at most one object](./decisions/0002-account-list-comes-from-chart-rendered-credential-templates.md): account Secrets are seeded by a controller from chart-rendered templates, and mint writes one Secret rendered from its template.
+
 <!-- Leave this empty in the initial PR; fill it in as implementation
 proceeds. Records live in this proposal's own directory, numbered from
 0001. Link each one here, newest first:
@@ -126,6 +128,8 @@ The view never shows the Secret's data, no ApplicationDefinition selects the Sec
 
 The identity of an account is its Secret's UID. It stays the same across reconciles, upgrades, in-place restores and the conversion. When the application is deleted and created again under the same name, it gets new Secrets, and a Secret left over from the deleted one is never reused.
 
+> Superseded by [decision 0002](./decisions/0002-account-list-comes-from-chart-rendered-credential-templates.md): the account Secrets are seeded by a controller from chart-rendered `CredentialTemplate` objects, not by the API on application writes, see [`credential-templates.md`](./credential-templates.md).
+
 The Cozystack API keeps account Secrets in step with the accounts of an application whenever it creates or updates one of a converted kind, whichever client sent the request (the dashboard, `kubectl`, an external API consumer):
 
 1. On create for every account, and on update for every account the write adds, it writes a Secret with the verifier of a random password that it throws away, origin `NotIssued`, replacing one that is not theirs (left from a deleted application of the same name, or holding another `username`). The account then exists in the database, and nobody can log in as it until someone mints. An account that exists already and has no Secret is left alone: the view does not list it, and a mint on it takes no precondition and creates the Secret. That is a state of the conversion (Upgrade), not a steady one: once the conversion is complete every declared account has its Secret, because a create seeds all of them, an update seeds the added ones and a mint recreates a missing one.
@@ -164,6 +168,8 @@ A lost response (a closed tab, a dropped connection, a crash between the write a
 Two concurrent mints cannot both succeed: the conditional write lets one land, and the other gets `409 Conflict` without a password. A caller can also pass the `resourceVersion` it last read, and the dashboard always does. If someone minted in between, the caller gets a 409 showing the newer issuance instead of silently killing the password another person just received.
 
 ### 3. Where the stored value goes
+
+> Superseded by [decision 0002](./decisions/0002-account-list-comes-from-chart-rendered-credential-templates.md): the stored form and the engine wiring come from the chart's templates, and ClickHouse no longer goes through `valuesFrom`, see [`credential-templates.md`](./credential-templates.md).
 
 An engine here is a database server with its operator. The API knows password formats and no engines. A `format` turns a password into the value the engine stores (`scram-sha-256`, `mysql-native`, `sha256` or `plaintext`), a kind names one in its block (§7), and the account Secret has one layout for all of them, `username` and `password`. The four are functions in one Go package, `pkg/credentials/format`, that the API and the migration's CLI import, so a new format is a change here. CNPG wants one Secret per role, mariadb-operator a key reference per `User`, and the ClickHouse operator watches no Secrets, so each chart wires its engine to the account Secret in its own way:
 
@@ -249,6 +255,8 @@ A rotation is subscribed to on the audit log, in the SIEM or in a VMAlert rule g
 ### 7. Coverage
 
 A kind joins a wave once its whole path from mint to engine works, not once the engine could accept a verifier. Every wave uses the same `Credential` and mint. In wave 1 the account Secret holds only the verifier, and one-time disclosure follows from storage. In waves 2 and 3 the account Secret holds the plaintext that the engine or its operator reads. No tenant can read that Secret, so one-time disclosure holds on the tenant-facing interface, while platform components and management-cluster administrators can still read it.
+
+> Superseded by [decision 0002](./decisions/0002-account-list-comes-from-chart-rendered-credential-templates.md): a kind's accounts are the templates its chart renders, and the ApplicationDefinition `spec.credentials` block is dropped, see [`credential-templates.md`](./credential-templates.md).
 
 A kind declares its accounts once, in `spec.credentials` of its ApplicationDefinition, which a tenant cannot edit. [`example.md`](./example.md#the-contract-for-a-kind) walks the block field by field, with the chart and the API, for PostgreSQL, for ClickHouse and for a kind outside the tree. `format` is how a password is stored (§3), as `{name: scram-sha-256}`, and `secretLabels` the labels its operator needs on an account Secret. `accounts` is a list of sources, each with a `kind`, and a kind may list several. `ValuesMap` names a values map whose keys are tenant accounts (`path: users`), with the name rules of §1 and no `password` field. `Static` is a fixed account, such as the single credential of a kind with no `users` ([Redis](./example.md#a-kind-with-no-users-redis)), switched on by a values key in `when` and read with its schema default, and `owner: platform` on it marks a platform account (§4): the API does nothing for it, and a `ValuesMap` skips its name. `valuesPath` is for an operator that cannot read Secrets (§3). The API adds no knowledge of kinds or engines, serves no kind with an unknown `format`, and a new format is a new function in it. A kind outside the tree names `plaintext`, which keeps the password in the account Secret as waves 2 and 3 do, or an existing format, and its chart has to read `<release>.<user>.account` and render `<release>-credentials` not tenant-visible, or a mint does nothing. Bucket's keys come from the COSI driver, which a format cannot express, so how a mint works there is set in its row of §3 at its conversion.
 
