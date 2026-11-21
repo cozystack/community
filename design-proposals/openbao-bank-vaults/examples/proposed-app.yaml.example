@@ -1,0 +1,47 @@
+# PROPOSED API ONLY: new fields below do not exist in Cozystack today.
+# Do not kubectl apply. This is an input-contract sketch for maintainer discussion.
+# backend is immutable after creation in the first implementation.
+# Existing initialized Raft data / matching externally provisioned shares are required
+# for bootstrap.mode: existing. Fresh bootstrap is a separate design/acceptance gate.
+apiVersion: apps.cozystack.io/v1alpha1
+kind: OpenBAO
+metadata:
+  name: secrets
+  namespace: tenant-example
+spec:
+  replicas: 1
+  size: 10Gi
+  storageClass: replicated
+  resources: {}
+  resourcesPreset: t1.small
+  external: false
+  ui: true
+  seal:
+    type: shamir
+    secretName: ""
+    keyId: ""
+  backend: bankVaults                 # PROPOSED; default remains helm
+  bootstrap:                         # PROPOSED here, not community#134's API
+    mode: existing
+    # PROPOSED: platform-approved restored claim in this application namespace.
+    # Proposed fail-closed Pod admission rechecks UID; guarded PVC deletion is denied
+    # while active. These controls are implementation gates, not stock operator features.
+    existingClaimRef:
+      name: raft-REPLACE_WITH_RENDERED_STATEFULSET_NAME-0
+      uid: REPLACE_WITH_RESTORED_PVC_UID
+  tls:                               # PROPOSED; align with platform-wide TLS design
+    existingSecretName: openbao-main-tls
+  unseal:                            # PROPOSED; automated Shamir, not a seal type
+    method: externalVault
+    externalVault:
+      address: https://unseal.example.org:8200
+      caConfigMapRef:
+        name: external-openbao-ca
+        key: ca.crt
+      authPath: main-kubernetes
+      role: main-unsealer
+      audience: external-openbao-unseal
+      keysPath: team-a/secret/data/unseal/main
+# Image versions, privileged raw config, operator scope and configurer credentials
+# are platform-admin settings, deliberately absent from this tenant-facing sketch.
+# Workload injection/reload is configured in the workload cluster, not on this server.
