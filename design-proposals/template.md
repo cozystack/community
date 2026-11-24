@@ -85,7 +85,15 @@ Examples:
 ## Testing
 
 <!-- How this will be validated. Be specific about which layer
-(unit / integration / e2e / manual) and what is asserted. -->
+(unit / integration / e2e / manual) and what is asserted.
+
+Name the layer per assertion, and keep each one where the code it checks
+lives: a platform unit test covers platform code through its interface; an
+application's correctness is tested in that application's package and in
+e2e, and a requirement the platform has of every application is a check
+that runs on any ApplicationDefinition, not a unit test over the in-tree
+ones. An implementer will read this section as an instruction.
+See design-proposals/platform-design-principles/README.md. -->
 
 ## Rollout
 
