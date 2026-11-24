@@ -23,6 +23,7 @@ An application kind counts as converted once its chart renders a `CredentialTemp
 ## Decisions
 
 - [0002. The chart renders a CredentialTemplate per account, and an API request writes at most one object](./decisions/0002-account-list-comes-from-chart-rendered-credential-templates.md): a kind's chart renders a `CredentialTemplate` per account, a controller seeds the account Secrets, and an API request writes at most one object.
+- [0003. A Bucket account's keys come from its BucketAccess, which cozystack-controller re-creates on a mint](./decisions/0003-bucket-keys-come-from-a-controller-owned-bucketaccess.md): a template that names a BucketAccess is engine-issued and stores its keys in the `plaintext` format, the controller owns the BucketAccess, and a mint re-creates it.
 
 <!-- Leave this empty in the initial PR; fill it in as implementation
 proceeds. Records live in this proposal's own directory, numbered from
@@ -183,7 +184,7 @@ This is the pattern of Kubernetes `TokenRequest`: a `create` on a subresource of
 
 1. Generates a password.
 2. Computes what the template's `format` stores: the verifier of the password, or for `plaintext` (§7) the password itself.
-3. Builds the whole account Secret from the template, with that value and the record extended by this operation, and writes it under the Secret version the template's status mirrors, or creates it when the template has no Secret yet. The API never reads the Secret: if the status lags behind it, or the caller's precondition names another version, the write fails with a 409 and no password, and the caller retries.
+3. Builds the whole account Secret from the template, with that value and the record extended by this operation, and writes it under the Secret version the template's status mirrors, or creates it when the template has no Secret yet. The API never reads the Secret: if the status lags behind it, or the caller's precondition names another version, the write fails with a 409 and no password, and the caller retries. The one exception is an engine-issued account, whose keys the platform cannot choose ([0003](./decisions/0003-bucket-keys-come-from-a-controller-owned-bucketaccess.md)): its mint writes the Secret without keys, then reads that one Secret, uncached, until cozystack-controller has stored the keys of the new grant, and returns them.
 4. Returns the plaintext in the response.
 
 The plaintext exists in the API server's memory for the length of the request and in the response. After a second mint the first password is dead: unlike a token, which is added next to the others, a password is replaced. A mint on a name with no template answers NotFound, and one on a template that reports a `SecretConflict` answers Conflict.
@@ -196,7 +197,7 @@ Two concurrent mints cannot both succeed: the conditional write lets one land, a
 
 ### 3. Where the stored value goes
 
-An engine here is a database server with its operator. The API knows password formats and no engines. A `format` turns a password into the value the engine stores (`scram-sha-256`, `mysql-native`, `sha256` or `plaintext`), a template names one (§1), and the account Secret has one layout for all of them, `username` and `password`. The four are functions in one Go package, `pkg/credentials/format`, that the API, the controller and the migration's CLI import, and a format outside them is registered as a webhook (below). CNPG wants one Secret per role, mariadb-operator a key reference per `User`, and the ClickHouse operator watches no Secrets, so each chart wires its engine to the account Secret in its own way:
+An engine here is a database server with its operator. The API knows password formats and no engines. A `format` turns a password into the value the engine stores (`scram-sha-256`, `mysql-native`, `sha256` or `plaintext`), a template names one (§1), and the account Secret has one layout for all of them, `username` and `password`. An engine-issued account, one whose template names a BucketAccess ([0003](./decisions/0003-bucket-keys-come-from-a-controller-owned-bucketaccess.md)), stores its keys as the driver issues them, in the `plaintext` format, and adds `accessKeyID`, the access key that goes with the secret key in `password`. The four are functions in one Go package, `pkg/credentials/format`, that the API, the controller and the migration's CLI import, and a format outside them is registered as a webhook (below). CNPG wants one Secret per role, mariadb-operator a key reference per `User`, and the ClickHouse operator watches no Secrets, so each chart wires its engine to the account Secret in its own way:
 
 | Engine, vendored operator | `format` | Wiring | Stored value |
 |---|---|---|---|
