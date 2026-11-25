@@ -38,7 +38,7 @@ Two classes may then share a resource name, and `ResourceNameConflict` and `stat
 
 ## Consequences
 
-- A licensed class and a bring-your-own-license class can share one vGPU profile ([vgpu-vms](../../vgpu-vms/README.md)). Picking a class does not grant a license: secret access, entitlement and the one-vGPU-class-per-VM rule keep their own checks.
+- A licensed class and a bring-your-own-license class can share one vGPU profile ([vgpu-vms](../../vgpu-vms/README.md)). Picking a class does not grant a license: the entitlement and the one-vGPU-class-per-VM rule keep their own checks, and no license copy is written into a namespace without the entitlement (section 6). Within an entitled namespace a tenant super-admin can mount the namespace's license copy into a VM ([vgpu-vms Security](../../vgpu-vms/README.md#security)).
 - Two classes on one resource name are two budgets for the same cards, which the uniqueness rule of [0014](./0014-step-1-names-a-class-and-holds-nothing.md) ruled out. A hoster who does not want that publishes one class per name.
 - Classes on one resource name describe the same cards. Their capacity and used-unit metrics are views, not additive, and physical totals are per resource name.
 - A billing system reads the class from the record instead of mapping names through the catalog. Pods without a valid snapshot, raw-name pods and pods created before the change stay under the resource name, and are never counted under both keys.
