@@ -22,13 +22,17 @@ The virt-launcher pod webhook copies the snapshot to the pod only when the pod's
 
 Two classes may then share a resource name, and `ResourceNameConflict` and `status.ownedResourceName` go away. `resourceName` stays mutable: a change applies to VMs started after it, and a running VM keeps the name in its snapshot.
 
-| Who | What they get |
-| --- | --- |
-| Tenant writing a VM or VMI | picks a class through a class entry, cannot write or change the snapshot |
-| Tenant creating a pod by hand | can request a raw resource name; copied labels, owner references or annotations are not a snapshot, so the use stays under the raw name |
-| KubeVirt's controller | gets the snapshot on a launcher pod only when the pod matches the VMI's UID, devices and requests |
-| Hoster editing a class | a `resourceName` change reaches new VMs only; a deleted and recreated class has a new UID and inherits no old usage |
-| Cluster admin | can change admission and RBAC, so is outside what this protects |
+| Who | What they get | Enforced by |
+| --- | --- | --- |
+| Tenant writing a VM or VMI | picks a class through a class entry, cannot write or change the snapshot | VMI webhook on create, policy on update |
+| Tenant creating a pod by hand | can request a raw resource name; copied labels, owner references or annotations are not a snapshot, so the use stays under the raw name | pod webhook on create, policy on update |
+| KubeVirt's controller | gets the snapshot on a launcher pod only when the pod matches the VMI's UID, devices and requests | pod webhook on create |
+| Hoster editing a class | a `resourceName` change reaches new VMs only; a deleted and recreated class has a new UID and inherits no old usage | the snapshot itself, which keeps the resource name it was written with; whether a recreated class inherits usage depends on what the class UID is checked against, which is still open |
+| Cluster admin | can change admission and RBAC, so is outside what this protects | nothing |
+
+Both webhooks match through `matchConditions` on "carries the `cozystack.io/gpu-reference` label or the snapshot annotation" and set no label `objectSelector`, since an object selector reads only labels and its result is ANDed with the conditions. KubeVirt copies a VMI's annotations to its launcher pod, so a VMI written directly without the label could otherwise bring a snapshot that no webhook saw. On create, a webhook removes any snapshot it did not derive itself: the VMI webhook keeps only the one it writes from the VMI's own class entries, and the pod webhook only the one it copies under the conditions above. The use of such an object then stays under the raw resource name.
+
+The rule that a snapshot never changes after create is a `ValidatingAdmissionPolicy` on VMI and pod updates, not a webhook. It runs in the API server, so the update path gains no call to the controller and no new outage. The webhooks stay on create only. The chart sets the label only on VMs with class entries, and only the webhooks keep a snapshot, so their outage blocks the start of those VMs and of any object that carries the label or the snapshot annotation by hand, and of no other VM.
 
 ## Why not the alternatives
 
@@ -43,7 +47,7 @@ Two classes may then share a resource name, and `ResourceNameConflict` and `stat
 - Classes on one resource name describe the same cards. Their capacity and used-unit metrics are views, not additive, and physical totals are per resource name.
 - A billing system reads the class from the record instead of mapping names through the catalog. Pods without a valid snapshot, raw-name pods and pods created before the change stay under the resource name, and are never counted under both keys.
 - A pod that requests no GPU, such as the one that binds `WaitForFirstConsumer` volumes, counts zero. Each launcher pod counts what it requests.
-- Both webhooks gain an update rule, and the `WorkloadMonitor` gains a GPU path. Before this replaces the current implementation, tests cover shared names, a forged snapshot, a UID or request mismatch, a rename while running, a recreated class, raw-name fallback and double counting.
+- Both webhooks gain a snapshot rule on create, a `ValidatingAdmissionPolicy` refuses snapshot changes on update, and the `WorkloadMonitor` gains a GPU path. Before this replaces the current implementation, tests cover shared names, a forged snapshot on a VMI without the label, a UID or request mismatch, a rename while running, a recreated class, raw-name fallback and double counting.
 
 ## Revisit if
 
