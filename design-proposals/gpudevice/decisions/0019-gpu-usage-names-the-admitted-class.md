@@ -2,8 +2,8 @@
 
 - **Number:** `0019`
 - **Date:** `2026-11-10`
-- **Status:** Proposed
-- **Deciders:** `@lexfrei`
+- **Status:** Accepted
+- **Deciders:** `@lexfrei, @lllamnyp`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/cozystack#4998`](https://github.com/cozystack/cozystack/pull/4998#pullrequestreview-5842083890)
 - **Implemented in:** not yet
@@ -22,8 +22,6 @@ The virt-launcher pod webhook copies the snapshot to the pod only when the pod's
 
 Two classes may then share a resource name, and `ResourceNameConflict` and `status.ownedResourceName` go away. `resourceName` stays mutable: a change applies to VMs started after it, and a running VM keeps the name in its snapshot.
 
-A vGPU class requires `profile` and a passthrough class cannot set one. Section 3 only marked the field "vgpu only"; the schema is stricter, and this record makes that the contract.
-
 | Who | What they get |
 | --- | --- |
 | Tenant writing a VM or VMI | picks a class through a class entry, cannot write or change the snapshot |
@@ -32,17 +30,9 @@ A vGPU class requires `profile` and a passthrough class cannot set one. Section 
 | Hoster editing a class | a `resourceName` change reaches new VMs only; a deleted and recreated class has a new UID and inherits no old usage |
 | Cluster admin | can change admission and RBAC, so is outside what this protects |
 
-## Questions from the review
-
-Why recorded state and not a stateless rule like `internal/shared/appdefowner`? A stateless rule orders by creation time, and a class can change `resourceName`. An older class edited onto a used name then takes it from the class whose VMs are already running. Recording the owner was specific to GPU classes and is not a pattern for new code. With this record nothing needs one owner per name.
-
-What happens when status is lost? With the recorded owner, a restore or re-create without status falls back to creation order and can pick a different class. The platform cannot tell such a restore from a new collision. With this record there is no ownership state to lose: each running VM and its pod carry their own snapshot.
-
-Why fail closed when two classes record one name? A tie-break would leave usage records whose name maps to two classes, and billing could charge the wrong offer. The cost was real: a controller overlap could stop new starts of an offer that already has running VMs. With this record a shared name is a supported catalog, not a conflict.
-
 ## Why not the alternatives
 
-- **Keep the recorded owner**, as cozystack/cozystack#4998 does. It keeps the recovery and availability costs above and still forbids two offers on one profile.
+- **Keep the recorded owner**, as cozystack/cozystack#4998 does. It was chosen over a stateless rule like `internal/shared/appdefowner`, because a stateless rule orders by creation time and an older class edited onto a used name would take it from the class whose VMs already run; recording the owner was specific to GPU classes and is not a pattern for new code. A restore or re-create without status falls back to creation order and can pick a different class, and the platform cannot tell such a restore from a new collision; with the snapshot there is no ownership state to lose. Two classes that record one name fail closed, since a tie-break would leave usage records whose name maps to two classes and billing could charge the wrong offer, so a controller overlap could stop new starts of an offer that already has running VMs. It also still forbids two offers on one profile.
 - **Freeze `resourceName`**, the other option in the [review](https://github.com/cozystack/cozystack/pull/4998#pullrequestreview-5842083890). Then only creates collide. Creation time is stored in whole seconds, so two classes created in the same second fall back to the name, and a later class with a lexically smaller name wins over one with running VMs. It also turns a device-plugin rename into a new class every tenant has to move to, which section 2 avoided.
 - **Keep uniqueness with a stateless creation-time rule.** An edit onto a used name moves the offer, which is the case @kvaps found.
 
@@ -54,7 +44,6 @@ Why fail closed when two classes record one name? A tie-break would leave usage 
 - A billing system reads the class from the record instead of mapping names through the catalog. Pods without a valid snapshot, raw-name pods and pods created before the change stay under the resource name, and are never counted under both keys.
 - A pod that requests no GPU, such as the one that binds `WaitForFirstConsumer` volumes, counts zero. Each launcher pod counts what it requests.
 - Both webhooks gain an update rule, and the `WorkloadMonitor` gains a GPU path. Before this replaces the current implementation, tests cover shared names, a forged snapshot, a UID or request mismatch, a rename while running, a recreated class, raw-name fallback and double counting.
-- No API or implementation changes are part of this proposal; existing fields stay until the contract is accepted.
 
 ## Revisit if
 

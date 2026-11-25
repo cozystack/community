@@ -22,8 +22,8 @@ NVIDIA's vGPU stack changes quickly. Within the last few releases the driver bra
 
 ## Decisions
 
-- [0020. A `GPUClass` toleration has no `tolerationSeconds`](./decisions/0020-a-gpuclass-toleration-has-no-tolerationseconds.md), proposed
-- [0019. GPU usage carries the class a VM was admitted with, so classes may share a resource name](./decisions/0019-gpu-usage-names-the-admitted-class.md), proposed
+- [0020. A `GPUClass` toleration has no `tolerationSeconds`](./decisions/0020-a-gpuclass-toleration-has-no-tolerationseconds.md)
+- [0019. GPU usage carries the class a VM was admitted with, so classes may share a resource name](./decisions/0019-gpu-usage-names-the-admitted-class.md)
 - [0018. A vGPU license reaches each VM as a Secret volume, copied only into entitled namespaces](./decisions/0018-a-vgpu-license-reaches-each-vm-as-a-secret-volume.md)
 - [0017. The vGPU entitlement is a Tenant flag stamped on the namespace, not a budget key](./decisions/0017-the-vgpu-entitlement-is-a-tenant-flag.md)
 - [0016. Holding a GPU for a stopped VM is step 2, and stays GPU-specific until DRA can carry it](./decisions/0016-holding-is-step-2-and-stays-gpu-specific.md)
@@ -177,6 +177,8 @@ A class maps an offer to a backend through a `source` union. The first release h
 How many GPUs of a class one VM may take is the hoster's `maxCount` on the class. For vGPU classes it follows NVIDIA's multi-vGPU matrix for the board and the profile series. Compute (C-series) profiles follow the [NVIDIA AI Enterprise matrix](https://docs.nvidia.com/ai-enterprise/release-8/latest/infra-software/vgpu/features/multi-vgpu-support.html), which allows several vGPU for Compute devices per VM on L40S under the Linux with KVM hypervisors it supports (section 2), so the `l40s-24c` class above sets `maxCount: 2`. Graphics (Q-series) profiles follow the vGPU 20 release notes for Linux with KVM, which allow several Q-series vGPUs per VM on L40S and offer no C-series profiles. For passthrough classes it is at most the GPUs per node. NVIDIA requires all vGPUs in one VM to share board type and series. Cozystack keeps it simpler and stricter: a VM takes vGPUs of one class only, although NVIDIA would also allow, say, A40-48Q next to A40-16Q. `maxCount` defaults to 1 for vGPU classes; on a passthrough class, unset means no limit beyond the GPUs of one node.
 
 `tolerations` lists the taints of the class's nodes that its VMs tolerate, such as a taint that reserves GPU nodes for GPU workloads. A toleration has `key`, `operator`, `value` and `effect`, with the operators `Exists` and `Equal` only, and no `tolerationSeconds` ([0020](./decisions/0020-a-gpuclass-toleration-has-no-tolerationseconds.md)). The launcher pod of a VM that names the class gets them (section 4), and `free` reads them ([0010](./decisions/0010-gpuclass-carries-the-tolerations-binding-reads.md)).
+
+The CRD requires `profile` on a class whose `mode` is `vgpu` and refuses it on a passthrough class.
 
 `license` is how a VM of a vGPU class gets licensed (section 6). `secretName` names a Secret in `cozy-system` whose key `client_configuration_token.tok` holds the client configuration token the hoster downloads from its NVIDIA license server. `featureType` is the `FeatureType` the guest's license client reads from `gridd.conf`, `1` by default. NVIDIA's [client licensing guide](https://docs.nvidia.com/vgpu/latest/grid-licensing-user-guide/configuring-nls-licensed-client.html) documents `1` for a VM with a vGPU, since "NVIDIA vGPU software automatically selects the correct type of license based on the vGPU type", and its `gridd.conf` template lists `4` as "NVIDIA vGPU for Compute"; `4` has been observed working on a C-series profile. The CRD admits `license` only on a class whose `mode` is `vgpu`, requires `secretName` as a DNS subdomain name, and takes `featureType` only as `1` or `4`. `license` can change, and a change reaches each VM at its next start.
 
