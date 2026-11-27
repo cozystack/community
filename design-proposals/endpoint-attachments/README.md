@@ -15,7 +15,7 @@ The mechanism is a union with one member, **`loadBalancer`**. The name **`gatewa
 
 ## Scope and related proposals
 
-- **Builds on** community#35 (IP addresses as a first-class resource), implemented by [cozystack/address-controller](https://github.com/cozystack/address-controller) in the same API group. #35 owns what an address is: held, moved, quota'd, enumerated. This proposal owns what an address is attached to. The two meet at the Service annotation `local.sdn.cozystack.io/ip-address-claim` and at `IPAddressClass.spec.loadBalancerClass` (*Claim*). N addresses on one application are N attachments, each rendering its own Service that consumes its own claim, which is the one-claim-one-consumer rule of #35 §5.
+- **Builds on** community#35 (IP addresses as a first-class resource), implemented by [cozystack/address-controller](https://github.com/cozystack/address-controller) in the same API group. #35 owns what an address is: held, moved, quota'd, enumerated. This proposal owns what an address is attached to. The two meet at the Service annotation `local.sdn.cozystack.io/ip-address-claim` and at the class's `status.loadBalancerClass` (*Claim*). N addresses on one application are N attachments, each rendering its own Service that consumes its own claim, which is the one-claim-one-consumer rule of #35 §5.
 - **Beside** community#20 (external database exposure via Gateway API TLS passthrough). #20 puts several databases on the tenant Gateway's one address, routed by SNI. An attachment gives one endpoint an address of its own: for a client that allow-lists an IP, a protocol that cannot carry SNI, or an address the tenant holds and moves. This proposal changes nothing in #20.
 - **Extended by** [community#144](https://github.com/cozystack/community/pull/144), the `gateway` member.
 - **Succeeds** community#29 (structured, additive external exposure), closed. #29's mechanism, one additive Service rendered by each chart, does not work for engines whose Services are operator-owned. This proposal renders the Service in a controller that mirrors the operator's Service instead.
@@ -70,6 +70,7 @@ A tenant cannot say "attach a public address to my Postgres replicas", "attach t
 - **Source-IP ACL.** `SecurityGroup` owns who may connect (*Security*).
 - **Address write-back into engines** that advertise peer addresses in-protocol (*Engines with in-protocol discovery*).
 - **Several datapath-delegated Services on one backend pod.** cozy-proxy keeps one address mapping per pod (*VM datapath modes*).
+- **Per-tenant authorization of class selection.** Deferred; *Security* states the current behaviour.
 - **Address allocation.** The substrate's (#35).
 
 ## Design
@@ -132,9 +133,7 @@ One engine-agnostic reconciler in cozystack-controller drives each attachment th
 
 The tenant-facing set is dynamic (a MariaDB `-secondary` Service exists only while `replicas > 1`), so a failure is `Resolved=False` and the attachment waits.
 
-**2. Claim.** With `claimName`, the controller reads that claim in the same namespace and writes nothing to it. Otherwise it mints an `IPAddressClaim` with `generateName`, under its controller owner reference, passing `className` and `family`; an absent `className` draws from the default class. The controller then reads the claim's resolved class and takes its `spec.loadBalancerClass`. A Service's `loadBalancerClass` is immutable, so the controller reads it before creating the Service. A class that leaves the field unset belongs to the cluster's default load-balancer implementation, and the Service then carries none. A claim whose `IPAddress.status.associatedTo` names another live Service is in use: the attachment reports it and withdraws its own Service, so two attachments that both rendered before either association was recorded leave one Service asking for the claim. The substrate kinds are read as unstructured, so the controller carries no module or CRD dependency on address-controller.
-
-`IPAddressClass.spec.loadBalancerClass` is new in address-controller v0.2.0 (cozystack/address-controller#18) and is immutable. Decision 0003 of #35 gave the value to a driver-reported `status.loadBalancerClass` instead and removed the spec field; the two documents disagree until #35 records the change.
+**2. Claim.** With `claimName`, the controller reads that claim in the same namespace and writes nothing to it. Otherwise it mints an `IPAddressClaim` with `generateName`, under its controller owner reference, passing `className` and `family`; an absent `className` draws from the default class. The controller then reads the claim's resolved class and takes its `status.loadBalancerClass`, which the class's driver reports (#35 §5, decision 0003). A Service's `loadBalancerClass` is immutable, so the controller reads it before creating the Service. The value counts only while the class's `Accepted` condition is true for the class's current generation; until then an empty value means "not reported yet", and the controller renders nothing new, neither Service nor FloatingIP, and reports `ClassNotAccepted` with the driver's condition. A Service or FloatingIP already published stays if the class later loses `Accepted` (a refused pool, for one), and the attachment reports `ClassNotAccepted` meanwhile. An empty accepted value means the cluster's default load-balancer implementation, and the Service then carries none. A claim whose `IPAddress.status.associatedTo` names another live Service is in use: the attachment reports it and withdraws its own Service, so two attachments that both rendered before either association was recorded leave one Service asking for the claim. The substrate kinds are read as unstructured, so the controller carries no module or CRD dependency on address-controller.
 
 **3. Render.** The controller creates one additive `type: LoadBalancer` Service with `generateName`, from a prefix derived from the attachment's name and bounded to what the apiserver accepts. The attachment's name therefore never collides with the Service it publishes. The Service:
 
@@ -184,7 +183,7 @@ cozy-proxy does not enforce this itself; the controller's refusal is the only ch
 
 Only a backend pod says whether a VM sits in a VPC, so a `method` attachment that has published nothing yet waits for one. An attachment created before its VM starts never pins its claim to a cozy-proxy Service first.
 
-cozy-proxy v0.4.0 programs IPv4 only. The controller does not refuse a `method` attachment with an `IPv6` or `Dual` claim.
+cozy-proxy v0.4.0 programs IPv4 only. A `method` attachment on the cozy-proxy path whose claim is `IPv6` or `Dual` renders no Service, so the address is not attracted, and reports `FamilyUnsupportedByDatapath`. On a cozyplane VPC an `IPv6` claim is served (*VMs in a cozyplane VPC*).
 
 ### VMs in a cozyplane VPC
 
@@ -237,11 +236,13 @@ To publish chosen ports of a VM in a cozyplane VPC, the tenant omits `method` an
 | `Provisioned=False` | `EndpointDetached` | The endpoint stopped resolving; the address is held |
 | | `NothingToPublish` | The endpoint has no selector, or nothing to mirror and neither `ports` nor `method` |
 | | `DatapathContractUnavailable` | `method` without a declared cozy-proxy, or a VPC backend without `FloatingIP` |
+| | `FamilyUnsupportedByDatapath` | `method` on the cozy-proxy path with an `IPv6` or `Dual` claim |
 | | `WaitingForBackend` | A `method` attachment whose endpoint has no backend pod yet |
 | | `BackendAlreadyDelegated` | Another delegated Service holds the backend pod |
 | | `MultipleBackends` | `WholeIP` on more than one backend or VPC target; the address is held |
 | | `ClaimNotFound` | The referenced claim does not exist |
 | | `ClaimPending` | The claim is unbound, its class unresolved, or the substrate not installed |
+| | `ClassNotAccepted` | The claim's class has no accepted `status.loadBalancerClass` for its current generation |
 | | `ClaimInUse` | The claim's address is associated to another Service |
 | | `FamilyConflict` | `family` differs from the referenced claim's |
 | | `WaitingForAddress` | The Service has not been assigned every claimed address |
@@ -279,17 +280,17 @@ An attachment publishes the L4 reachability of a Service. That suffices for engi
 - RBAC: `cozy:tenant:base` grants every verb on `endpointattachments`, `cozy:tenant:view:base` grants `get`, `list` and `watch`, and `cozy:tenant:admin:base` grants `create`, `update`, `patch` and `delete`. Tenants get no access to `ipaddressclaims` through this change.
 - `ApplicationDefinition.spec.services` now also decides which Services tenants can attach an address to. Adding a Service to `include` lets tenants publish it.
 - `count/endpointattachments.local.sdn.cozystack.io` works with a stock `ResourceQuota`, because the kind is CRD-served by the kube-apiserver, where ResourceQuota admission runs. The bare `sdn.cozystack.io` group is served by the aggregated `cozystack-api`, as `SecurityGroup` is, and never sees ResourceQuota admission; the `local.` prefix marks the CRD-served half of the sdn family. Garbage collection by owner reference needs the same real storage. Addresses remain bounded at the claim.
-- Admins configure nothing new beyond #35's classes and pools. A class served by a non-default load-balancer implementation sets `spec.loadBalancerClass`.
+- Admins configure nothing new beyond #35's classes and pools. Each class's driver reports the class's `loadBalancerClass`.
 - Nothing changes for any existing application, chart value or `external` user.
 
 ## Upgrade and rollback compatibility
 
-The change is additive: a new CRD, a new reconciler in cozystack-controller, new RBAC rules, no migration. It needs address-controller and metallb-iad v0.2.0, which add `IPAddressClass.spec.loadBalancerClass` and make the MetalLB driver serve only the classes and Services of the MetalLB it fronts. The system bundle passes the cozystack-controller two values, `endpointAttachments.cozyProxyContractImplemented` and `endpointAttachments.allocateLoadBalancerNodePorts`, so the first upgrade restarts the controller once; neither changes anything until attachments exist. Rollback is removing the controller and the CRD: rendered Services, FloatingIPs and minted claims are owned by attachments and go with them, and reserved claims and everything `external` renders are untouched.
+The change is additive: a new CRD, a new reconciler in cozystack-controller, new RBAC rules, no migration. It needs address-controller and metallb-iad v0.3.0, in which the MetalLB driver reports each class's `status.loadBalancerClass` and `Accepted` condition and associates only Services that carry that `loadBalancerClass`. The system bundle passes the cozystack-controller two values, `endpointAttachments.cozyProxyContractImplemented` and `endpointAttachments.allocateLoadBalancerNodePorts`, so the first upgrade restarts the controller once; neither changes anything until attachments exist. Rollback is removing the controller and the CRD: rendered Services, FloatingIPs and minted claims are owned by attachments and go with them, and reserved claims and everything `external` renders are untouched.
 
 ## Security
 
 - **What may be published is what `ApplicationDefinition.spec.services` declares.** An attachment reaches only a Service in its own namespace whose lineage labels match `applicationRef` on all three fields and which carries `internal.cozystack.io/tenantresource: "true"`. The lineage labels alone also cover operator-internal Services (Kafka and ClickHouse declare one Service each), so the marker is the gate. The marker records the `spec.services` selection; it was introduced for visibility, and no separate declaration says a Service may be published. Some kinds select internal or headless Services, which are therefore attachable: OpenBao's `-internal`, Qdrant's `-headless`, and for a managed Kubernetes cluster every Service carrying its `cluster.x-k8s.io/cluster-name` label. A tenant can publish only Services of its own applications. The LoadBalancer Services a tenant cluster's cloud-controller-manager creates carry the cluster's label and the marker, and the controller refuses them by their `cluster.x-k8s.io/tenant-service-name` label. All references (`applicationRef`, `serviceName`, `claimName`) are same-namespace.
-- **Class selection is not authorized per tenant.** The controller mints claims under its own ServiceAccount and copies `className` into them, so a tenant who may create an attachment draws from any class it names. Tenant roles have no access to `ipaddressclaims`, so an attachment is a tenant's only way to mint. #35 leaves the question of which classes a namespace may name to an admission policy or to platform machinery that mints claims on a tenant's behalf, and neither exists: a policy keyed on the requesting user would see the controller, so it would have to key on the namespace.
+- **Class selection is not authorized per tenant.** The controller mints claims under its own ServiceAccount and copies `className` into them, so a tenant who may create an attachment draws from any class it names. Tenant roles have no access to `ipaddressclaims`, so an attachment is a tenant's only way to mint. #35 leaves the question of which classes a namespace may name to an admission policy or to platform machinery that mints claims on a tenant's behalf, and neither exists: a policy keyed on the requesting user would see the controller, so it would have to key on the namespace. Authorizing class selection per tenant is deferred (*Rollout*, item 5).
 - **Publishing a database does not enable or enforce its TLS.** The controller mirrors a Service and knows nothing about engines, and an attachment never sets `external`, on which charts key their TLS defaults and on which the platform keys its plaintext guards. Postgres serves TLS but accepts plaintext unless `tls.required` is on, and `tls.required` defaults to the value of `external`. The admission policy that refuses plaintext external Redis (#20 decision 0002) matches `spec.external == true`. A database with `external: false` and an attachment is therefore reachable in plaintext on a public address. The user guide tells tenants to set `tls.required: true` on Postgres before attaching. No chart adds an IP SAN to a server certificate, so a client dialing an attached address verifies by hostname only if DNS points a name in the certificate at the address.
 - **Who may connect** is `SecurityGroup`'s question (cozystack/cozystack#2922). Publication carries no default-deny.
 - **ACL granularity is per application.** `SecurityGroup` stamps membership labels on an application's pods, so two addresses on one VM share one rule set. `ports` narrows exposure but is port filtering, not source-IP ACL. A per-address model would need `SecurityGroup` to target an attachment; attachments are namespaced, stably named and lineage-labelled, so they can serve as targets.
@@ -311,6 +312,8 @@ The change is additive: a new CRD, a new reconciler in cozystack-controller, new
 - **A second delegated Service for one VM backend pod** → the later attachment reports `BackendAlreadyDelegated` and renders nothing; an `external: true` chart Service always wins.
 - **`WholeIP` while the endpoint has several ready backends** → the Service and claim stay, the selector matches nothing, `MultipleBackends`; it recovers when one backend remains.
 - **A `method` attachment without a declared cozy-proxy** → `DatapathContractUnavailable`; no Service.
+- **A `method` attachment on the cozy-proxy path with an `IPv6` or `Dual` claim** → `FamilyUnsupportedByDatapath`; no Service.
+- **The class is not accepted by its driver** (not yet reported, or a refused pool) → `ClassNotAccepted`; nothing new is rendered, and anything already published stays.
 - **The endpoint stops resolving** → `Detached`; the claim is kept, and the attachment reattaches when the endpoint returns.
 - **The attachment is deleted mid-provisioning** → owned objects are collected; a minted claim's address follows the class's reclaim policy.
 - **A Service carries the ownership label but not the attachment's controller owner reference** → ignored; never adopted.
@@ -327,11 +330,11 @@ The change is additive: a new CRD, a new reconciler in cozystack-controller, new
 
 ## Rollout
 
-1. address-controller and metallb-iad v0.2.0, with `IPAddressClass.spec.loadBalancerClass`.
+1. address-controller and metallb-iad v0.3.0 (cozystack/address-controller#19, cozystack/metallb-iad#13), with the driver-reported `status.loadBalancerClass` and `Accepted` condition on `IPAddressClass`.
 2. The CRD, the controller with the `loadBalancer` member, the VM datapath modes and the cozyplane path, tenant RBAC, and the user guide (cozystack/cozystack#4324, cozystack/website#825). The FloatingIP generation check needs cozyplane v0.1.5 (cozystack/cozystack#5389).
 3. Before an engine's exposure is documented, check that its operator keeps a static Service selector with pod-label roles; document a selector-rewriting operator with the failover window, or hold it back.
 4. The address-preserving migration from `external` (substrate adoption plus attachment synthesis); the `external` deprecation window starts after it lands.
-5. The Kubernetes API certSAN write-back for a dedicated address, and discovery-engine write-back, each its own design.
+5. The Kubernetes API certSAN write-back for a dedicated address, discovery-engine write-back, and per-tenant authorization of class selection, each its own design.
 
 ## Open questions
 
@@ -340,8 +343,6 @@ The change is additive: a new CRD, a new reconciler in cozystack-controller, new
 ## Alternatives considered
 
 **A chart-values `expose: []` field (#29's shape).** Its mechanism required each chart to render the exposure, which #29's review showed impossible where Services are operator-owned, and charts cannot read allocation results back. It also repeats one field and schema in every chart, and every attach or detach is a Helm upgrade of the release. A controller that mirrors the Service needs neither.
-
-**Chart helpers and an existing controller, no new kind** (lexfrei, review of 2026-10-15). A list of addresses in values covers N addresses, and a reserved claim survives detach through #35. Values do not give an attachment its own lifecycle and status (`Detached`, held address, collection with the application), do not check that the Service is tenant-facing before rendering, and need per-chart work for operator-owned Services, the problem that closed #29.
 
 **Reviving `ServiceExposure`** (removed in cozystack/cozystack#3218; #20 decision 0001). `ServiceExposure` told a chart-owned Service to be `type: LoadBalancer`, which the native field already does. An attachment is not a wrapper over one Service's type: it is N per application, each with its own lifecycle; it holds and moves addresses through claims, which `loadBalancerClass` cannot express; it checks which Services may be published; and it never mutates the application's objects.
 
