@@ -17,7 +17,8 @@ This proposal covers instance creation. Defaults for platform components, applic
 
 ## Decisions
 
-No decision records yet. This is a new proposal.
+- [0002. Installation defaults come from one ConfigMap rendered from the platform value](./decisions/0002-installation-defaults-come-from-one-configmap-rendered-from-the-platform-value.md) — why ConfigMaps selected by a label, one per application kind, were not taken.
+- [0001. The atomic marker is for alternatives that each stand complete](./decisions/0001-the-atomic-marker-is-for-alternatives-that-each-stand-complete.md) — why dependent pairs and objects that also hold independent fields stay merged field by field, and what a user who picks an alternative gives up.
 
 ## Context
 
@@ -115,6 +116,44 @@ For each field missing from the user spec, copy the installation value. If both 
 Arrays are replaced as whole values, and so are objects without declared properties: typed dictionaries (`additionalProperties`) and free-form objects (`x-kubernetes-preserve-unknown-fields`). An object that its schema marks `x-kubernetes-map-type: atomic` is replaced whole as well, which fits fields whose children exclude each other, such as `osImage.builtin` and `osImage.factory` of a worker pool. Installation defaults do not merge into the elements, entries or fields of any of these. For a map of registry mirrors, a pool that declares its own entries receives none of the platform entries. Existing normalization of required, non-nullable null fields remains in place; its ordering is an open question below.
 
 Top-level fields beginning with `_` remain reserved by the existing application API. Nested application data is not subject to that reservation.
+
+#### Unset and empty values
+
+The API decides whether a field is set by whether its key is in the request. The merge runs on the spec as decoded JSON, before anything converts it into a typed object, so it never sees a Go zero value: a key that is present counts as set whatever its value, and `{}`, `[]`, `""`, `0`, `false` and `null` all win over the installation value (rows 2 and 3 below). Only a key that the request leaves out is filled from the entry.
+
+A typed client is where a zero value turns into a present key. Encoding a Go struct writes every field whose JSON tag has no `omitempty`, and the generated types in `api/apps/v1alpha1` have none on fields such as `storageClass`, `size` and `replicas`. A request built from them therefore sets those fields to `""` or `0` and receives no installation default for them, as [Client behavior and stored values](#client-behavior-and-stored-values) describes. The server cannot tell such a zero from one the user chose, and this proposal does not try to.
+
+#### Merge cases
+
+Each row is a fixture of the merge test in cozystack/cozystack, `pkg/registry/apps/application/testdata/installation-defaults-merge.json`. The test sends the user spec through the API create path with the entry configured and compares the values stored in the HelmRelease, so a change to the merge changes this table and the fixture together. The Schema column describes the application schema of the case. "No declared properties" is a root that takes arbitrary keys: its fields are filled from the entry, and nothing is merged into them.
+
+| # | Case | Schema | User spec | Installation entry | Stored spec |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Omitted fields receive installation values | no declared properties | `{}` | `{"size": "20Gi", "nested": {"enabled": true}}` | `{"size": "20Gi", "nested": {"enabled": true}}` |
+| 2 | Explicit empty values win | no declared properties | `{"object": {}, "array": [], "flag": false, "number": 0, "text": "", "nullable": null}` | `{"object": {"enabled": true}, "array": [1], "flag": true, "number": 3, "text": "default", "nullable": "default"}` | `{"object": {}, "array": [], "flag": false, "number": 0, "text": "", "nullable": null}` |
+| 3 | An explicit null wins over an installation object | no declared properties | `{"object": null}` | `{"object": {"enabled": true}}` | `{"object": null}` |
+| 4 | Nonempty objects with declared properties merge recursively | `nested` and `nested.child` declare properties | `{"nested": {"child": {"user": true}}}` | `{"nested": {"child": {"user": false, "default": true}, "sibling": 1}}` | `{"nested": {"child": {"user": true, "default": true}, "sibling": 1}}` |
+| 5 | An empty nested object stops recursion | `nested` and `nested.child` declare properties | `{"nested": {"child": {}}}` | `{"nested": {"child": {"default": true}, "sibling": 1}}` | `{"nested": {"child": {}, "sibling": 1}}` |
+| 6 | Typed dictionaries are replaced as a whole | `mirrors` is a dictionary (`additionalProperties` with an object schema) | `{"mirrors": {"docker.io": {"endpoints": ["https://mine"]}}}` | `{"mirrors": {"docker.io": {"endpoints": ["https://platform"], "skipFallback": true}, "ghcr.io": {"endpoints": ["https://platform"]}}}` | `{"mirrors": {"docker.io": {"endpoints": ["https://mine"]}}}` |
+| 7 | Free-form objects are replaced as a whole | `values` preserves unknown fields | `{"values": {"a": 1}}` | `{"values": {"a": 2, "b": 3}}` | `{"values": {"a": 1}}` |
+| 8 | Objects that also declare a dictionary are replaced as a whole | `options` declares `known` and `additionalProperties` | `{"options": {"extra": "user"}}` | `{"options": {"known": "platform", "platformKey": "injected"}}` | `{"options": {"extra": "user"}}` |
+| 9 | Objects that also preserve unknown fields are replaced as a whole | `options` declares `known` and preserves unknown fields | `{"options": {"extra": "user"}}` | `{"options": {"known": "platform", "platformKey": "injected"}}` | `{"options": {"extra": "user"}}` |
+| 10 | Closed objects still merge recursively | `options` declares properties, `additionalProperties: false` | `{"options": {"known": "user"}}` | `{"options": {"known": "platform", "other": "platform"}}` | `{"options": {"known": "user", "other": "platform"}}` |
+| 11 | An omitted dictionary is copied whole | `mirrors` is a dictionary | `{}` | `{"mirrors": {"docker.io": {"endpoints": ["https://platform"]}}}` | `{"mirrors": {"docker.io": {"endpoints": ["https://platform"]}}}` |
+| 12 | Arrays are whole replacement values | no declared properties | `{"rows": [{"name": "user", "nested": {}}]}` | `{"rows": [{"name": "default", "extra": true}]}` | `{"rows": [{"name": "user", "nested": {}}]}` |
+| 13 | User scalars and objects retain their type | no declared properties | `{"scalar": "user", "object": {"user": true}}` | `{"scalar": {"default": true}, "object": "default"}` | `{"scalar": "user", "object": {"user": true}}` |
+| 14 | Installation nulls and empty objects are copied | no declared properties | `{"user": true}` | `{"object": {}, "nullable": null, "array": []}` | `{"user": true, "object": {}, "nullable": null, "array": []}` |
+| 15 | An omitted atomic object is copied whole | `osImage` is atomic | `{}` | `{"osImage": {"builtin": {}}}` | `{"osImage": {"builtin": {}}}` |
+| 16 | An atomic object the user fills is not completed from the installation | `osImage` is atomic | `{"osImage": {"factory": {"version": "v1.13.0"}}}` | `{"osImage": {"builtin": {}}}` | `{"osImage": {"factory": {"version": "v1.13.0"}}}` |
+| 17 | An atomic object the user fills with an empty child is not completed either | `osImage` is atomic | `{"osImage": {"factory": {}}}` | `{"osImage": {"builtin": {}}}` | `{"osImage": {"factory": {}}}` |
+| 18 | An explicit empty atomic object wins | `osImage` is atomic | `{"osImage": {}}` | `{"osImage": {"builtin": {}}}` | `{"osImage": {}}` |
+| 19 | Granular objects still merge recursively | `nested` declares properties, `x-kubernetes-map-type: granular` | `{"nested": {"a": 1}}` | `{"nested": {"a": 9, "b": 2}}` | `{"nested": {"a": 1, "b": 2}}` |
+| 20 | A default for a sibling field inside the alternative a user chose is not filled in | `atomicMap` is atomic, its children declare properties | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "userValue1"}}}` | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "defaultValue1", "value2": "defaultValue2"}}}` | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "userValue1"}}}` |
+| 21 | The same object without the atomic marker is completed field by field | `atomicMap` and its children declare properties, no marker | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "userValue1"}}}` | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "defaultValue1", "value2": "defaultValue2"}}}` | `{"atomicMap": {"mutuallyExclusiveKey1": {"value1": "userValue1", "value2": "defaultValue2"}}}` |
+| 22 | An atomic object nested in a merged object stops the merge only at itself | `pool` declares properties, `pool.osImage` is atomic | `{"pool": {"osImage": {"factory": {"version": "v1.13.0"}}}}` | `{"pool": {"size": "20Gi", "osImage": {"factory": {"imageFactoryURL": "https://factory.example.org"}}}}` | `{"pool": {"size": "20Gi", "osImage": {"factory": {"version": "v1.13.0"}}}}` |
+| 23 | Objects that also take arbitrary keys are replaced as a whole | `options` declares `known`, `additionalProperties: true` | `{"options": {"extra": "user"}}` | `{"options": {"known": "platform", "platformKey": "injected"}}` | `{"options": {"extra": "user"}}` |
+
+Rows 20 to 22 show how an atomic object treats a field of the alternative a user chose. The user's value of the atomic object is stored as written, so `value2` stays unset in row 20 although the entry sets it for the same alternative, while row 21, the same object without the marker, fills it in. In row 22 the factory URL from the entry is dropped, and `pool.size` next to the atomic object is still filled. Decision [0001](./decisions/0001-the-atomic-marker-is-for-alternatives-that-each-stand-complete.md) says where the marker is used and why.
 
 ### API creation
 
