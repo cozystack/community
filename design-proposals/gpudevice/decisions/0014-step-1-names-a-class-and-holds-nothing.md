@@ -2,7 +2,7 @@
 
 - **Number:** `0014`
 - **Date:** `2026-10-27`
-- **Status:** Accepted
+- **Status:** Accepted; partly superseded by [`0019`](./0019-gpu-usage-names-the-admitted-class.md) (resource name uniqueness, billing through the catalog)
 - **Deciders:** `@lexfrei`
 - **Proposal:** [`../README.md`](../README.md)
 - **Decided in:** [`cozystack/community#99`](https://github.com/cozystack/community/pull/99#issuecomment-6445311702)
