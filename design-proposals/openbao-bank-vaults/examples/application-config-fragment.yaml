@@ -1,0 +1,47 @@
+# Bank-Vaults-format configuration DATA for OpenBao namespace team-a; not an installer.
+# Use the explicit API provisioning sequence in README.md for this reference.
+# Do not pass this incomplete fragment to stock configure or attach as externalConfig:
+# missing auth.config would overwrite the intended Kubernetes auth connection.
+# Stock configure cannot use only a namespace-scoped token. Its shares-only branch
+# also cannot generate a root token with VAULT_NAMESPACE=team-a; acquire credentials
+# in root separately from namespace-targeted configuration. No credentials included.
+secrets:
+# Require an unused path or an existing KV v2 mount. Never implicitly upgrade KV v1;
+# use a different mount and update references, or plan an explicit client migration.
+- path: secret
+  type: kv
+  options:
+    version: 2
+policies:
+- name: demo-api-read
+  rules: |
+    path "secret/data/demo/api" { capabilities = ["read"] }
+- name: demo-reloader-read
+  rules: |
+    path "secret/data/demo/api" { capabilities = ["read"] }
+auth:
+# Apply roles only via auth/kubernetes-workloads/role/<name>; do not write /config.
+# For stock configure, first supply ALL intended auth.config connection settings.
+- type: kubernetes
+  path: kubernetes-workloads
+  roles:
+  - name: demo-api-read
+    bound_service_account_names: [demo-api]
+    bound_service_account_namespaces: [demo-app]
+    policies: [demo-api-read]
+    # Match aud in this application's actual login JWT, also accepted by TokenReview.
+    audience: https://kubernetes.default.svc.cluster.local
+    token_no_default_policy: true
+    ttl: 10m
+    max_ttl: 30m
+  - name: demo-reloader
+    bound_service_account_names: [demo-reloader]
+    bound_service_account_namespaces: [bank-vaults]
+    policies: [demo-reloader-read]
+    # Match aud in the Reloader's actual JWT; do not assume it matches the app JWT.
+    audience: https://kubernetes.default.svc.cluster.local
+    token_no_default_policy: true
+    ttl: 10m
+    max_ttl: 30m
+# Provision secret/data/demo/api out of band, without plaintext secret values in Git.
+# The reloader reads the KV data response, not only metadata: constrain its paths.

@@ -1,0 +1,6 @@
+{
+  "bound_issuer": "https://primary-api.example.org:6443",
+  "jwt_validation_pubkeys": [
+    "REPLACE_WITH_PRIMARY_CLUSTER_PUBLIC_SIGNING_KEY_PEM"
+  ]
+}
